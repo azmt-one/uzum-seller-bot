@@ -1,8 +1,31 @@
-# Uzum Seller Telegram Bot — Multi-seller MVP
+# Uzum Seller Telegram Bot — Multi-seller MVP fix3
 
-Версия с нормальной схемой для многих селлеров: каждый пользователь сам подключает свой Uzum Seller OpenAPI token через `/connect`.
+Версия с точными остатками FBO + FBS/DBS по SKU из ответа `/v1/product/shop/{shopId}`.
 
-## Что умеет
+## Как считаются остатки
+
+По реальному ответу Uzum Seller API внутри `skuList` есть поля:
+
+- `quantityAvailable` — общий доступный остаток;
+- `quantityActive` — активный остаток в продаже;
+- `quantityFbs` — остаток FBS/DBS на складе продавца;
+- `quantityAdditional` — дополнительный остаток, если передан;
+- `quantitySold`, `quantityReturned`, `quantityMissing`, `quantityDefected`, `quantityPending` — служебные количества.
+
+Если отдельного поля FBO нет, бот считает:
+
+```text
+FBO = quantityAvailable - quantityFbs
+Итого = quantityAvailable
+FBS/DBS = quantityFbs
+```
+
+Например, если `quantityAvailable=5`, `quantityFbs=0`, значит:
+- FBO: 5
+- FBS/DBS: 0
+- Итого: 5
+
+## Команды
 
 - `/connect` — подключить личный Uzum API-токен селлера
 - `/disconnect` — удалить подключение
@@ -10,12 +33,14 @@
 - `/pinguzum` — проверить Uzum API
 - `/shops` — список магазинов селлера
 - `/setshop SHOP_ID` — выбрать основной магазин
-- `/products [поиск]` — товары и остатки
-- `/stock [поиск]` — короткий alias для товаров/остатков
-- `/lowstock [порог]` — товары с низким остатком
+- `/products [поиск]` — товары, цены и агрегированный остаток
+- `/stock [поиск]` — FBO + FBS/DBS + итого по SKU
+- `/fbo [поиск]` — только FBO-остатки
+- `/fbs [поиск]` — только FBS/DBS-остатки
+- `/lowstock [порог]` — низкие остатки по общему количеству
 - `/orders [status]` — FBS/DBS заказы
-- `/export_products` — выгрузка товаров в Excel
-- `/debug_product` — показать сырой JSON первого товара для настройки полей Uzum
+- `/export_products` — Excel с колонками FBO, FBS/DBS, итого
+- `/debug_product` — сырой JSON первого товара
 
 ## Переменные окружения
 
@@ -29,43 +54,8 @@ UZUM_API_BASE_URL=https://api-seller.uzum.uz/api/seller-openapi
 
 Сгенерировать `ENCRYPTION_KEY`:
 
-```bash
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```python
+import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())
 ```
 
 `ENCRYPTION_KEY` нельзя терять. Если он изменится, старые Uzum API-токены в базе нельзя будет расшифровать.
-
-## Локальный запуск
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
-python main.py
-```
-
-## Запуск на BotHost
-
-1. Обновите файлы в GitHub.
-2. В BotHost добавьте переменные:
-   - `TELEGRAM_BOT_TOKEN`
-   - `ENCRYPTION_KEY`
-   - `OWNER_TELEGRAM_ID`
-   - `DB_PATH=bot.db`
-3. Пересоберите и перезапустите бота.
-4. В Telegram проверьте:
-   - `/start`
-   - `/connect`
-
-## Важно для продакшена
-
-SQLite подходит только для MVP/теста. Для коммерческого запуска лучше перейти на PostgreSQL, чтобы данные не потерялись при пересборке/миграции сервера.
-
-
-## Fix 1
-
-- Excel export no longer crashes when Uzum returns status as an object.
-- Product output now shows status when numeric stock is not returned.
-- `/lowstock` no longer falsely says there are no low stocks when numeric stock is missing.
-- Added `/debug_product` to inspect the actual product response and map the correct stock field.

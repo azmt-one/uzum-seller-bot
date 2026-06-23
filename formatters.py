@@ -5,25 +5,6 @@ from html import escape
 from typing import Any
 
 
-STOCK_KEYS = (
-    "leftover",
-    "leftovers",
-    "quantity",
-    "availableQuantity",
-    "available_quantity",
-    "availableAmount",
-    "available_amount",
-    "amount",
-    "stock",
-    "stocks",
-    "stockAmount",
-    "stock_amount",
-    "fbsAmount",
-    "fbs_amount",
-    "qty",
-    "count",
-)
-
 STATUS_KEYS = ("status", "state", "productStatus", "skuStatus", "availability")
 
 
@@ -42,7 +23,6 @@ def extract_items(data: Any) -> list[Any]:
         "products",
         "productList",
         "shopProducts",
-        "skuList",
         "data",
         "result",
         "rows",
@@ -115,6 +95,26 @@ def excel_value(value: Any) -> str | int | float:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
+def to_number(value: Any) -> float | None:
+    value = normalize_value(value)
+    if value in (None, "", "—"):
+        return None
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def clean_num(value: float | int | None) -> str:
+    if value is None:
+        return "—"
+    try:
+        value = float(value)
+        return str(int(value)) if value.is_integer() else str(value)
+    except Exception:
+        return str(value)
+
+
 def format_money(value: Any) -> str:
     value = normalize_value(value)
     if value in (None, "—", ""):
@@ -129,39 +129,11 @@ def safe(value: Any) -> str:
     return escape(str(normalize_value(value)))
 
 
-def find_numeric_by_keys(obj: Any, keys: tuple[str, ...]) -> float | None:
-    if isinstance(obj, dict):
-        lower_map = {str(k).lower(): k for k in obj.keys()}
-        for key in keys:
-            actual = lower_map.get(key.lower())
-            if actual is None:
-                continue
-            value = normalize_value(obj.get(actual))
-            # Do not treat status strings as stock.
-            if isinstance(value, str) and value.upper() in {"IN_STOCK", "OUT_OF_STOCK", "ACTIVE", "INACTIVE"}:
-                continue
-            try:
-                return float(value)
-            except Exception:
-                pass
-        for value in obj.values():
-            found = find_numeric_by_keys(value, keys)
-            if found is not None:
-                return found
-    elif isinstance(obj, list):
-        for value in obj:
-            found = find_numeric_by_keys(value, keys)
-            if found is not None:
-                return found
-    return None
-
-
 def find_status(obj: Any) -> str | None:
     value = normalize_value(pick(obj, *STATUS_KEYS, default=None))
     if value not in (None, "", "—"):
         return str(value)
 
-    # Uzum sometimes returns status in additional/colorized object or attributes.
     if isinstance(obj, dict):
         for k, v in obj.items():
             if str(k).lower() in {"value", "text"} and isinstance(v, str) and ("STOCK" in v.upper() or v.upper() in {"ACTIVE", "INACTIVE"}):
@@ -178,27 +150,16 @@ def find_status(obj: Any) -> str | None:
     return None
 
 
-def stock_display(product: Any) -> str:
-    number = get_stock_number(product)
-    if number is not None:
-        # Keep integer-looking values clean.
-        return str(int(number)) if number.is_integer() else str(number)
-
-    status = find_status(product)
-    if status:
-        mapping = {
-            "IN_STOCK": "в продаже",
-            "OUT_OF_STOCK": "нет в продаже",
-            "ACTIVE": "активен",
-            "INACTIVE": "неактивен",
-        }
-        return mapping.get(status.upper(), status)
-
-    return "не передан API"
-
-
-def has_any_numeric_stock(products: list[Any]) -> bool:
-    return any(get_stock_number(p) is not None for p in products)
+def status_display(value: Any) -> str:
+    value = normalize_value(value)
+    mapping = {
+        "IN_STOCK": "в продаже",
+        "OUT_OF_STOCK": "нет в продаже",
+        "ACTIVE": "активен",
+        "INACTIVE": "неактивен",
+        "ON_MODERATION": "на модерации",
+    }
+    return mapping.get(str(value).upper(), str(value))
 
 
 def format_shop_line(shop: Any) -> str:
@@ -207,19 +168,165 @@ def format_shop_line(shop: Any) -> str:
     return f"• ID: <code>{safe(shop_id)}</code> — {safe(title)}"
 
 
-def format_product_line(product: Any) -> str:
-    sku_id = pick(product, "skuId", "sku", "id", "productId")
-    title = pick(product, "title", "name", "skuTitle", "productTitle", "skuFullName")
-    price = pick(product, "price", "sellPrice", "fullPrice", "currentPrice", "skuPrice", default="—")
-    status = find_status(product)
-    line = f"• <code>{safe(sku_id)}</code> — {safe(title)}\n  Цена: {format_money(price)} сум | Остаток: {safe(stock_display(product))}"
-    if status and get_stock_number(product) is None:
-        line += f" | Статус: {safe(status)}"
-    return line
+def flatten_sku_rows(products: list[Any]) -> list[dict[str, Any]]:
+    """Turn Uzum product objects with skuList into SKU rows with FBO/FBS/total stock.
+
+    Based on the seller's real OpenAPI response:
+    - quantityAvailable: total available quantity
+    - quantityActive: active sellable quantity
+    - quantityFbs: seller warehouse stock for FBS/DBS
+    - FBO is derived as quantityAvailable - quantityFbs when no explicit FBO field exists.
+    """
+    rows: list[dict[str, Any]] = []
+
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+
+        product_id = product.get("productId") or product.get("id")
+        product_title = pick(product, "productTitle", "title", "name", default="—")
+        product_status = find_status(product)
+        category = pick(product, "category", default="—")
+
+        sku_list = product.get("skuList")
+        if not isinstance(sku_list, list):
+            continue
+
+        for sku in sku_list:
+            if not isinstance(sku, dict):
+                continue
+
+            total = first_number(sku, "quantityAvailable", "quantityActive", "availableQuantity", "availableAmount", "quantity")
+            active = first_number(sku, "quantityActive", "quantityAvailable")
+            fbs = first_number(sku, "quantityFbs", "fbsQuantity", "quantityDbs", "dbsQuantity")
+            additional = first_number(sku, "quantityAdditional")
+            explicit_fbo = first_number(sku, "quantityFbo", "quantityFBO", "fboQuantity", "quantityWarehouse", "warehouseQuantity")
+
+            total_n = total if total is not None else 0.0
+            fbs_n = fbs if fbs is not None else 0.0
+
+            if explicit_fbo is not None:
+                fbo = explicit_fbo
+            elif total is not None:
+                # In the real response quantityAvailable=5 and quantityFbs=0.
+                # So FBO/marketplace stock is total available minus FBS/DBS.
+                fbo = max(total_n - fbs_n, 0.0)
+            else:
+                fbo = None
+
+            sku_status = find_status(sku) or product_status
+
+            rows.append(
+                {
+                    "product_id": product_id,
+                    "sku_id": sku.get("skuId") or sku.get("id"),
+                    "barcode": sku.get("barcode"),
+                    "seller_item_code": sku.get("sellerItemCode") or sku.get("article"),
+                    "product_title": sku.get("productTitle") or product_title,
+                    "sku_title": sku.get("skuTitle") or sku.get("skuFullTitle") or sku.get("title") or "—",
+                    "sku_full_title": sku.get("skuFullTitle") or sku.get("skuTitle") or "—",
+                    "category": category,
+                    "price": sku.get("price") or sku.get("marketPrice"),
+                    "market_price": sku.get("marketPrice"),
+                    "total": total,
+                    "active": active,
+                    "fbo": fbo,
+                    "fbs": fbs,
+                    "additional": additional,
+                    "sold": first_number(sku, "quantitySold"),
+                    "returned": first_number(sku, "quantityReturned"),
+                    "missing": first_number(sku, "quantityMissing"),
+                    "defected": first_number(sku, "quantityDefected"),
+                    "pending": first_number(sku, "quantityPending"),
+                    "status": sku_status,
+                    "raw": sku,
+                }
+            )
+
+    return rows
+
+
+def first_number(obj: dict[str, Any], *keys: str) -> float | None:
+    for key in keys:
+        if key in obj:
+            n = to_number(obj.get(key))
+            if n is not None:
+                return n
+    # case-insensitive fallback
+    lower_map = {str(k).lower(): k for k in obj.keys()}
+    for key in keys:
+        actual = lower_map.get(key.lower())
+        if actual is not None:
+            n = to_number(obj.get(actual))
+            if n is not None:
+                return n
+    return None
 
 
 def get_stock_number(product: Any) -> float | None:
-    return find_numeric_by_keys(product, STOCK_KEYS)
+    # Product-level fallback: sum quantityAvailable from skuList.
+    if isinstance(product, dict) and isinstance(product.get("skuList"), list):
+        total = 0.0
+        found = False
+        for sku in product["skuList"]:
+            if isinstance(sku, dict):
+                n = first_number(sku, "quantityAvailable", "quantityActive")
+                if n is not None:
+                    total += n
+                    found = True
+        return total if found else None
+    return None
+
+
+def format_product_line(product: Any) -> str:
+    product_id = pick(product, "productId", "id")
+    title = pick(product, "title", "name", "productTitle", default="—")
+    status = find_status(product)
+
+    sku_rows = flatten_sku_rows([product]) if isinstance(product, dict) else []
+    if sku_rows:
+        total = sum((r["total"] or 0) for r in sku_rows if r["total"] is not None)
+        fbo = sum((r["fbo"] or 0) for r in sku_rows if r["fbo"] is not None)
+        fbs = sum((r["fbs"] or 0) for r in sku_rows if r["fbs"] is not None)
+        price = sku_rows[0].get("price")
+        return (
+            f"• <code>{safe(product_id)}</code> — {safe(title)}\n"
+            f"  Цена: {format_money(price)} сум | FBO: <b>{safe(clean_num(fbo))}</b> | "
+            f"FBS/DBS: <b>{safe(clean_num(fbs))}</b> | Итого: <b>{safe(clean_num(total))}</b>"
+            + (f" | Статус: {safe(status_display(status))}" if status else "")
+        )
+
+    price = pick(product, "price", "sellPrice", "fullPrice", "currentPrice", "skuPrice", default="—")
+    return f"• <code>{safe(product_id)}</code> — {safe(title)}\n  Цена: {format_money(price)} сум" + (f" | Статус: {safe(status_display(status))}" if status else "")
+
+
+def format_sku_stock_line(row: dict[str, Any], mode: str = "all") -> str:
+    sku_id = row.get("sku_id")
+    title = row.get("sku_full_title") or row.get("sku_title") or row.get("product_title")
+    price = row.get("price")
+    fbo = row.get("fbo")
+    fbs = row.get("fbs")
+    total = row.get("total")
+    active = row.get("active")
+    status = row.get("status")
+
+    if mode == "fbo":
+        stock_part = f"FBO: <b>{safe(clean_num(fbo))}</b>"
+    elif mode == "fbs":
+        stock_part = f"FBS/DBS: <b>{safe(clean_num(fbs))}</b>"
+    else:
+        stock_part = (
+            f"FBO: <b>{safe(clean_num(fbo))}</b> | "
+            f"FBS/DBS: <b>{safe(clean_num(fbs))}</b> | "
+            f"Итого: <b>{safe(clean_num(total))}</b>"
+        )
+
+    extra = f" | Активно: {safe(clean_num(active))}" if active is not None and active != total else ""
+    return (
+        f"• <code>{safe(sku_id)}</code> — {safe(title)}\n"
+        f"  {stock_part}{extra} | Цена: {format_money(price)} сум"
+        + (f" | Статус: {safe(status_display(status))}" if status else "")
+    )
 
 
 def format_order_line(order: Any) -> str:

@@ -90,6 +90,19 @@ class UzumClient:
         }
         return await self._request("GET", "/v2/fbs/orders/count", params=params)
 
+
+    async def get_fbs_sku_stocks(self, *, page: int = 0, size: int = 50) -> Any:
+        """Get exact FBS/DBS SKU stock quantities.
+
+        Uzum OpenAPI v3 endpoint is paginated and is not tied to a shop_id in the
+        public schema; it returns SKU stocks available for this seller token.
+        """
+        params = {
+            "page": page,
+            "size": size,
+        }
+        return await self._request("GET", "/v3/fbs/sku/stocks", params=params)
+
     async def get_expenses(self, *, shop_id: int | None = None, page: int = 0, size: int = 20) -> Any:
         params: dict[str, Any] = {"page": page, "size": size}
         if shop_id is not None:

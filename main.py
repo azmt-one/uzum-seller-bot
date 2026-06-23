@@ -20,16 +20,18 @@ from openpyxl import Workbook
 
 from db import Database, TokenCipher
 from formatters import (
+    clean_num,
     compact_json_preview,
     excel_value,
     extract_items,
+    flatten_sku_rows,
     format_order_line,
     format_product_line,
     format_shop_line,
-    get_stock_number,
-    has_any_numeric_stock,
+    format_sku_stock_line,
     pick,
-    stock_display,
+    safe,
+    status_display,
 )
 from uzum_client import UzumClient
 
@@ -39,7 +41,6 @@ logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 UZUM_API_BASE_URL = os.getenv("UZUM_API_BASE_URL", "https://api-seller.uzum.uz/api/seller-openapi").strip()
-OWNER_TELEGRAM_ID = os.getenv("OWNER_TELEGRAM_ID", "").strip()
 DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
 
@@ -116,6 +117,24 @@ def parse_args(text: str) -> str:
     return parts[1].strip() if len(parts) > 1 else ""
 
 
+async def load_products(client: UzumClient, shop_id: int, *, search_query: str = "", max_pages: int = 20, page_size: int = 100) -> list[Any]:
+    all_products: list[Any] = []
+    for page in range(max_pages):
+        data = await client.get_products(shop_id, search_query=search_query, page=page, size=page_size)
+        items = extract_items(data)
+        if not items:
+            break
+        all_products.extend(items)
+        if len(items) < page_size:
+            break
+    return all_products
+
+
+async def load_sku_rows(client: UzumClient, shop_id: int, *, search_query: str = "", max_pages: int = 20) -> list[dict[str, Any]]:
+    products = await load_products(client, shop_id, search_query=search_query, max_pages=max_pages, page_size=100)
+    return flatten_sku_rows(products)
+
+
 async def connect_token(message: Message, token: str, state: FSMContext | None = None) -> None:
     telegram_id = upsert_from_message(message)
     token = token.strip()
@@ -151,7 +170,7 @@ async def connect_token(message: Message, token: str, state: FSMContext | None =
             + "\n".join(lines)
             + "\n\nОсновной магазин: "
             + (f"<code>{default_shop_id}</code>" if default_shop_id else "не выбран")
-            + "\n\nПроверка: <code>/products</code> или <code>/lowstock</code>"
+            + "\n\nПроверка остатков: <code>/stock</code> или <code>/lowstock</code>"
         )
 
         if state:
@@ -173,12 +192,14 @@ async def start(message: Message) -> None:
         "• <code>/disconnect</code> — удалить подключение\n"
         "• <code>/shops</code> — мои магазины\n"
         "• <code>/setshop SHOP_ID</code> — выбрать основной магазин\n"
-        "• <code>/products [поиск]</code> — товары и остатки\n"
-        "• <code>/stock [поиск]</code> — то же самое, короткая команда\n"
-        "• <code>/lowstock [порог]</code> — товары, которые заканчиваются\n"
+        "• <code>/products [поиск]</code> — товары, цены и общий остаток\n"
+        "• <code>/stock [поиск]</code> — FBO + FBS/DBS + итого по SKU\n"
+        "• <code>/fbo [поиск]</code> — остатки FBO\n"
+        "• <code>/fbs [поиск]</code> — остатки FBS/DBS\n"
+        "• <code>/lowstock [порог]</code> — товары, которые заканчиваются по общему остатку\n"
         "• <code>/orders [CREATED]</code> — FBS/DBS заказы\n"
-        "• <code>/export_products</code> — Excel-выгрузка товаров\n"
-        "• <code>/debug_product</code> — показать сырой ответ первого товара для настройки полей\n"
+        "• <code>/export_products</code> — Excel: FBO, FBS/DBS, итого\n"
+        "• <code>/debug_product</code> — сырой JSON первого товара\n"
         "• <code>/status</code> — статус подключения\n\n"
         "Для начала нажмите: <code>/connect</code>"
     )
@@ -303,7 +324,7 @@ async def setshop(message: Message) -> None:
     await message.answer(f"✅ Основной магазин выбран: <code>{shop_id}</code>")
 
 
-@dp.message(Command("products", "stock"))
+@dp.message(Command("products"))
 async def products(message: Message) -> None:
     req = await require_connection(message)
     if req is None:
@@ -327,6 +348,56 @@ async def products(message: Message) -> None:
         await send_api_error(message, e)
 
 
+async def send_stock_list(message: Message, mode: str = "all") -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+    search_query = parse_args(message.text or "")
+
+    try:
+        rows = await load_sku_rows(client, shop_id, search_query=search_query, max_pages=10)
+        if not rows:
+            await message.answer("SKU-остатки не найдены.")
+            return
+
+        if mode == "fbo":
+            rows = [r for r in rows if (r.get("fbo") or 0) > 0]
+            title = "📦 <b>Остатки FBO / склад Uzum</b>"
+        elif mode == "fbs":
+            rows = [r for r in rows if (r.get("fbs") or 0) > 0]
+            title = "📦 <b>Остатки FBS/DBS / склад продавца</b>"
+        else:
+            title = "📦 <b>Остатки по SKU: FBO + FBS/DBS + итого</b>"
+
+        if search_query:
+            title += f"\nПоиск: <b>{escape(search_query)}</b>"
+
+        if not rows:
+            await message.answer(title + "\n\nНичего не найдено.")
+            return
+
+        lines = [format_sku_stock_line(row, mode=mode) for row in rows[:25]]
+        await message.answer(title + f"\nПоказано: {min(len(rows), 25)} из {len(rows)}\n\n" + "\n\n".join(lines))
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+@dp.message(Command("stock"))
+async def stock(message: Message) -> None:
+    await send_stock_list(message, mode="all")
+
+
+@dp.message(Command("fbo"))
+async def fbo(message: Message) -> None:
+    await send_stock_list(message, mode="fbo")
+
+
+@dp.message(Command("fbs"))
+async def fbs(message: Message) -> None:
+    await send_stock_list(message, mode="fbs")
+
+
 @dp.message(Command("lowstock"))
 async def lowstock(message: Message) -> None:
     req = await require_connection(message)
@@ -338,31 +409,22 @@ async def lowstock(message: Message) -> None:
     threshold = int(arg) if arg.isdigit() else 5
 
     try:
-        data = await client.get_products(shop_id, page=0, size=100)
-        items = extract_items(data)
-        low = [item for item in items if (get_stock_number(item) is not None and get_stock_number(item) <= threshold)]
-
-        if not items:
-            await message.answer("Товары не найдены.")
+        rows = await load_sku_rows(client, shop_id, max_pages=20)
+        if not rows:
+            await message.answer("SKU-остатки не найдены.")
             return
 
-        if not has_any_numeric_stock(items):
-            status_lines = [format_product_line(item) for item in items[:10]]
-            await message.answer(
-                "⚠️ В ответе Uzum API по этим товарам нет числового поля остатка. "
-                "Сейчас бот видит только статус товара, поэтому не может честно определить товары ≤ "
-                f"{threshold}.\n\n"
-                "Первые товары со статусом:\n\n" + "\n\n".join(status_lines) +
-                "\n\nДля точной настройки отправьте команду <code>/debug_product</code>."
-            )
-            return
+        low = [r for r in rows if r.get("total") is not None and r["total"] <= threshold]
 
         if not low:
-            await message.answer(f"✅ В первых {len(items)} товарах нет остатков ≤ {threshold}.")
+            await message.answer(f"✅ В первых {len(rows)} SKU нет общего остатка ≤ {threshold}.")
             return
 
-        lines = [format_product_line(item) for item in low[:20]]
-        await message.answer(f"⚠️ <b>Низкие остатки ≤ {threshold}:</b>\n\n" + "\n\n".join(lines))
+        lines = [format_sku_stock_line(row, mode="all") for row in low[:30]]
+        await message.answer(
+            f"⚠️ <b>Низкие остатки по общему количеству ≤ {threshold}:</b>\n"
+            f"Показано: {min(len(low), 30)} из {len(low)}\n\n" + "\n\n".join(lines)
+        )
     except Exception as e:
         await send_api_error(message, e)
 
@@ -404,8 +466,7 @@ async def debug_product(message: Message) -> None:
             return
 
         await message.answer(
-            "🔎 <b>Первый товар — сырой JSON</b>\n"
-            "Нужен, чтобы точно понять поле остатка у Uzum для вашего магазина.\n\n"
+            "🔎 <b>Первый товар — сырой JSON</b>\n\n"
             "<pre>" + escape(compact_json_preview(items[0], limit=3200)) + "</pre>"
         )
     except Exception as e:
@@ -419,46 +480,68 @@ async def export_products(message: Message) -> None:
         return
     _, client, shop_id = req
 
-    search_query = parse_args(message.text or "")
-
     try:
-        all_items: list[Any] = []
-        for page in range(5):
-            data = await client.get_products(shop_id, search_query=search_query, page=page, size=100)
-            items = extract_items(data)
-            if not items:
-                break
-            all_items.extend(items)
-            if len(items) < 100:
-                break
+        rows = await load_sku_rows(client, shop_id, max_pages=50)
 
-        if not all_items:
-            await message.answer("Товары для экспорта не найдены.")
+        if not rows:
+            await message.answer("SKU-остатки для экспорта не найдены.")
             return
 
         wb = Workbook()
         ws = wb.active
-        ws.title = "Products"
-        ws.append(["SKU/ID", "Название", "Цена", "Остаток", "Статус"])
+        ws.title = "Stocks"
+        ws.append([
+            "Product ID",
+            "SKU ID",
+            "Barcode",
+            "Seller code",
+            "Category",
+            "Product title",
+            "SKU title",
+            "Price",
+            "FBO / склад Uzum",
+            "FBS/DBS / склад продавца",
+            "Итого доступно",
+            "Активно",
+            "Продано",
+            "Возвраты",
+            "Недостача",
+            "Брак",
+            "Ожидает",
+            "Статус",
+        ])
 
-        for item in all_items:
+        for r in rows:
             ws.append([
-                excel_value(pick(item, "skuId", "sku", "id", "productId")),
-                excel_value(pick(item, "title", "name", "skuTitle", "productTitle", "skuFullName")),
-                excel_value(pick(item, "price", "sellPrice", "fullPrice", "currentPrice", "skuPrice")),
-                excel_value(stock_display(item)),
-                excel_value(pick(item, "status", "state", "productStatus", "skuStatus", "availability")),
+                excel_value(r.get("product_id")),
+                excel_value(r.get("sku_id")),
+                excel_value(r.get("barcode")),
+                excel_value(r.get("seller_item_code")),
+                excel_value(r.get("category")),
+                excel_value(r.get("product_title")),
+                excel_value(r.get("sku_full_title") or r.get("sku_title")),
+                excel_value(r.get("price")),
+                excel_value(r.get("fbo")),
+                excel_value(r.get("fbs")),
+                excel_value(r.get("total")),
+                excel_value(r.get("active")),
+                excel_value(r.get("sold")),
+                excel_value(r.get("returned")),
+                excel_value(r.get("missing")),
+                excel_value(r.get("defected")),
+                excel_value(r.get("pending")),
+                excel_value(status_display(r.get("status")) if r.get("status") else ""),
             ])
 
         for column in ws.columns:
             max_len = max(len(str(cell.value or "")) for cell in column)
-            ws.column_dimensions[column[0].column_letter].width = min(max(max_len + 2, 12), 60)
+            ws.column_dimensions[column[0].column_letter].width = min(max(max_len + 2, 12), 70)
 
         tmp_dir = Path(tempfile.gettempdir())
-        filename = tmp_dir / f"uzum_products_{shop_id}.xlsx"
+        filename = tmp_dir / f"uzum_stocks_{shop_id}.xlsx"
         wb.save(filename)
 
-        await message.answer(f"✅ Экспортировано товаров: {len(all_items)}")
+        await message.answer(f"✅ Экспортировано SKU-остатков: {len(rows)}")
         await message.answer_document(FSInputFile(filename))
     except Exception as e:
         await send_api_error(message, e)
