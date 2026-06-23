@@ -12,7 +12,7 @@ class UzumApiError(Exception):
 class UzumClient:
     def __init__(self, token: str, base_url: str = "https://api-seller.uzum.uz/api/seller-openapi") -> None:
         if not token:
-            raise ValueError("UZUM_API_TOKEN is empty")
+            raise ValueError("Uzum API token is empty")
         self.base_url = base_url.rstrip("/")
         self.headers = {
             # Uzum Seller OpenAPI: token goes to Authorization header without "Bearer".
