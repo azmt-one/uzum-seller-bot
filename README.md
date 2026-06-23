@@ -15,6 +15,7 @@
 - `/lowstock [порог]` — товары с низким остатком
 - `/orders [status]` — FBS/DBS заказы
 - `/export_products` — выгрузка товаров в Excel
+- `/debug_product` — показать сырой JSON первого товара для настройки полей Uzum
 
 ## Переменные окружения
 
@@ -60,3 +61,11 @@ python main.py
 ## Важно для продакшена
 
 SQLite подходит только для MVP/теста. Для коммерческого запуска лучше перейти на PostgreSQL, чтобы данные не потерялись при пересборке/миграции сервера.
+
+
+## Fix 1
+
+- Excel export no longer crashes when Uzum returns status as an object.
+- Product output now shows status when numeric stock is not returned.
+- `/lowstock` no longer falsely says there are no low stocks when numeric stock is missing.
+- Added `/debug_product` to inspect the actual product response and map the correct stock field.

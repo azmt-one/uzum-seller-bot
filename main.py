@@ -21,12 +21,15 @@ from openpyxl import Workbook
 from db import Database, TokenCipher
 from formatters import (
     compact_json_preview,
+    excel_value,
     extract_items,
     format_order_line,
     format_product_line,
     format_shop_line,
     get_stock_number,
+    has_any_numeric_stock,
     pick,
+    stock_display,
 )
 from uzum_client import UzumClient
 
@@ -175,6 +178,7 @@ async def start(message: Message) -> None:
         "• <code>/lowstock [порог]</code> — товары, которые заканчиваются\n"
         "• <code>/orders [CREATED]</code> — FBS/DBS заказы\n"
         "• <code>/export_products</code> — Excel-выгрузка товаров\n"
+        "• <code>/debug_product</code> — показать сырой ответ первого товара для настройки полей\n"
         "• <code>/status</code> — статус подключения\n\n"
         "Для начала нажмите: <code>/connect</code>"
     )
@@ -338,6 +342,21 @@ async def lowstock(message: Message) -> None:
         items = extract_items(data)
         low = [item for item in items if (get_stock_number(item) is not None and get_stock_number(item) <= threshold)]
 
+        if not items:
+            await message.answer("Товары не найдены.")
+            return
+
+        if not has_any_numeric_stock(items):
+            status_lines = [format_product_line(item) for item in items[:10]]
+            await message.answer(
+                "⚠️ В ответе Uzum API по этим товарам нет числового поля остатка. "
+                "Сейчас бот видит только статус товара, поэтому не может честно определить товары ≤ "
+                f"{threshold}.\n\n"
+                "Первые товары со статусом:\n\n" + "\n\n".join(status_lines) +
+                "\n\nДля точной настройки отправьте команду <code>/debug_product</code>."
+            )
+            return
+
         if not low:
             await message.answer(f"✅ В первых {len(items)} товарах нет остатков ≤ {threshold}.")
             return
@@ -366,6 +385,29 @@ async def orders(message: Message) -> None:
 
         lines = [format_order_line(item) for item in items[:10]]
         await message.answer(f"🧾 <b>Заказы {escape(status)} для магазина <code>{shop_id}</code>:</b>\n\n" + "\n".join(lines))
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+@dp.message(Command("debug_product"))
+async def debug_product(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+
+    try:
+        data = await client.get_products(shop_id, page=0, size=1)
+        items = extract_items(data)
+        if not items:
+            await message.answer("Товар для debug не найден. Ответ API:\n<pre>" + escape(compact_json_preview(data, limit=3000)) + "</pre>")
+            return
+
+        await message.answer(
+            "🔎 <b>Первый товар — сырой JSON</b>\n"
+            "Нужен, чтобы точно понять поле остатка у Uzum для вашего магазина.\n\n"
+            "<pre>" + escape(compact_json_preview(items[0], limit=3200)) + "</pre>"
+        )
     except Exception as e:
         await send_api_error(message, e)
 
@@ -401,11 +443,11 @@ async def export_products(message: Message) -> None:
 
         for item in all_items:
             ws.append([
-                pick(item, "skuId", "sku", "id", "productId"),
-                pick(item, "title", "name", "skuTitle", "productTitle", "skuFullName"),
-                pick(item, "price", "sellPrice", "fullPrice", "currentPrice", "skuPrice"),
-                pick(item, "leftover", "leftovers", "quantity", "amount", "availableAmount", "stock", "stockAmount", "fbsAmount"),
-                pick(item, "status", "state", "productStatus"),
+                excel_value(pick(item, "skuId", "sku", "id", "productId")),
+                excel_value(pick(item, "title", "name", "skuTitle", "productTitle", "skuFullName")),
+                excel_value(pick(item, "price", "sellPrice", "fullPrice", "currentPrice", "skuPrice")),
+                excel_value(stock_display(item)),
+                excel_value(pick(item, "status", "state", "productStatus", "skuStatus", "availability")),
             ])
 
         for column in ws.columns:
