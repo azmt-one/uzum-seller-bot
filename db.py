@@ -1,5 +1,5 @@
 from __future__ import annotations
-
+import os
 import json
 import sqlite3
 from datetime import datetime, timezone
@@ -15,6 +15,11 @@ def now_iso() -> str:
 class Database:
     def __init__(self, path: str = "bot.db") -> None:
         self.path = path
+
+        folder = os.path.dirname(self.path)
+        if folder:
+            os.makedirs(folder, exist_ok=True)
+
         self._init()
 
     def connect(self) -> sqlite3.Connection:
