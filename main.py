@@ -77,6 +77,13 @@ SALE_NOTIFICATIONS = (
     not in {"0", "false", "no", "off"}
 )
 SALE_CHECK_INTERVAL_SECONDS = int(os.getenv("SALE_CHECK_INTERVAL_SECONDS", "300") or "300")
+STOCK_CHANGE_NOTIFICATIONS = (
+    os.getenv("STOCK_CHANGE_NOTIFICATIONS", "1").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
+STOCK_CHANGE_CHECK_INTERVAL_SECONDS = int(
+    os.getenv("STOCK_CHANGE_CHECK_INTERVAL_SECONDS", "300") or "300"
+)
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError(
@@ -94,11 +101,13 @@ bot = Bot(
 dp = Dispatcher()
 
 # Минималистичное меню по разделам.
-# Главное меню показывает только крупные разделы, а внутри — нужные действия.
+# ВАЖНО: в разделах явно разделены FBO и FBS/DBS.
+# FBS/DBS-заказы берём из Orders API, а FBO лучше отслеживать через остатки,
+# потому что FBO-заказ может не появляться в /orders CREATED.
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Аналитика"), KeyboardButton(text="📦 Товары")],
-        [KeyboardButton(text="🛒 Заказы"), KeyboardButton(text="🔔 Уведомления")],
+        [KeyboardButton(text="🛒 Заказы/продажи"), KeyboardButton(text="🔔 Уведомления")],
         [KeyboardButton(text="⭐ Отзывы"), KeyboardButton(text="⚙️ Настройки")],
     ],
     resize_keyboard=True,
@@ -107,8 +116,8 @@ MAIN_MENU = ReplyKeyboardMarkup(
 
 ANALYTICS_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📈 Сводка")],
-        [KeyboardButton(text="📊 Сводка заказов")],
+        [KeyboardButton(text="💰 Продажи Finance"), KeyboardButton(text="📈 Сводка FBO/FBS")],
+        [KeyboardButton(text="📊 Сводка FBS/DBS"), KeyboardButton(text="📦 FBO/FBS движение")],
         [KeyboardButton(text="⬅️ Главное меню")],
     ],
     resize_keyboard=True,
@@ -117,32 +126,35 @@ ANALYTICS_MENU = ReplyKeyboardMarkup(
 
 PRODUCTS_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📦 Все товары"), KeyboardButton(text="📊 Остатки")],
+        [KeyboardButton(text="📦 Все товары"), KeyboardButton(text="📊 Все остатки")],
+        [KeyboardButton(text="🏬 Остатки FBO"), KeyboardButton(text="🚚 Остатки FBS/DBS")],
         [KeyboardButton(text="⚠️ Заканчиваются"), KeyboardButton(text="📄 Excel-отчёт")],
         [KeyboardButton(text="⬅️ Главное меню")],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Товары и остатки",
+    input_field_placeholder="Товары: FBO + FBS/DBS",
 )
 
 ORDERS_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🛒 Новые заказы")],
-        [KeyboardButton(text="📊 Сводка заказов")],
+        [KeyboardButton(text="🛒 FBS/DBS заказы")],
+        [KeyboardButton(text="📦 FBO/FBS движение остатков")],
+        [KeyboardButton(text="📊 Сводка FBS/DBS")],
         [KeyboardButton(text="⬅️ Главное меню")],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Заказы",
+    input_field_placeholder="Заказы и продажи",
 )
 
 NOTIFICATIONS_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔔 Новые заказы"), KeyboardButton(text="💸 Новые продажи")],
-        [KeyboardButton(text="📉 Низкие остатки"), KeyboardButton(text="❌ Нет в наличии")],
+        [KeyboardButton(text="🔔 FBS/DBS новые заказы"), KeyboardButton(text="💸 Продажи Finance")],
+        [KeyboardButton(text="📦 Изменение FBO/FBS")],
+        [KeyboardButton(text="📉 Низкие остатки FBO/FBS"), KeyboardButton(text="❌ Нет в наличии")],
         [KeyboardButton(text="⬅️ Главное меню")],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Уведомления",
+    input_field_placeholder="Уведомления FBO + FBS/DBS",
 )
 
 SETTINGS_MENU = ReplyKeyboardMarkup(
@@ -331,9 +343,10 @@ async def start(message: Message) -> None:
         "• <code>/export_products</code> — Excel: FBO, FBS/DBS, итого\n"
         "• <code>/debug_product</code> — сырой JSON первого товара\n"
         "• <code>/status</code> — статус подключения\n"
-        "• <code>/notify_status</code> — статус уведомлений о новых заказах\n"
-        "• <code>/lowstock_notify_status</code> — статус уведомлений о низких остатках\n"
-        "• <code>/outofstock_notify_status</code> — статус уведомлений о нулевых остатках\n\n"
+        "• <code>/notify_status</code> — уведомления о новых FBS/DBS заказах\n"
+        "• <code>/lowstock_notify_status</code> — низкие остатки FBO + FBS/DBS\n"
+        "• <code>/outofstock_notify_status</code> — нулевые остатки FBO + FBS/DBS\n"
+        "• <code>/stock_change_notify_status</code> — изменение остатков FBO + FBS/DBS\n\n"
         "Для начала нажмите: <code>/connect</code>",
         reply_markup=MAIN_MENU,
     )
@@ -2103,6 +2116,172 @@ async def sales_notify_status(message: Message) -> None:
     )
 
 
+
+# --- Уведомления об изменении остатков: FBO + FBS/DBS ---
+# Это нужно для FBO-продаж: FBO-заказ может не появиться в FBS/DBS CREATED,
+# но остаток на складе Uzum уменьшается. Бот сравнивает общий остаток, FBO и FBS.
+_stock_snapshot_by_user: dict[int, dict[str, dict[str, Any]]] = {}
+_stock_change_watch_initialized: set[int] = set()
+
+
+def _stock_qty(value: Any) -> int:
+    num = _num_from_value(value)
+    if num is None:
+        return 0
+    return int(num)
+
+
+def _stock_snapshot_item(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "total": _stock_qty(row.get("total")),
+        "fbo": _stock_qty(row.get("fbo")),
+        "fbs": _stock_qty(row.get("fbs")),
+        "title": str(
+            row.get("title")
+            or row.get("productTitle")
+            or row.get("skuTitle")
+            or row.get("name")
+            or row.get("product_name")
+            or "SKU"
+        ),
+        "price": row.get("price"),
+        "row": row,
+    }
+
+
+def _stock_change_snapshot(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    snapshot: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        snapshot[stock_row_key(row)] = _stock_snapshot_item(row)
+    return snapshot
+
+
+def _format_stock_change_line(key: str, before: dict[str, Any], after: dict[str, Any]) -> str:
+    title = escape(str(after.get("title") or before.get("title") or key))
+    old_total = int(before.get("total") or 0)
+    new_total = int(after.get("total") or 0)
+    old_fbo = int(before.get("fbo") or 0)
+    new_fbo = int(after.get("fbo") or 0)
+    old_fbs = int(before.get("fbs") or 0)
+    new_fbs = int(after.get("fbs") or 0)
+
+    parts = []
+    if old_total != new_total:
+        parts.append(f"Итого: <b>{old_total}</b> → <b>{new_total}</b>")
+    if old_fbo != new_fbo:
+        parts.append(f"FBO: <b>{old_fbo}</b> → <b>{new_fbo}</b>")
+    if old_fbs != new_fbs:
+        parts.append(f"FBS/DBS: <b>{old_fbs}</b> → <b>{new_fbs}</b>")
+    if not parts:
+        parts.append("остаток изменился")
+
+    delta = new_total - old_total
+    delta_text = f" | Разница: <b>{delta}</b> шт" if delta else ""
+    return f"• <b>{title}</b>\n  " + " | ".join(parts) + delta_text
+
+
+async def check_stock_change_once() -> None:
+    users = connected_users_for_order_watch()
+
+    for row in users:
+        telegram_id = int(row["telegram_id"])
+        shop_id = int(row["default_shop_id"])
+        encrypted_token = row["uzum_token_encrypted"]
+
+        try:
+            token = cipher.decrypt(encrypted_token)
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            rows = await load_sku_rows(client, shop_id, max_pages=20)
+            snapshot_now = _stock_change_snapshot(rows)
+        except Exception:
+            logging.exception("Stock change watcher: failed to check stocks for %s", telegram_id)
+            continue
+
+        previous = _stock_snapshot_by_user.setdefault(telegram_id, {})
+
+        # Первый проход: только запоминаем, чтобы не прислать старые изменения.
+        if telegram_id not in _stock_change_watch_initialized:
+            _stock_snapshot_by_user[telegram_id] = snapshot_now
+            _stock_change_watch_initialized.add(telegram_id)
+            logging.info(
+                "Stock change watcher initialized for user=%s shop=%s skus=%s",
+                telegram_id,
+                shop_id,
+                len(snapshot_now),
+            )
+            continue
+
+        decreased: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+        for key, after in snapshot_now.items():
+            before = previous.get(key)
+            if not before:
+                continue
+            before_total = int(before.get("total") or 0)
+            after_total = int(after.get("total") or 0)
+            before_fbo = int(before.get("fbo") or 0)
+            after_fbo = int(after.get("fbo") or 0)
+            before_fbs = int(before.get("fbs") or 0)
+            after_fbs = int(after.get("fbs") or 0)
+
+            if after_total < before_total or after_fbo < before_fbo or after_fbs < before_fbs:
+                decreased.append((key, before, after))
+
+        _stock_snapshot_by_user[telegram_id] = snapshot_now
+
+        if not decreased:
+            continue
+
+        lines = [_format_stock_change_line(key, before, after) for key, before, after in decreased[:10]]
+        more = "" if len(decreased) <= 10 else f"\n\nЕщё изменений: {len(decreased) - 10}"
+        text = (
+            "📦 <b>Изменение остатков</b>\n"
+            f"Магазин: <code>{shop_id}</code>\n"
+            "Уменьшился остаток по SKU. Это может быть продажа, резерв, списание или изменение склада.\n\n"
+            + "\n\n".join(lines)
+            + more
+            + "\n\nПроверить остатки: <code>/stock</code>"
+        )
+
+        try:
+            await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+        except Exception:
+            logging.exception("Stock change watcher: failed to send notification to %s", telegram_id)
+
+
+async def stock_change_watch_loop() -> None:
+    await asyncio.sleep(70)
+    logging.info(
+        "Stock change watcher started. Interval: %s seconds. Enabled: %s",
+        STOCK_CHANGE_CHECK_INTERVAL_SECONDS,
+        STOCK_CHANGE_NOTIFICATIONS,
+    )
+    while True:
+        try:
+            await check_stock_change_once()
+        except Exception:
+            logging.exception("Stock change watcher loop error")
+        await asyncio.sleep(max(60, STOCK_CHANGE_CHECK_INTERVAL_SECONDS))
+
+
+@dp.message(Command("stock_change_notify_status"))
+async def stock_change_notify_status(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, _, shop_id = req
+    initialized = telegram_id in _stock_change_watch_initialized
+    await message.answer(
+        "📦 <b>Уведомления об изменении остатков</b>\n\n"
+        f"Статус: {'✅ включены' if STOCK_CHANGE_NOTIFICATIONS else '❌ выключены'}\n"
+        f"Магазин: <code>{shop_id}</code>\n"
+        f"Проверка каждые: <b>{max(60, STOCK_CHANGE_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
+        f"Состояние: {'остатки уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
+        "Бот сравнивает <b>FBO</b>, <b>FBS/DBS</b> и <b>общий остаток</b>. "
+        "Так можно поймать FBO-продажи, даже если Finance API показывает нули.",
+        reply_markup=MAIN_MENU,
+    )
+
 # --- Меню по разделам ---
 # Эти обработчики не заменяют старые /commands, а просто открывают разделы
 # или вызывают уже рабочие команды. Старые команды продолжают работать.
@@ -2125,15 +2304,16 @@ async def section_analytics(message: Message) -> None:
 async def section_products(message: Message) -> None:
     await message.answer(
         "📦 <b>Товары и остатки</b>\n\n"
-        "Выберите действие:",
+        "Здесь учитываем <b>FBO + FBS/DBS</b>. Выберите действие:",
         reply_markup=PRODUCTS_MENU,
     )
 
 
-@dp.message(F.text == "🛒 Заказы")
+@dp.message(F.text == "🛒 Заказы/продажи")
 async def section_orders(message: Message) -> None:
     await message.answer(
-        "🛒 <b>Заказы</b>\n\n"
+        "🛒 <b>Заказы/продажи</b>\n\n"
+        "FBS/DBS заказы идут через Orders API. FBO продажи отслеживаем через изменение остатков.\n\n"
         "Выберите действие:",
         reply_markup=ORDERS_MENU,
     )
@@ -2143,7 +2323,8 @@ async def section_orders(message: Message) -> None:
 async def section_notifications(message: Message) -> None:
     await message.answer(
         "🔔 <b>Уведомления</b>\n\n"
-        "Выберите тип уведомлений:",
+        "Разделено по FBS/DBS заказам, Finance продажам и движению FBO/FBS остатков.\n\n"
+        "Выберите тип:",
         reply_markup=NOTIFICATIONS_MENU,
     )
 
@@ -2160,16 +2341,19 @@ async def section_settings(message: Message) -> None:
 # --- Кнопки внутри разделов ---
 
 @dp.message(F.text == "📈 Сводка")
+@dp.message(F.text == "📈 Сводка FBO/FBS")
 async def button_dashboard(message: Message) -> None:
     await dashboard(message)
 
 
 @dp.message(F.text == "📊 Сводка заказов")
+@dp.message(F.text == "📊 Сводка FBS/DBS")
 async def button_orders_summary(message: Message) -> None:
     await orders_summary(message)
 
 
 @dp.message(F.text == "💰 Продажи")
+@dp.message(F.text == "💰 Продажи Finance")
 async def button_sales(message: Message) -> None:
     await sales(message)
 
@@ -2180,11 +2364,23 @@ async def button_products(message: Message) -> None:
 
 
 @dp.message(F.text == "📊 Остатки")
+@dp.message(F.text == "📊 Все остатки")
 async def button_stock(message: Message) -> None:
     await stock(message)
 
 
+@dp.message(F.text == "🏬 Остатки FBO")
+async def button_fbo_stock(message: Message) -> None:
+    await fbo(message)
+
+
+@dp.message(F.text == "🚚 Остатки FBS/DBS")
+async def button_fbs_stock(message: Message) -> None:
+    await fbs(message)
+
+
 @dp.message(F.text == "🛒 Новые заказы")
+@dp.message(F.text == "🛒 FBS/DBS заказы")
 async def button_orders(message: Message) -> None:
     await orders(message)
 
@@ -2210,16 +2406,27 @@ async def button_shops(message: Message) -> None:
 
 
 @dp.message(F.text == "🔔 Новые заказы")
+@dp.message(F.text == "🔔 FBS/DBS новые заказы")
 async def button_notify_status(message: Message) -> None:
     await notify_status(message)
 
 
 @dp.message(F.text == "💸 Новые продажи")
+@dp.message(F.text == "💸 Продажи Finance")
 async def button_sales_notify_status(message: Message) -> None:
     await sales_notify_status(message)
 
 
+@dp.message(F.text == "📦 Изменение остатков")
+@dp.message(F.text == "📦 Изменение FBO/FBS")
+@dp.message(F.text == "📦 FBO/FBS движение")
+@dp.message(F.text == "📦 FBO/FBS движение остатков")
+async def button_stock_change_notify_status(message: Message) -> None:
+    await stock_change_notify_status(message)
+
+
 @dp.message(F.text == "📉 Низкие остатки")
+@dp.message(F.text == "📉 Низкие остатки FBO/FBS")
 async def button_lowstock_notify_status(message: Message) -> None:
     await lowstock_notify_status(message)
 
@@ -2248,6 +2455,8 @@ async def main() -> None:
         asyncio.create_task(out_of_stock_watch_loop())
     if SALE_NOTIFICATIONS:
         asyncio.create_task(sales_watch_loop())
+    if STOCK_CHANGE_NOTIFICATIONS:
+        asyncio.create_task(stock_change_watch_loop())
     await dp.start_polling(bot)
 
 
