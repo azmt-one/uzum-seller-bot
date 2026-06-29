@@ -55,16 +55,6 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
-MAIN_MENU = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="📦 Товары"), KeyboardButton(text="📊 Остатки")],
-        [KeyboardButton(text="🛒 Заказы"), KeyboardButton(text="📉 Заканчиваются")],
-        [KeyboardButton(text="📄 Excel-отчёт"), KeyboardButton(text="⚙️ Статус")],
-        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="🔌 Подключение")],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Выберите раздел",
-)
 
 class ConnectStates(StatesGroup):
     waiting_for_token = State()
@@ -210,8 +200,7 @@ async def start(message: Message) -> None:
         "• <code>/export_products</code> — Excel: FBO, FBS/DBS, итого\n"
         "• <code>/debug_product</code> — сырой JSON первого товара\n"
         "• <code>/status</code> — статус подключения\n\n"
-        "Для начала нажмите: <code>/connect</code>",
-        reply_markup=MAIN_MENU,
+        "Для начала нажмите: <code>/connect</code>"
     )
 
 
