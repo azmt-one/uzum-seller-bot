@@ -14,7 +14,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import FSInputFile, Message, ReplyKeyboardMarkup, KeyboardButton
+from aiogram.types import FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 from openpyxl import Workbook
 
@@ -35,18 +35,26 @@ from formatters import (
 )
 from uzum_client import UzumClient
 
-
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-UZUM_API_BASE_URL = os.getenv("UZUM_API_BASE_URL", "https://api-seller.uzum.uz/api/seller-openapi").strip()
+TELEGRAM_BOT_TOKEN = (
+    os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    or os.getenv("TELEGRAM_TOKEN", "").strip()
+    or os.getenv("TOKEN", "").strip()
+)
+UZUM_API_BASE_URL = os.getenv(
+    "UZUM_API_BASE_URL", "https://api-seller.uzum.uz/api/seller-openapi"
+).strip()
 DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
 
 if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError("TELEGRAM_BOT_TOKEN is empty. Set it in BotHost environment variables.")
+    raise RuntimeError(
+        "TELEGRAM_BOT_TOKEN is empty. Set it in BotHost environment variables."
+    )
 
+# База и шифрование Uzum API-токена
 db = Database(DB_PATH)
 cipher = TokenCipher(ENCRYPTION_KEY)
 
@@ -55,16 +63,19 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
+
+# Простое надежное меню: кнопки отправляют обычные команды, которые уже работают.
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="/products"), KeyboardButton(text="/stock")],
         [KeyboardButton(text="/orders"), KeyboardButton(text="/lowstock")],
         [KeyboardButton(text="/export_products"), KeyboardButton(text="/status")],
-        [KeyboardButton(text="/shops")],
+        [KeyboardButton(text="/shops"), KeyboardButton(text="/help")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите команду",
 )
+
 
 class ConnectStates(StatesGroup):
     waiting_for_token = State()
@@ -100,14 +111,16 @@ async def require_connection(message: Message) -> tuple[int, UzumClient, int] | 
     if client is None:
         await message.answer(
             "Сначала подключите ваш Uzum Seller API-токен.\n\n"
-            "Команда: <code>/connect</code>"
+            "Команда: <code>/connect</code>",
+            reply_markup=MAIN_MENU,
         )
         return None
 
     if shop_id is None:
         await message.answer(
             "Токен подключён, но основной магазин не выбран.\n"
-            "Напишите <code>/shops</code>, потом <code>/setshop SHOP_ID</code>."
+            "Напишите <code>/shops</code>, потом <code>/setshop SHOP_ID</code>.",
+            reply_markup=MAIN_MENU,
         )
         return None
 
@@ -118,7 +131,7 @@ async def send_api_error(message: Message, error: Exception) -> None:
     text = escape(str(error))
     if len(text) > 3500:
         text = text[:3500] + "\n..."
-    await message.answer(f"⚠️ Ошибка API:\n<code>{text}</code>")
+    await message.answer(f"⚠️ Ошибка API:\n<code>{text}</code>", reply_markup=MAIN_MENU)
 
 
 def parse_args(text: str) -> str:
@@ -126,10 +139,19 @@ def parse_args(text: str) -> str:
     return parts[1].strip() if len(parts) > 1 else ""
 
 
-async def load_products(client: UzumClient, shop_id: int, *, search_query: str = "", max_pages: int = 20, page_size: int = 100) -> list[Any]:
+async def load_products(
+    client: UzumClient,
+    shop_id: int,
+    *,
+    search_query: str = "",
+    max_pages: int = 20,
+    page_size: int = 100,
+) -> list[Any]:
     all_products: list[Any] = []
     for page in range(max_pages):
-        data = await client.get_products(shop_id, search_query=search_query, page=page, size=page_size)
+        data = await client.get_products(
+            shop_id, search_query=search_query, page=page, size=page_size
+        )
         items = extract_items(data)
         if not items:
             break
@@ -139,28 +161,43 @@ async def load_products(client: UzumClient, shop_id: int, *, search_query: str =
     return all_products
 
 
-async def load_sku_rows(client: UzumClient, shop_id: int, *, search_query: str = "", max_pages: int = 20) -> list[dict[str, Any]]:
-    products = await load_products(client, shop_id, search_query=search_query, max_pages=max_pages, page_size=100)
+async def load_sku_rows(
+    client: UzumClient,
+    shop_id: int,
+    *,
+    search_query: str = "",
+    max_pages: int = 20,
+) -> list[dict[str, Any]]:
+    products = await load_products(
+        client, shop_id, search_query=search_query, max_pages=max_pages, page_size=100
+    )
     return flatten_sku_rows(products)
 
 
-async def connect_token(message: Message, token: str, state: FSMContext | None = None) -> None:
+async def connect_token(
+    message: Message, token: str, state: FSMContext | None = None
+) -> None:
     telegram_id = upsert_from_message(message)
     token = token.strip()
-
     if not token or len(token) < 20:
-        await message.answer("Похоже, это не Uzum API-токен. Отправьте полный токен или нажмите /cancel.")
+        await message.answer(
+            "Похоже, это не Uzum API-токен.\n"
+            "Отправьте полный токен или нажмите /cancel.",
+            reply_markup=MAIN_MENU,
+        )
         return
 
     try:
         client = UzumClient(token, UZUM_API_BASE_URL)
         data = await client.get_shops()
         shops = extract_items(data)
-
         if not shops:
             await message.answer(
                 "Токен сработал, но список магазинов не найден.\n"
-                "Ответ API:\n<pre>" + escape(compact_json_preview(data)) + "</pre>"
+                "Ответ API:\n<code>"
+                + escape(compact_json_preview(data))
+                + "</code>",
+                reply_markup=MAIN_MENU,
             )
             return
 
@@ -179,12 +216,11 @@ async def connect_token(message: Message, token: str, state: FSMContext | None =
             + "\n".join(lines)
             + "\n\nОсновной магазин: "
             + (f"<code>{default_shop_id}</code>" if default_shop_id else "не выбран")
-            + "\n\nПроверка остатков: <code>/stock</code> или <code>/lowstock</code>"
+            + "\n\nПроверка остатков: <code>/stock</code> или <code>/lowstock</code>",
+            reply_markup=MAIN_MENU,
         )
-
         if state:
             await state.clear()
-
     except Exception as e:
         await send_api_error(message, e)
 
@@ -193,10 +229,11 @@ async def connect_token(message: Message, token: str, state: FSMContext | None =
 async def start(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     connected = "✅ подключён" if db.has_uzum_connection(telegram_id) else "❌ не подключён"
-    await message.answer( 
+    await message.answer(
         "👋 <b>Uzum Seller Assistant</b>\n\n"
         f"Статус Uzum API: {connected}\n\n"
         "Основные команды:\n"
+        "• <code>/menu</code> — показать кнопки\n"
         "• <code>/connect</code> — подключить Uzum API-токен\n"
         "• <code>/disconnect</code> — удалить подключение\n"
         "• <code>/shops</code> — мои магазины\n"
@@ -205,19 +242,26 @@ async def start(message: Message) -> None:
         "• <code>/stock [поиск]</code> — FBO + FBS/DBS + итого по SKU\n"
         "• <code>/fbo [поиск]</code> — остатки FBO\n"
         "• <code>/fbs [поиск]</code> — остатки FBS/DBS\n"
-        "• <code>/lowstock [порог]</code> — товары, которые заканчиваются по общему остатку\n"
+        "• <code>/lowstock [порог]</code> — товары, которые заканчиваются\n"
         "• <code>/orders [CREATED]</code> — FBS/DBS заказы\n"
         "• <code>/export_products</code> — Excel: FBO, FBS/DBS, итого\n"
         "• <code>/debug_product</code> — сырой JSON первого товара\n"
         "• <code>/status</code> — статус подключения\n\n"
-        "Для начала нажмите: <code>/connect</code>"
+        "Для начала нажмите: <code>/connect</code>",
+        reply_markup=MAIN_MENU,
     )
+
+
+@dp.message(Command("menu"))
+async def menu(message: Message) -> None:
+    upsert_from_message(message)
+    await message.answer("Выберите команду 👇", reply_markup=MAIN_MENU)
 
 
 @dp.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Действие отменено.")
+    await message.answer("Действие отменено.", reply_markup=MAIN_MENU)
 
 
 @dp.message(Command("status"))
@@ -227,13 +271,13 @@ async def status(message: Message) -> None:
     shops = db.list_shops(telegram_id)
     connected = bool(user and user["uzum_token_encrypted"])
     default_shop_id = user["default_shop_id"] if user else None
-
     await message.answer(
-        "📌 <b>Статус</b>\n\n"
+        "⚙️ <b>Статус</b>\n\n"
         f"Uzum API: {'✅ подключён' if connected else '❌ не подключён'}\n"
         f"Магазинов: {len(shops)}\n"
         f"Основной магазин: {f'<code>{default_shop_id}</code>' if default_shop_id else 'не выбран'}\n\n"
-        "Подписки и trial добавим следующим шагом."
+        "Подписки и trial добавим следующим шагом.",
+        reply_markup=MAIN_MENU,
     )
 
 
@@ -247,11 +291,12 @@ async def connect(message: Message, state: FSMContext) -> None:
     upsert_from_message(message)
     await state.set_state(ConnectStates.waiting_for_token)
     await message.answer(
-        "Отправьте ваш <b>Uzum Seller OpenAPI token</b> следующим сообщением.\n\n"
+        "Отправьте ваш Uzum Seller OpenAPI token следующим сообщением.\n\n"
         "Важно:\n"
         "• токен будет сохранён в зашифрованном виде;\n"
         "• после проверки я постараюсь удалить сообщение с токеном;\n"
-        "• отменить: <code>/cancel</code>."
+        "• отменить: <code>/cancel</code>.",
+        reply_markup=MAIN_MENU,
     )
 
 
@@ -264,7 +309,10 @@ async def connect_waiting_token(message: Message, state: FSMContext) -> None:
 async def disconnect(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     db.disconnect_uzum(telegram_id)
-    await message.answer("✅ Подключение к Uzum API удалено. Можно подключить заново через <code>/connect</code>.")
+    await message.answer(
+        "✅ Подключение к Uzum API удалено. Можно подключить заново через <code>/connect</code>.",
+        reply_markup=MAIN_MENU,
+    )
 
 
 @dp.message(Command("pinguzum"))
@@ -272,13 +320,15 @@ async def ping_uzum(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     client = get_uzum_for_user(telegram_id)
     if client is None:
-        await message.answer("Сначала подключите Uzum API-токен: <code>/connect</code>")
+        await message.answer(
+            "Сначала подключите Uzum API-токен: <code>/connect</code>",
+            reply_markup=MAIN_MENU,
+        )
         return
-
     try:
         data = await client.get_shops()
         shops = extract_items(data)
-        await message.answer(f"✅ Uzum API отвечает. Найдено магазинов: {len(shops)}")
+        await message.answer(f"✅ Uzum API отвечает. Найдено магазинов: {len(shops)}", reply_markup=MAIN_MENU)
     except Exception as e:
         await send_api_error(message, e)
 
@@ -288,20 +338,24 @@ async def shops(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     client = get_uzum_for_user(telegram_id)
     if client is None:
-        await message.answer("Сначала подключите Uzum API-токен: <code>/connect</code>")
+        await message.answer("Сначала подключите Uzum API-токен: <code>/connect</code>", reply_markup=MAIN_MENU)
         return
 
     try:
         data = await client.get_shops()
         items = extract_items(data)
         if not items:
-            await message.answer("Ответ получен, но список магазинов не найден:\n<pre>" + escape(compact_json_preview(data)) + "</pre>")
+            await message.answer(
+                "Ответ получен, но список магазинов не найден:\n<code>"
+                + escape(compact_json_preview(data))
+                + "</code>",
+                reply_markup=MAIN_MENU,
+            )
             return
 
         encrypted = db.get_encrypted_token(telegram_id)
         if encrypted:
             db.save_connection(telegram_id, encrypted, items)
-
         current = db.get_default_shop_id(telegram_id)
         lines = [format_shop_line(item) for item in items[:30]]
         await message.answer(
@@ -309,7 +363,8 @@ async def shops(message: Message) -> None:
             + "\n".join(lines)
             + "\n\nТекущий основной магазин: "
             + (f"<code>{current}</code>" if current else "не выбран")
-            + "\n\nЧтобы выбрать: <code>/setshop SHOP_ID</code>"
+            + "\n\nЧтобы выбрать: <code>/setshop SHOP_ID</code>",
+            reply_markup=MAIN_MENU,
         )
     except Exception as e:
         await send_api_error(message, e)
@@ -319,18 +374,20 @@ async def shops(message: Message) -> None:
 async def setshop(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     arg = parse_args(message.text or "")
-
     if not arg.isdigit():
-        await message.answer("Напишите так: <code>/setshop SHOP_ID</code>\nНапример: <code>/setshop 12345</code>")
+        await message.answer(
+            "Напишите так: <code>/setshop SHOP_ID</code>\nНапример: <code>/setshop 12345</code>",
+            reply_markup=MAIN_MENU,
+        )
         return
 
     shop_id = int(arg)
     ok = db.set_default_shop_id(telegram_id, shop_id)
     if not ok:
-        await message.answer("Этот магазин не найден среди подключённых. Сначала обновите список: <code>/shops</code>")
+        await message.answer("Этот магазин не найден среди подключённых. Сначала обновите список: <code>/shops</code>", reply_markup=MAIN_MENU)
         return
 
-    await message.answer(f"✅ Основной магазин выбран: <code>{shop_id}</code>")
+    await message.answer(f"✅ Основной магазин выбран: <code>{shop_id}</code>", reply_markup=MAIN_MENU)
 
 
 @dp.message(Command("products"))
@@ -345,14 +402,19 @@ async def products(message: Message) -> None:
         data = await client.get_products(shop_id, search_query=search_query, page=0, size=10)
         items = extract_items(data)
         if not items:
-            await message.answer("Товары не найдены. Ответ API:\n<pre>" + escape(compact_json_preview(data)) + "</pre>")
+            await message.answer(
+                "Товары не найдены. Ответ API:\n<code>"
+                + escape(compact_json_preview(data))
+                + "</code>",
+                reply_markup=MAIN_MENU,
+            )
             return
 
-        title = f"📦 <b>Товары магазина <code>{shop_id}</code></b>"
+        title = f"📦 <b>Товары магазина</b> <code>{shop_id}</code>"
         if search_query:
             title += f" по запросу “{escape(search_query)}”"
         lines = [format_product_line(item) for item in items[:10]]
-        await message.answer(title + ":\n\n" + "\n\n".join(lines))
+        await message.answer(title + ":\n\n" + "\n\n".join(lines), reply_markup=MAIN_MENU)
     except Exception as e:
         await send_api_error(message, e)
 
@@ -367,27 +429,29 @@ async def send_stock_list(message: Message, mode: str = "all") -> None:
     try:
         rows = await load_sku_rows(client, shop_id, search_query=search_query, max_pages=10)
         if not rows:
-            await message.answer("SKU-остатки не найдены.")
+            await message.answer("SKU-остатки не найдены.", reply_markup=MAIN_MENU)
             return
 
         if mode == "fbo":
             rows = [r for r in rows if (r.get("fbo") or 0) > 0]
-            title = "📦 <b>Остатки FBO / склад Uzum</b>"
+            title = "📊 <b>Остатки FBO / склад Uzum</b>"
         elif mode == "fbs":
             rows = [r for r in rows if (r.get("fbs") or 0) > 0]
-            title = "📦 <b>Остатки FBS/DBS / склад продавца</b>"
+            title = "📊 <b>Остатки FBS/DBS / склад продавца</b>"
         else:
-            title = "📦 <b>Остатки по SKU: FBO + FBS/DBS + итого</b>"
+            title = "📊 <b>Остатки по SKU: FBO + FBS/DBS + итого</b>"
 
         if search_query:
-            title += f"\nПоиск: <b>{escape(search_query)}</b>"
-
+            title += f"\nПоиск: {escape(search_query)}"
         if not rows:
-            await message.answer(title + "\n\nНичего не найдено.")
+            await message.answer(title + "\n\nНичего не найдено.", reply_markup=MAIN_MENU)
             return
 
         lines = [format_sku_stock_line(row, mode=mode) for row in rows[:25]]
-        await message.answer(title + f"\nПоказано: {min(len(rows), 25)} из {len(rows)}\n\n" + "\n\n".join(lines))
+        await message.answer(
+            title + f"\nПоказано: {min(len(rows), 25)} из {len(rows)}\n\n" + "\n\n".join(lines),
+            reply_markup=MAIN_MENU,
+        )
     except Exception as e:
         await send_api_error(message, e)
 
@@ -413,26 +477,26 @@ async def lowstock(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
-
     arg = parse_args(message.text or "")
     threshold = int(arg) if arg.isdigit() else 5
 
     try:
         rows = await load_sku_rows(client, shop_id, max_pages=20)
         if not rows:
-            await message.answer("SKU-остатки не найдены.")
+            await message.answer("SKU-остатки не найдены.", reply_markup=MAIN_MENU)
             return
 
         low = [r for r in rows if r.get("total") is not None and r["total"] <= threshold]
-
         if not low:
-            await message.answer(f"✅ В первых {len(rows)} SKU нет общего остатка ≤ {threshold}.")
+            await message.answer(f"✅ В первых {len(rows)} SKU нет общего остатка ≤ {threshold}.", reply_markup=MAIN_MENU)
             return
 
         lines = [format_sku_stock_line(row, mode="all") for row in low[:30]]
         await message.answer(
             f"⚠️ <b>Низкие остатки по общему количеству ≤ {threshold}:</b>\n"
-            f"Показано: {min(len(low), 30)} из {len(low)}\n\n" + "\n\n".join(lines)
+            f"Показано: {min(len(low), 30)} из {len(low)}\n\n"
+            + "\n\n".join(lines),
+            reply_markup=MAIN_MENU,
         )
     except Exception as e:
         await send_api_error(message, e)
@@ -444,18 +508,21 @@ async def orders(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
-
     status = parse_args(message.text or "").upper() or "CREATED"
 
     try:
         data = await client.get_fbs_orders(shop_id, status=status, page=0, size=10)
         items = extract_items(data)
         if not items:
-            await message.answer(f"Заказы со статусом <code>{escape(status)}</code> не найдены.")
+            await message.answer(f"Заказы со статусом <code>{escape(status)}</code> не найдены.", reply_markup=MAIN_MENU)
             return
 
         lines = [format_order_line(item) for item in items[:10]]
-        await message.answer(f"🧾 <b>Заказы {escape(status)} для магазина <code>{shop_id}</code>:</b>\n\n" + "\n".join(lines))
+        await message.answer(
+            f"🛒 <b>Заказы {escape(status)} для магазина</b> <code>{shop_id}</code>:\n\n"
+            + "\n".join(lines),
+            reply_markup=MAIN_MENU,
+        )
     except Exception as e:
         await send_api_error(message, e)
 
@@ -471,12 +538,19 @@ async def debug_product(message: Message) -> None:
         data = await client.get_products(shop_id, page=0, size=1)
         items = extract_items(data)
         if not items:
-            await message.answer("Товар для debug не найден. Ответ API:\n<pre>" + escape(compact_json_preview(data, limit=3000)) + "</pre>")
+            await message.answer(
+                "Товар для debug не найден. Ответ API:\n<code>"
+                + escape(compact_json_preview(data, limit=3000))
+                + "</code>",
+                reply_markup=MAIN_MENU,
+            )
             return
 
         await message.answer(
-            "🔎 <b>Первый товар — сырой JSON</b>\n\n"
-            "<pre>" + escape(compact_json_preview(items[0], limit=3200)) + "</pre>"
+            "🧪 <b>Первый товар — сырой JSON</b>\n\n<code>"
+            + escape(compact_json_preview(items[0], limit=3200))
+            + "</code>",
+            reply_markup=MAIN_MENU,
         )
     except Exception as e:
         await send_api_error(message, e)
@@ -491,9 +565,8 @@ async def export_products(message: Message) -> None:
 
     try:
         rows = await load_sku_rows(client, shop_id, max_pages=50)
-
         if not rows:
-            await message.answer("SKU-остатки для экспорта не найдены.")
+            await message.answer("SKU-остатки для экспорта не найдены.", reply_markup=MAIN_MENU)
             return
 
         wb = Workbook()
@@ -549,52 +622,13 @@ async def export_products(message: Message) -> None:
         tmp_dir = Path(tempfile.gettempdir())
         filename = tmp_dir / f"uzum_stocks_{shop_id}.xlsx"
         wb.save(filename)
-
-        await message.answer(f"✅ Экспортировано SKU-остатков: {len(rows)}")
+        await message.answer(f"✅ Экспортировано SKU-остатков: {len(rows)}", reply_markup=MAIN_MENU)
         await message.answer_document(FSInputFile(filename))
     except Exception as e:
         await send_api_error(message, e)
 
 
 async def main() -> None:
-    @dp.message(Command("menu"))
-async def menu(message: Message) -> None:
-    await message.answer("Выберите действие 👇", reply_markup=MAIN_MENU)
-
-
-@dp.message(F.text == "📦 Товары")
-async def menu_products(message: Message) -> None:
-    await products(message)
-
-
-@dp.message(F.text == "📊 Остатки")
-async def menu_stock(message: Message) -> None:
-    await stock(message)
-
-
-@dp.message(F.text == "🛒 Заказы")
-async def menu_orders(message: Message) -> None:
-    await orders(message)
-
-
-@dp.message(F.text == "📉 Заканчиваются")
-async def menu_lowstock(message: Message) -> None:
-    await lowstock(message)
-
-
-@dp.message(F.text == "📄 Excel-отчёт")
-async def menu_export_products(message: Message) -> None:
-    await export_products(message)
-
-
-@dp.message(F.text == "⚙️ Статус")
-async def menu_status(message: Message) -> None:
-    await status(message)
-
-
-@dp.message(F.text == "🏪 Магазины")
-async def menu_shops(message: Message) -> None:
-    await shops(message)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
