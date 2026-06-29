@@ -106,6 +106,7 @@ dp = Dispatcher()
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="📊 Сегодня")],
+        [KeyboardButton(text="📆 Вчера"), KeyboardButton(text="🗓 7 дней")],
         [KeyboardButton(text="📦 Остатки"), KeyboardButton(text="⚠️ Заканчивается")],
         [KeyboardButton(text="🧭 Потерянные"), KeyboardButton(text="ℹ️ Помощь")],
     ],
@@ -607,6 +608,18 @@ def _days_range_ms(days: int) -> tuple[int, int]:
     return _epoch_ms(start), _epoch_ms(now)
 
 
+def _yesterday_range_ms() -> tuple[int, int]:
+    # Вчера = прошлый полный день по времени Узбекистана.
+    now = datetime.now(UZT)
+    start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_yesterday = start_today - timedelta(days=1)
+    return _epoch_ms(start_yesterday), _epoch_ms(start_today)
+
+
+def _last_7_days_range_ms() -> tuple[int, int]:
+    return _days_range_ms(7)
+
+
 def _deep_items(obj: Any) -> list[dict[str, Any]]:
     """Достаём список строк из разных возможных форматов ответа Uzum."""
     direct = extract_items(obj)
@@ -1046,6 +1059,12 @@ async def _load_today_finance_flexible(
     client: UzumClient, shop_id: int
 ) -> tuple[list[dict[str, Any]], Any | None, str]:
     date_from, date_to = _today_range_ms()
+    return await _load_finance_range_flexible(client, shop_id, date_from, date_to)
+
+
+async def _load_finance_range_flexible(
+    client: UzumClient, shop_id: int, date_from_ms: int, date_to_ms: int
+) -> tuple[list[dict[str, Any]], Any | None, str]:
     attempts: list[tuple[str, list[tuple[str, Any]]]] = [
         ("без статуса", []),
         ("statuses=PROCESSING", [("statuses", "PROCESSING")]),
@@ -1062,8 +1081,8 @@ async def _load_today_finance_flexible(
             data = await _finance_orders_request_extra(
                 client,
                 shop_id,
-                date_from_ms=date_from,
-                date_to_ms=date_to,
+                date_from_ms=date_from_ms,
+                date_to_ms=date_to_ms,
                 extra_params=extra,
             )
             if first_response is None:
@@ -1171,6 +1190,47 @@ async def today_sales(message: Message) -> None:
         rows, _, _ = await _load_today_finance_flexible(client, shop_id)
         stats = _build_noorza_today_stats(rows)
         await message.answer(_format_noorza_today(shop_id, stats, rows), reply_markup=MAIN_MENU)
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+def _format_noorza_period(title: str, shop_id: int, stats: dict[str, Any], rows: list[dict[str, Any]]) -> str:
+    text = _format_noorza_today(shop_id, stats, rows)
+    text = text.replace("💰 <b>Продажи Uzum FBO/FBS за сегодня</b>", f"💰 <b>{escape(title)}</b>", 1)
+    if not rows:
+        text = text.replace("за сегодня", "за выбранный период")
+    return text
+
+
+@dp.message(Command("yesterday"))
+async def yesterday_sales(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+    await message.answer("⌛ Считаю продажи за вчера...", reply_markup=MAIN_MENU)
+    try:
+        date_from, date_to = _yesterday_range_ms()
+        rows, _, _ = await _load_finance_range_flexible(client, shop_id, date_from, date_to)
+        stats = _build_noorza_today_stats(rows)
+        await message.answer(_format_noorza_period("Продажи Uzum FBO/FBS за вчера", shop_id, stats, rows), reply_markup=MAIN_MENU)
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+@dp.message(Command("week"))
+@dp.message(Command("last7"))
+async def week_sales(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+    await message.answer("⌛ Считаю продажи за 7 дней...", reply_markup=MAIN_MENU)
+    try:
+        date_from, date_to = _last_7_days_range_ms()
+        rows, _, _ = await _load_finance_range_flexible(client, shop_id, date_from, date_to)
+        stats = _build_noorza_today_stats(rows)
+        await message.answer(_format_noorza_period("Продажи Uzum FBO/FBS за 7 дней", shop_id, stats, rows), reply_markup=MAIN_MENU)
     except Exception as e:
         await send_api_error(message, e)
 
@@ -2537,6 +2597,16 @@ async def button_today(message: Message) -> None:
     await today_sales(message)
 
 
+@dp.message(F.text == "📆 Вчера")
+async def button_yesterday(message: Message) -> None:
+    await yesterday_sales(message)
+
+
+@dp.message(F.text == "🗓 7 дней")
+async def button_week(message: Message) -> None:
+    await week_sales(message)
+
+
 @dp.message(F.text == "📦 Остатки")
 async def button_stock_short(message: Message) -> None:
     await stock(message)
@@ -2681,6 +2751,7 @@ async def button_outofstock_notify_status(message: Message) -> None:
 
 
 async def main() -> None:
+    logging.info("FINANCE_SECONDS_PATCH_LOADED: dateFrom for Finance = seconds, dateTo = milliseconds")
     await bot.delete_webhook(drop_pending_updates=True)
     if NEW_ORDER_NOTIFICATIONS:
         asyncio.create_task(order_watch_loop())
