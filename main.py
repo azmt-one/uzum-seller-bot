@@ -55,6 +55,16 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
+MAIN_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📦 Товары"), KeyboardButton(text="📊 Остатки")],
+        [KeyboardButton(text="🛒 Заказы"), KeyboardButton(text="📉 Заканчиваются")],
+        [KeyboardButton(text="📄 Excel-отчёт"), KeyboardButton(text="⚙️ Статус")],
+        [KeyboardButton(text="🏪 Магазины")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выберите действие",
+)
 
 class ConnectStates(StatesGroup):
     waiting_for_token = State()
@@ -547,6 +557,44 @@ async def export_products(message: Message) -> None:
 
 
 async def main() -> None:
+    @dp.message(Command("menu"))
+async def menu(message: Message) -> None:
+    await message.answer("Выберите действие 👇", reply_markup=MAIN_MENU)
+
+
+@dp.message(F.text == "📦 Товары")
+async def menu_products(message: Message) -> None:
+    await products(message)
+
+
+@dp.message(F.text == "📊 Остатки")
+async def menu_stock(message: Message) -> None:
+    await stock(message)
+
+
+@dp.message(F.text == "🛒 Заказы")
+async def menu_orders(message: Message) -> None:
+    await orders(message)
+
+
+@dp.message(F.text == "📉 Заканчиваются")
+async def menu_lowstock(message: Message) -> None:
+    await lowstock(message)
+
+
+@dp.message(F.text == "📄 Excel-отчёт")
+async def menu_export_products(message: Message) -> None:
+    await export_products(message)
+
+
+@dp.message(F.text == "⚙️ Статус")
+async def menu_status(message: Message) -> None:
+    await status(message)
+
+
+@dp.message(F.text == "🏪 Магазины")
+async def menu_shops(message: Message) -> None:
+    await shops(message)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
