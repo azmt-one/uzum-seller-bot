@@ -105,13 +105,13 @@ dp = Dispatcher()
 # Все старые команды остаются рабочими: /products, /stock, /orders, /reviews и т.д.
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="📊 Сегодня")],
-        [KeyboardButton(text="📆 Вчера"), KeyboardButton(text="🗓 7 дней")],
+        [KeyboardButton(text="📊 Сегодня"), KeyboardButton(text="📆 Вчера")],
+        [KeyboardButton(text="🗓 7 дней"), KeyboardButton(text="📅 30 дней")],
         [KeyboardButton(text="📦 Остатки"), KeyboardButton(text="⚠️ Заканчивается")],
         [KeyboardButton(text="🧭 Потерянные"), KeyboardButton(text="ℹ️ Помощь")],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Выберите раздел",
+    input_field_placeholder="Выберите действие",
 )
 
 # Для совместимости: старые обработчики разделов могут ссылаться на эти переменные.
@@ -1261,18 +1261,169 @@ async def balance(message: Message) -> None:
         await send_api_error(message, e)
 
 
-@dp.message(Command("lost"))
-async def lost_goods(message: Message) -> None:
-    await message.answer(
-        "🧭 <b>Потерянные товары</b>\n\n"
-        "Этот раздел пока в заготовке.\n"
-        "Чтобы сделать его корректно, нужен API-метод Uzum по потерянным/расхождениям/актам.\n\n"
-        "Пока можно использовать:\n"
-        "• <code>/stock</code> — текущие остатки FBO/FBS\n"
-        "• <code>/stock_change_notify_status</code> — уведомления об изменении остатков",
-        reply_markup=MAIN_MENU,
+def _product_missing_qty(product: dict[str, Any]) -> int:
+    """Количество потерянного товара из ответа Uzum Products API."""
+    value = pick(
+        product,
+        "quantityMissing",
+        "missingQuantity",
+        "quantityLost",
+        "lostQuantity",
+        "missing",
+    )
+    number = _num_from_value(value)
+    return int(number or 0)
+
+
+def _product_available_qty(product: dict[str, Any]) -> int:
+    """Доступный остаток товара из ответа Uzum Products API."""
+    value = pick(
+        product,
+        "quantityAvailable",
+        "quantityActive",
+        "availableQuantity",
+        "stock",
+        "quantity",
+    )
+    number = _num_from_value(value)
+    return int(number or 0)
+
+
+def _product_status_text(product: dict[str, Any]) -> str:
+    status = product.get("status") or product.get("productStatus") or {}
+    if isinstance(status, dict):
+        return str(pick(status, "title", "value", "name", "code") or "-")
+    return str(status or "-")
+
+
+def _product_title(product: dict[str, Any]) -> str:
+    return str(
+        pick(
+            product,
+            "productTitle",
+            "skuFullTitle",
+            "skuTitle",
+            "title",
+            "name",
+        )
+        or "Без названия"
     )
 
+
+def _product_sku_text(product: dict[str, Any]) -> str:
+    return str(
+        pick(
+            product,
+            "skuFullTitle",
+            "skuTitle",
+            "skuName",
+            "skuId",
+            "sku",
+            "productId",
+        )
+        or "-"
+    )
+
+
+def _short_text(value: Any, limit: int = 70) -> str:
+    text = " ".join(str(value or "-").split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _split_long_message(text: str, limit: int = 3900) -> list[str]:
+    parts: list[str] = []
+    current = ""
+    for block in text.split("\n\n"):
+        candidate = block if not current else current + "\n\n" + block
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
+                parts.append(current)
+            current = block
+    if current:
+        parts.append(current)
+    return parts
+
+
+def _format_lost_product_line(product: dict[str, Any], idx: int) -> str:
+    missing = _product_missing_qty(product)
+    available = _product_available_qty(product)
+    title = escape(_short_text(_product_title(product)))
+    sku = escape(_short_text(_product_sku_text(product), limit=90))
+    status = escape(_product_status_text(product))
+    price = _pick_number(product, ("price", "sellPrice", "purchasePrice", "oldPrice")) or 0
+    approx = missing * price
+
+    line = (
+        f"{idx}. <b>{title}</b>\n"
+        f"SKU: {sku}\n"
+        f"Потеряно: <b>{missing} шт.</b> | Остаток: {available} шт. | Статус: {status}"
+    )
+    if price:
+        line += f"\nЦена: {_format_money(price)} | Примерная сумма: <b>{_format_money(approx)}</b>"
+    return line
+
+
+@dp.message(Command("lost"))
+@dp.message(Command("missing"))
+async def lost_goods(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+
+    await message.answer("⌛ Проверяю потерянные товары...", reply_markup=MAIN_MENU)
+    try:
+        products = await load_products(client, shop_id, max_pages=50, page_size=100)
+        products = [
+            p
+            for p in products
+            if isinstance(p, dict)
+            and not p.get("archived")
+            and _product_missing_qty(p) > 0
+        ]
+        products.sort(key=lambda p: _product_missing_qty(p), reverse=True)
+
+        title = "🧭 <b>Потерянные товары Uzum FBO</b>"
+        if not products:
+            await message.answer(
+                title
+                + "\n\nПотерянных товаров не найдено.\n"
+                + "Проверил поле <code>quantityMissing</code> в списке товаров Uzum.",
+                reply_markup=MAIN_MENU,
+            )
+            return
+
+        total_missing = sum(_product_missing_qty(p) for p in products)
+        approx_value = sum(
+            _product_missing_qty(p)
+            * (_pick_number(p, ("price", "sellPrice", "purchasePrice", "oldPrice")) or 0)
+            for p in products
+        )
+
+        lines = [
+            title,
+            f"Магазин: <code>{shop_id}</code>",
+            f"SKU с потерями: <b>{len(products)}</b>",
+            f"Всего потеряно: <b>{total_missing} шт.</b>",
+            f"Примерная сумма по текущей цене: <b>{_format_money(approx_value)}</b>",
+        ]
+
+        for idx, product in enumerate(products[:80], start=1):
+            lines.append(_format_lost_product_line(product, idx))
+
+        if len(products) > 80:
+            lines.append(f"Показаны первые 80 SKU из {len(products)}.")
+
+        lines.append("<i>Раздел использует поле quantityMissing из Products API. Если в кабинете Uzum потери считаются по актам иначе, сумма может отличаться.</i>")
+
+        for part in _split_long_message("\n\n".join(lines)):
+            await message.answer(part, reply_markup=MAIN_MENU)
+    except Exception as e:
+        await send_api_error(message, e)
 
 
 @dp.message(Command("sales"))
@@ -2607,6 +2758,11 @@ async def button_week(message: Message) -> None:
     await week_sales(message)
 
 
+@dp.message(F.text == "📅 30 дней")
+async def button_30_days(message: Message) -> None:
+    await sales_30(message)
+
+
 @dp.message(F.text == "📦 Остатки")
 async def button_stock_short(message: Message) -> None:
     await stock(message)
@@ -2768,6 +2924,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
