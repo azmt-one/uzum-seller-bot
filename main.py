@@ -778,19 +778,17 @@ async def _finance_orders_request(
     date_to_ms: int,
     page: int = 0,
     size: int = 100,
-    statuses: list[str] | None = None,
 ) -> Any:
-    params: list[tuple[str, Any]] = [
+    params = [
         ("page", page),
         ("size", size),
         ("group", "false"),
-        ("dateFrom", date_from_ms),
+        # Важно: рабочий Noorza Bot использует dateFrom в секундах, dateTo в миллисекундах.
+        # Если отправить dateFrom в миллисекундах, Uzum Finance может вернуть 0 строк.
+        ("dateFrom", int(date_from_ms / 1000)),
         ("dateTo", date_to_ms),
         ("shopIds", shop_id),
     ]
-    # В Swagger statuses — array<string>. Для query обычно это повторяющийся параметр.
-    for status in statuses or ["PROCESSING", "TO_WITHDRAW"]:
-        params.append(("statuses", status))
     path = "/v1/finance/orders?" + urlencode(params)
     return await client._request("GET", path)
 
@@ -1033,7 +1031,8 @@ async def _finance_orders_request_extra(
         ("page", page),
         ("size", size),
         ("group", "false"),
-        ("dateFrom", date_from_ms),
+        # Важно: рабочий Noorza Bot использует dateFrom в секундах, dateTo в миллисекундах.
+        ("dateFrom", int(date_from_ms / 1000)),
         ("dateTo", date_to_ms),
         ("shopIds", shop_id),
     ]
@@ -1047,22 +1046,12 @@ async def _load_today_finance_flexible(
     client: UzumClient, shop_id: int
 ) -> tuple[list[dict[str, Any]], Any | None, str]:
     date_from, date_to = _today_range_ms()
-    # В Uzum Finance API поле statuses — это массив в query.
-    # Для совместимости пробуем оба распространённых формата:
-    # 1) statuses=PROCESSING&statuses=TO_WITHDRAW
-    # 2) statuses=PROCESSING,TO_WITHDRAW
-    # Без statuses этот API у некоторых магазинов возвращает пустой список.
     attempts: list[tuple[str, list[tuple[str, Any]]]] = [
-        (
-            "statuses=PROCESSING&statuses=TO_WITHDRAW",
-            [("statuses", "PROCESSING"), ("statuses", "TO_WITHDRAW")],
-        ),
-        ("statuses=PROCESSING,TO_WITHDRAW", [("statuses", "PROCESSING,TO_WITHDRAW")]),
+        ("без статуса", []),
         ("statuses=PROCESSING", [("statuses", "PROCESSING")]),
         ("statuses=TO_WITHDRAW", [("statuses", "TO_WITHDRAW")]),
         ("status=PROCESSING", [("status", "PROCESSING")]),
         ("status=TO_WITHDRAW", [("status", "TO_WITHDRAW")]),
-        ("без статуса", []),
     ]
     all_rows: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -2531,108 +2520,6 @@ async def stock_change_notify_status(message: Message) -> None:
     )
 
 
-
-
-# --- Диагностика Finance API ---
-async def _finance_debug_request(
-    client: UzumClient,
-    shop_id: int,
-    *,
-    date_from_ms: int,
-    date_to_ms: int,
-    group: str,
-    params_extra: list[tuple[str, Any]],
-) -> tuple[str, Any, int]:
-    params: list[tuple[str, Any]] = [
-        ("page", 0),
-        ("size", 20),
-        ("group", group),
-        ("dateFrom", date_from_ms),
-        ("dateTo", date_to_ms),
-        ("shopIds", shop_id),
-    ]
-    params.extend(params_extra)
-    path = "/v1/finance/orders?" + urlencode(params)
-    data = await client._request("GET", path)
-    rows = _deep_items(data)
-    return path, data, len(rows)
-
-
-@dp.message(Command("finance_debug"))
-async def finance_debug(message: Message) -> None:
-    req = await require_connection(message)
-    if req is None:
-        return
-    _, client, shop_id = req
-    await message.answer("🧪 Проверяю Finance API разными вариантами запроса...", reply_markup=MAIN_MENU)
-
-    today_from, today_to = _today_range_ms()
-    two_days_from, two_days_to = _days_range_ms(2)
-    status_repeated = [("statuses", "PROCESSING"), ("statuses", "TO_WITHDRAW")]
-    status_all = [
-        ("statuses", "PROCESSING"),
-        ("statuses", "TO_WITHDRAW"),
-        ("statuses", "CANCELED"),
-        ("statuses", "PARTIALLY_CANCELED"),
-    ]
-    attempts: list[tuple[str, int, int, str, list[tuple[str, Any]]]] = [
-        ("Сегодня, group=false, PROCESSING+TO_WITHDRAW", today_from, today_to, "false", status_repeated),
-        ("Сегодня, group=true, PROCESSING+TO_WITHDRAW", today_from, today_to, "true", status_repeated),
-        ("Сегодня, group=false, все статусы", today_from, today_to, "false", status_all),
-        ("Сегодня, group=true, все статусы", today_from, today_to, "true", status_all),
-        ("Сегодня, group=false, без статусов", today_from, today_to, "false", []),
-        ("Сегодня, group=true, без статусов", today_from, today_to, "true", []),
-        ("2 дня, group=false, PROCESSING+TO_WITHDRAW", two_days_from, two_days_to, "false", status_repeated),
-        ("2 дня, group=true, PROCESSING+TO_WITHDRAW", two_days_from, two_days_to, "true", status_repeated),
-    ]
-
-    report_lines = [
-        "🧪 <b>Finance API debug</b>",
-        f"Магазин: <code>{shop_id}</code>",
-        "",
-    ]
-    first_non_empty: tuple[str, str, Any, int] | None = None
-    first_response: tuple[str, str, Any, int] | None = None
-
-    for label, d_from, d_to, group, extra in attempts:
-        try:
-            path, data, rows_count = await _finance_debug_request(
-                client,
-                shop_id,
-                date_from_ms=d_from,
-                date_to_ms=d_to,
-                group=group,
-                params_extra=extra,
-            )
-            report_lines.append(f"• {escape(label)}: <b>{rows_count}</b> строк")
-            if first_response is None:
-                first_response = (label, path, data, rows_count)
-            if rows_count > 0 and first_non_empty is None:
-                first_non_empty = (label, path, data, rows_count)
-            await asyncio.sleep(0.35)
-        except Exception as e:
-            report_lines.append(f"• {escape(label)}: ошибка {escape(str(e))[:150]}")
-
-    await message.answer("\n".join(report_lines), reply_markup=MAIN_MENU)
-
-    chosen = first_non_empty or first_response
-    if chosen:
-        label, path, data, rows_count = chosen
-        preview = compact_json_preview(data)
-        if len(preview) > 2600:
-            preview = preview[:2600] + "..."
-        await message.answer(
-            "📌 <b>Фрагмент ответа Finance API</b>\n"
-            f"Вариант: <b>{escape(label)}</b>\n"
-            f"Строк найдено парсером: <b>{rows_count}</b>\n\n"
-            "Путь без домена:\n"
-            f"<code>{escape(path)}</code>\n\n"
-            "Ответ:\n"
-            f"<code>{escape(preview)}</code>",
-            reply_markup=MAIN_MENU,
-        )
-
-
 # --- Главное меню в стиле Noorza Bot ---
 @dp.message(F.text == "⬅️ Главное меню")
 @dp.message(F.text == "Меню")
@@ -2810,7 +2697,6 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
 
 
 
