@@ -93,9 +93,9 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton(text="📦 Товары"), KeyboardButton(text="📊 Остатки")],
         [KeyboardButton(text="🛒 Заказы"), KeyboardButton(text="⚠️ Заканчиваются")],
         [KeyboardButton(text="📄 Excel-отчёт"), KeyboardButton(text="⚙️ Статус")],
-        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="🔔 Новые заказы")],
-        [KeyboardButton(text="📉 Низкие остатки"), KeyboardButton(text="❌ Нет в наличии")],
-        [KeyboardButton(text="❓ Помощь")],
+        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="⭐ Отзывы")],
+        [KeyboardButton(text="🔔 Новые заказы"), KeyboardButton(text="📉 Низкие остатки")],
+        [KeyboardButton(text="❌ Нет в наличии"), KeyboardButton(text="❓ Помощь")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите раздел",
@@ -559,6 +559,239 @@ async def orders(message: Message) -> None:
         )
     except Exception as e:
         await send_api_error(message, e)
+
+
+
+# --- Отзывы покупателей ---
+# В официальном Seller OpenAPI Uzum раздел отзывов может быть недоступен.
+# Поэтому список/ответы сделаны безопасно: сначала используются переменные окружения
+# REVIEWS_LIST_PATH и REVIEWS_REPLY_PATH, а если их нет — бот пробует несколько
+# типовых путей и честно сообщает ошибку, если endpoint не найден.
+REVIEWS_LIST_PATH = os.getenv("REVIEWS_LIST_PATH", "").strip()
+REVIEWS_REPLY_PATH = os.getenv("REVIEWS_REPLY_PATH", "").strip()
+REVIEWS_REPLY_METHOD = os.getenv("REVIEWS_REPLY_METHOD", "POST").strip().upper() or "POST"
+REVIEWS_REPLY_BODY_FIELD = os.getenv("REVIEWS_REPLY_BODY_FIELD", "text").strip() or "text"
+
+
+def _format_endpoint_template(template: str, *, shop_id: int, review_id: str = "", page: int = 0, size: int = 10) -> str:
+    return (
+        template.replace("{shop_id}", str(shop_id))
+        .replace("{shopId}", str(shop_id))
+        .replace("{review_id}", str(review_id))
+        .replace("{reviewId}", str(review_id))
+        .replace("{page}", str(page))
+        .replace("{size}", str(size))
+    )
+
+
+def _review_candidates(shop_id: int, page: int = 0, size: int = 10) -> list[str]:
+    if REVIEWS_LIST_PATH:
+        return [_format_endpoint_template(REVIEWS_LIST_PATH, shop_id=shop_id, page=page, size=size)]
+    return [
+        f"/v1/reviews?shopId={shop_id}&page={page}&size={size}",
+        f"/v1/reviews/shop/{shop_id}?page={page}&size={size}",
+        f"/v1/shop/{shop_id}/reviews?page={page}&size={size}",
+        f"/v1/feedbacks?shopId={shop_id}&page={page}&size={size}",
+        f"/v1/shop/{shop_id}/feedbacks?page={page}&size={size}",
+        f"/v1/comments?shopId={shop_id}&page={page}&size={size}",
+        f"/v1/shop/{shop_id}/comments?page={page}&size={size}",
+    ]
+
+
+def _reply_candidates(shop_id: int, review_id: str) -> list[str]:
+    if REVIEWS_REPLY_PATH:
+        return [_format_endpoint_template(REVIEWS_REPLY_PATH, shop_id=shop_id, review_id=review_id)]
+    return [
+        f"/v1/reviews/{review_id}/reply",
+        f"/v1/reviews/{review_id}/answer",
+        f"/v1/review/{review_id}/reply",
+        f"/v1/feedbacks/{review_id}/reply",
+        f"/v1/feedback/{review_id}/answer",
+        f"/v1/shop/{shop_id}/reviews/{review_id}/reply",
+        f"/v1/shop/{shop_id}/feedbacks/{review_id}/reply",
+        "/v1/reviews/reply",
+        "/v1/feedbacks/reply",
+    ]
+
+
+def _find_review_lists(obj: Any) -> list[Any]:
+    """Best-effort поиск списков отзывов в неизвестной структуре ответа."""
+    direct = extract_items(obj)
+    if direct:
+        return direct
+    found: list[Any] = []
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            key_l = str(key).lower()
+            if isinstance(value, list) and any(x in key_l for x in ("review", "feedback", "comment", "rating")):
+                found.extend(value)
+            elif isinstance(value, (dict, list)):
+                found.extend(_find_review_lists(value))
+    elif isinstance(obj, list):
+        for value in obj:
+            if isinstance(value, dict):
+                found.append(value)
+            elif isinstance(value, (dict, list)):
+                found.extend(_find_review_lists(value))
+    return found
+
+
+def _review_id(review: Any) -> str:
+    value = pick(review, "id", "reviewId", "feedbackId", "commentId", "uuid", "uid", default="—")
+    return str(value)
+
+
+def _review_answer(review: Any) -> str:
+    return str(pick(review, "answer", "reply", "sellerAnswer", "sellerReply", "response", "commentAnswer", default="—"))
+
+
+def format_review_line(review: Any) -> str:
+    review_id = _review_id(review)
+    product = pick(review, "productTitle", "productName", "title", "name", "skuTitle", default="—")
+    rating = pick(review, "rating", "stars", "mark", "grade", "score", default="—")
+    author = pick(review, "customerName", "userName", "buyerName", "clientName", "author", default="—")
+    created = pick(review, "createdAt", "date", "createdDate", "publishedAt", default="—")
+    text = pick(review, "text", "comment", "review", "content", "message", "description", default="—")
+    answer = _review_answer(review)
+
+    text_s = safe(text)
+    if len(text_s) > 600:
+        text_s = text_s[:600] + "..."
+
+    answer_part = ""
+    if answer not in (None, "", "—"):
+        answer_s = safe(answer)
+        if len(answer_s) > 300:
+            answer_s = answer_s[:300] + "..."
+        answer_part = f"\n💬 Ответ продавца: {answer_s}"
+
+    return (
+        f"• ID отзыва: <code>{safe(review_id)}</code>\n"
+        f"Товар: {safe(product)}\n"
+        f"Оценка: {safe(rating)} | Клиент: {safe(author)} | Дата: {safe(created)}\n"
+        f"Отзыв: {text_s}"
+        f"{answer_part}"
+    )
+
+
+async def get_reviews_from_uzum(client: UzumClient, shop_id: int, *, page: int = 0, size: int = 10) -> tuple[list[Any], str | None, str | None]:
+    last_error: str | None = None
+    last_path: str | None = None
+    for path in _review_candidates(shop_id, page=page, size=size):
+        try:
+            data = await client._request("GET", path)
+            items = _find_review_lists(data)
+            return items, path, None
+        except Exception as e:
+            last_error = str(e)
+            last_path = path
+            continue
+    return [], last_path, last_error
+
+
+@dp.message(Command("reviews"))
+async def reviews(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+
+    items, path, error = await get_reviews_from_uzum(client, shop_id, page=0, size=10)
+    if error and not items:
+        await message.answer(
+            "⭐ <b>Отзывы</b>\n\n"
+            "Не смог получить отзывы через текущий Uzum API.\n"
+            "Скорее всего, в вашем Seller OpenAPI нет открытого метода для отзывов.\n\n"
+            "Что можно сделать:\n"
+            "1. Если у вас есть endpoint отзывов из кабинета Uzum, добавьте в bothost переменные:\n"
+            "<code>REVIEWS_LIST_PATH</code> и <code>REVIEWS_REPLY_PATH</code>.\n"
+            "2. Потом перезапустите бота.\n\n"
+            f"Последний путь: <code>{escape(str(path))}</code>\n"
+            f"Ошибка: <code>{escape(error[:1000])}</code>",
+            reply_markup=MAIN_MENU,
+        )
+        return
+
+    if not items:
+        await message.answer("⭐ Отзывы не найдены.", reply_markup=MAIN_MENU)
+        return
+
+    lines = [format_review_line(item) for item in items[:10]]
+    await message.answer(
+        "⭐ <b>Последние отзывы</b>\n\n"
+        + "\n\n".join(lines)
+        + "\n\nЧтобы ответить: <code>/reply ID_ОТЗЫВА ваш ответ</code>",
+        reply_markup=MAIN_MENU,
+    )
+
+
+@dp.message(Command("reply"))
+async def reply_review(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+
+    arg = parse_args(message.text or "")
+    if not arg or " " not in arg:
+        await message.answer(
+            "Напишите так:\n"
+            "<code>/reply ID_ОТЗЫВА Спасибо за отзыв!</code>\n\n"
+            "ID отзыва можно посмотреть через <code>/reviews</code>.",
+            reply_markup=MAIN_MENU,
+        )
+        return
+
+    review_id, answer_text = arg.split(maxsplit=1)
+    review_id = review_id.strip()
+    answer_text = answer_text.strip()
+    if not review_id or not answer_text:
+        await message.answer("Не вижу ID отзыва или текст ответа.", reply_markup=MAIN_MENU)
+        return
+    if len(answer_text) > 1000:
+        await message.answer("Ответ слишком длинный. Сделайте до 1000 символов.", reply_markup=MAIN_MENU)
+        return
+
+    payloads = [
+        {REVIEWS_REPLY_BODY_FIELD: answer_text},
+        {"text": answer_text},
+        {"reply": answer_text},
+        {"answer": answer_text},
+        {"message": answer_text},
+        {"reviewId": review_id, "shopId": shop_id, "text": answer_text},
+        {"feedbackId": review_id, "shopId": shop_id, "answer": answer_text},
+    ]
+
+    errors: list[str] = []
+    tried = 0
+    for path in _reply_candidates(shop_id, review_id):
+        # Для кастомного REVIEWS_REPLY_PATH пробуем только первый payload, заданный полем REVIEWS_REPLY_BODY_FIELD.
+        selected_payloads = payloads[:1] if REVIEWS_REPLY_PATH else payloads
+        for payload in selected_payloads:
+            tried += 1
+            try:
+                await client._request(REVIEWS_REPLY_METHOD, path, json=payload)
+                await message.answer(
+                    "✅ Ответ на отзыв отправлен.\n\n"
+                    f"ID отзыва: <code>{escape(review_id)}</code>",
+                    reply_markup=MAIN_MENU,
+                )
+                return
+            except Exception as e:
+                errors.append(f"{path}: {str(e)[:250]}")
+                continue
+
+    await message.answer(
+        "⚠️ Не получилось отправить ответ на отзыв.\n\n"
+        "Вероятно, ваш текущий Uzum Seller OpenAPI не поддерживает ответы на отзывы, "
+        "или нужен точный endpoint из кабинета продавца.\n\n"
+        "Можно добавить в bothost:\n"
+        "<code>REVIEWS_REPLY_PATH=/точный/путь/{review_id}/reply</code>\n"
+        "<code>REVIEWS_REPLY_BODY_FIELD=text</code>\n\n"
+        f"Попыток: <b>{tried}</b>\n"
+        f"Последняя ошибка:\n<code>{escape(errors[-1] if errors else '—')}</code>",
+        reply_markup=MAIN_MENU,
+    )
 
 
 @dp.message(Command("debug_product"))
@@ -1084,6 +1317,11 @@ async def button_outofstock_notify_status(message: Message) -> None:
     await outofstock_notify_status(message)
 
 
+@dp.message(F.text == "⭐ Отзывы")
+async def button_reviews(message: Message) -> None:
+    await reviews(message)
+
+
 @dp.message(F.text == "❓ Помощь")
 async def button_help(message: Message) -> None:
     await start(message)
@@ -1102,3 +1340,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
