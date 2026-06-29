@@ -55,6 +55,14 @@ NEW_ORDER_NOTIFICATIONS = (
     os.getenv("NEW_ORDER_NOTIFICATIONS", "1").strip().lower()
     not in {"0", "false", "no", "off"}
 )
+LOW_STOCK_NOTIFICATIONS = (
+    os.getenv("LOW_STOCK_NOTIFICATIONS", "1").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
+LOW_STOCK_CHECK_INTERVAL_SECONDS = int(
+    os.getenv("LOW_STOCK_CHECK_INTERVAL_SECONDS", "1800") or "1800"
+)
+LOW_STOCK_THRESHOLD = int(os.getenv("LOW_STOCK_THRESHOLD", "5") or "5")
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError(
@@ -78,7 +86,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton(text="/orders"), KeyboardButton(text="/lowstock")],
         [KeyboardButton(text="/export_products"), KeyboardButton(text="/status")],
         [KeyboardButton(text="/shops"), KeyboardButton(text="/notify_status")],
-        [KeyboardButton(text="/help")],
+        [KeyboardButton(text="/lowstock_notify_status"), KeyboardButton(text="/help")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите команду",
@@ -255,7 +263,8 @@ async def start(message: Message) -> None:
         "• <code>/export_products</code> — Excel: FBO, FBS/DBS, итого\n"
         "• <code>/debug_product</code> — сырой JSON первого товара\n"
         "• <code>/status</code> — статус подключения\n"
-        "• <code>/notify_status</code> — статус уведомлений о новых заказах\n\n"
+        "• <code>/notify_status</code> — статус уведомлений о новых заказах\n"
+        "• <code>/lowstock_notify_status</code> — статус уведомлений о низких остатках\n\n"
         "Для начала нажмите: <code>/connect</code>",
         reply_markup=MAIN_MENU,
     )
@@ -781,13 +790,134 @@ async def notify_status(message: Message) -> None:
     )
 
 
+# --- Уведомления о низких остатках ---
+# Логика:
+# 1) при первом запуске бот запоминает текущие SKU с остатком ниже порога и не спамит ими;
+# 2) дальше проверяет остатки каждые LOW_STOCK_CHECK_INTERVAL_SECONDS секунд;
+# 3) если SKU впервые стал ниже/равен порогу, бот присылает уведомление.
+_seen_low_stock_keys_by_user: dict[int, set[str]] = {}
+_low_stock_watch_initialized: set[int] = set()
+
+
+def stock_row_key(row: dict[str, Any]) -> str:
+    for key in ("sku_id", "barcode", "seller_item_code", "product_id"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return f"{key}:{value}"
+    raw = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+    return "hash:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+async def check_low_stock_once() -> None:
+    users = connected_users_for_order_watch()
+    threshold = max(0, LOW_STOCK_THRESHOLD)
+
+    for row in users:
+        telegram_id = int(row["telegram_id"])
+        shop_id = int(row["default_shop_id"])
+        encrypted_token = row["uzum_token_encrypted"]
+
+        try:
+            token = cipher.decrypt(encrypted_token)
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            rows = await load_sku_rows(client, shop_id, max_pages=50)
+        except Exception:
+            logging.exception("Low stock watcher: failed to check stocks for %s", telegram_id)
+            continue
+
+        low_rows = [
+            r
+            for r in rows
+            if r.get("total") is not None and int(r.get("total") or 0) <= threshold
+        ]
+        low_keys_now = [stock_row_key(r) for r in low_rows]
+        known = _seen_low_stock_keys_by_user.setdefault(telegram_id, set())
+
+        # Первый проход: запоминаем текущие низкие остатки, чтобы не прислать старые как новые.
+        if telegram_id not in _low_stock_watch_initialized:
+            known.update(low_keys_now)
+            _low_stock_watch_initialized.add(telegram_id)
+            logging.info(
+                "Low stock watcher initialized for user=%s shop=%s low_skus=%s threshold=%s",
+                telegram_id,
+                shop_id,
+                len(low_keys_now),
+                threshold,
+            )
+            continue
+
+        new_low_rows = [r for r, key in zip(low_rows, low_keys_now) if key not in known]
+        known.update(low_keys_now)
+
+        # Если товар восстановился выше порога, удаляем его из known.
+        # Тогда при повторном падении ниже порога бот снова уведомит.
+        _seen_low_stock_keys_by_user[telegram_id] = set(low_keys_now)
+
+        if not new_low_rows:
+            continue
+
+        lines = [format_sku_stock_line(item, mode="all") for item in new_low_rows[:10]]
+        more = "" if len(new_low_rows) <= 10 else f"\n\nЕщё SKU с низким остатком: {len(new_low_rows) - 10}"
+        text = (
+            f"📉 <b>Товар заканчивается</b>\n"
+            f"Магазин: <code>{shop_id}</code>\n"
+            f"Порог: ≤ <b>{threshold}</b> шт.\n"
+            f"Новых позиций с низким остатком: <b>{len(new_low_rows)}</b>\n\n"
+            + "\n\n".join(lines)
+            + more
+            + f"\n\nПоказать все низкие остатки: <code>/lowstock {threshold}</code>"
+        )
+
+        try:
+            await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+        except Exception:
+            logging.exception("Low stock watcher: failed to send notification to %s", telegram_id)
+
+
+async def low_stock_watch_loop() -> None:
+    await asyncio.sleep(20)
+    logging.info(
+        "Low stock watcher started. Interval: %s seconds. Threshold: %s. Enabled: %s",
+        LOW_STOCK_CHECK_INTERVAL_SECONDS,
+        LOW_STOCK_THRESHOLD,
+        LOW_STOCK_NOTIFICATIONS,
+    )
+    while True:
+        try:
+            await check_low_stock_once()
+        except Exception:
+            logging.exception("Low stock watcher loop error")
+        await asyncio.sleep(max(300, LOW_STOCK_CHECK_INTERVAL_SECONDS))
+
+
+@dp.message(Command("lowstock_notify_status"))
+async def lowstock_notify_status(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, _, shop_id = req
+    initialized = telegram_id in _low_stock_watch_initialized
+    await message.answer(
+        "📉 <b>Уведомления о низких остатках</b>\n\n"
+        f"Статус: {'✅ включены' if LOW_STOCK_NOTIFICATIONS else '❌ выключены'}\n"
+        f"Магазин: <code>{shop_id}</code>\n"
+        f"Порог: ≤ <b>{LOW_STOCK_THRESHOLD}</b> шт.\n"
+        f"Проверка каждые: <b>{max(300, LOW_STOCK_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
+        f"Состояние: {'остатки уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
+        "Бот уведомит, когда товар впервые опустится до порога или ниже.",
+        reply_markup=MAIN_MENU,
+    )
+
+
 async def main() -> None:
     await bot.delete_webhook(drop_pending_updates=True)
     if NEW_ORDER_NOTIFICATIONS:
         asyncio.create_task(order_watch_loop())
+    if LOW_STOCK_NOTIFICATIONS:
+        asyncio.create_task(low_stock_watch_loop())
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
