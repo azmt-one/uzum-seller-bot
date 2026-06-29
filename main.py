@@ -93,24 +93,67 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# Красивое меню на русском. Кнопки отправляют обычный текст,
-# а ниже есть обработчики, которые вызывают уже рабочие команды.
+# Минималистичное меню по разделам.
+# Главное меню показывает только крупные разделы, а внутри — нужные действия.
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📈 Сводка"), KeyboardButton(text="💰 Продажи")],
-        [KeyboardButton(text="📦 Товары"), KeyboardButton(text="📊 Остатки")],
-        [KeyboardButton(text="🛒 Заказы"), KeyboardButton(text="⚠️ Заканчиваются")],
-        [KeyboardButton(text="📄 Excel-отчёт"), KeyboardButton(text="⚙️ Статус")],
-        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="⭐ Отзывы")],
-        [KeyboardButton(text="🔔 Новые заказы"), KeyboardButton(text="💸 Новые продажи")],
-        [KeyboardButton(text="📉 Низкие остатки"), KeyboardButton(text="❌ Нет в наличии")],
-        [KeyboardButton(text="📊 Сводка заказов")],
-        [KeyboardButton(text="❓ Помощь")],
+        [KeyboardButton(text="📊 Аналитика"), KeyboardButton(text="📦 Товары")],
+        [KeyboardButton(text="🛒 Заказы"), KeyboardButton(text="🔔 Уведомления")],
+        [KeyboardButton(text="⭐ Отзывы"), KeyboardButton(text="⚙️ Настройки")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите раздел",
 )
 
+ANALYTICS_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📈 Сводка")],
+        [KeyboardButton(text="📊 Сводка заказов")],
+        [KeyboardButton(text="⬅️ Главное меню")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Аналитика",
+)
+
+PRODUCTS_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📦 Все товары"), KeyboardButton(text="📊 Остатки")],
+        [KeyboardButton(text="⚠️ Заканчиваются"), KeyboardButton(text="📄 Excel-отчёт")],
+        [KeyboardButton(text="⬅️ Главное меню")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Товары и остатки",
+)
+
+ORDERS_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🛒 Новые заказы")],
+        [KeyboardButton(text="📊 Сводка заказов")],
+        [KeyboardButton(text="⬅️ Главное меню")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Заказы",
+)
+
+NOTIFICATIONS_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🔔 Новые заказы"), KeyboardButton(text="💸 Новые продажи")],
+        [KeyboardButton(text="📉 Низкие остатки"), KeyboardButton(text="❌ Нет в наличии")],
+        [KeyboardButton(text="⬅️ Главное меню")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Уведомления",
+)
+
+SETTINGS_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="⚙️ Статус"), KeyboardButton(text="🏪 Магазины")],
+        [KeyboardButton(text="❓ Помощь")],
+        [KeyboardButton(text="⬅️ Главное меню")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Настройки",
+)
 
 class ConnectStates(StatesGroup):
     waiting_for_token = State()
@@ -2060,9 +2103,61 @@ async def sales_notify_status(message: Message) -> None:
     )
 
 
-# --- Русские кнопки меню ---
-# Эти обработчики не заменяют старые /commands, а просто вызывают их.
-# Поэтому старые команды продолжают работать как раньше.
+# --- Меню по разделам ---
+# Эти обработчики не заменяют старые /commands, а просто открывают разделы
+# или вызывают уже рабочие команды. Старые команды продолжают работать.
+
+@dp.message(F.text == "⬅️ Главное меню")
+async def button_main_menu(message: Message) -> None:
+    await message.answer("Главное меню 👇", reply_markup=MAIN_MENU)
+
+
+@dp.message(F.text == "📊 Аналитика")
+async def section_analytics(message: Message) -> None:
+    await message.answer(
+        "📊 <b>Аналитика</b>\n\n"
+        "Выберите, что посмотреть:",
+        reply_markup=ANALYTICS_MENU,
+    )
+
+
+@dp.message(F.text == "📦 Товары")
+async def section_products(message: Message) -> None:
+    await message.answer(
+        "📦 <b>Товары и остатки</b>\n\n"
+        "Выберите действие:",
+        reply_markup=PRODUCTS_MENU,
+    )
+
+
+@dp.message(F.text == "🛒 Заказы")
+async def section_orders(message: Message) -> None:
+    await message.answer(
+        "🛒 <b>Заказы</b>\n\n"
+        "Выберите действие:",
+        reply_markup=ORDERS_MENU,
+    )
+
+
+@dp.message(F.text == "🔔 Уведомления")
+async def section_notifications(message: Message) -> None:
+    await message.answer(
+        "🔔 <b>Уведомления</b>\n\n"
+        "Выберите тип уведомлений:",
+        reply_markup=NOTIFICATIONS_MENU,
+    )
+
+
+@dp.message(F.text == "⚙️ Настройки")
+async def section_settings(message: Message) -> None:
+    await message.answer(
+        "⚙️ <b>Настройки</b>\n\n"
+        "Выберите действие:",
+        reply_markup=SETTINGS_MENU,
+    )
+
+
+# --- Кнопки внутри разделов ---
 
 @dp.message(F.text == "📈 Сводка")
 async def button_dashboard(message: Message) -> None:
@@ -2079,7 +2174,7 @@ async def button_sales(message: Message) -> None:
     await sales(message)
 
 
-@dp.message(F.text == "📦 Товары")
+@dp.message(F.text == "📦 Все товары")
 async def button_products(message: Message) -> None:
     await products(message)
 
@@ -2089,7 +2184,7 @@ async def button_stock(message: Message) -> None:
     await stock(message)
 
 
-@dp.message(F.text == "🛒 Заказы")
+@dp.message(F.text == "🛒 Новые заказы")
 async def button_orders(message: Message) -> None:
     await orders(message)
 
@@ -2143,7 +2238,6 @@ async def button_reviews(message: Message) -> None:
 async def button_help(message: Message) -> None:
     await start(message)
 
-
 async def main() -> None:
     await bot.delete_webhook(drop_pending_updates=True)
     if NEW_ORDER_NOTIFICATIONS:
@@ -2159,5 +2253,6 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
