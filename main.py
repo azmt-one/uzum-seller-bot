@@ -778,8 +778,9 @@ async def _finance_orders_request(
     date_to_ms: int,
     page: int = 0,
     size: int = 100,
+    statuses: list[str] | None = None,
 ) -> Any:
-    params = [
+    params: list[tuple[str, Any]] = [
         ("page", page),
         ("size", size),
         ("group", "false"),
@@ -787,6 +788,9 @@ async def _finance_orders_request(
         ("dateTo", date_to_ms),
         ("shopIds", shop_id),
     ]
+    # В Swagger statuses — array<string>. Для query обычно это повторяющийся параметр.
+    for status in statuses or ["PROCESSING", "TO_WITHDRAW"]:
+        params.append(("statuses", status))
     path = "/v1/finance/orders?" + urlencode(params)
     return await client._request("GET", path)
 
@@ -1043,12 +1047,22 @@ async def _load_today_finance_flexible(
     client: UzumClient, shop_id: int
 ) -> tuple[list[dict[str, Any]], Any | None, str]:
     date_from, date_to = _today_range_ms()
+    # В Uzum Finance API поле statuses — это массив в query.
+    # Для совместимости пробуем оба распространённых формата:
+    # 1) statuses=PROCESSING&statuses=TO_WITHDRAW
+    # 2) statuses=PROCESSING,TO_WITHDRAW
+    # Без statuses этот API у некоторых магазинов возвращает пустой список.
     attempts: list[tuple[str, list[tuple[str, Any]]]] = [
-        ("без статуса", []),
+        (
+            "statuses=PROCESSING&statuses=TO_WITHDRAW",
+            [("statuses", "PROCESSING"), ("statuses", "TO_WITHDRAW")],
+        ),
+        ("statuses=PROCESSING,TO_WITHDRAW", [("statuses", "PROCESSING,TO_WITHDRAW")]),
         ("statuses=PROCESSING", [("statuses", "PROCESSING")]),
         ("statuses=TO_WITHDRAW", [("statuses", "TO_WITHDRAW")]),
         ("status=PROCESSING", [("status", "PROCESSING")]),
         ("status=TO_WITHDRAW", [("status", "TO_WITHDRAW")]),
+        ("без статуса", []),
     ]
     all_rows: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -2694,6 +2708,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
