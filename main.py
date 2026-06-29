@@ -14,7 +14,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import FSInputFile, Message
+from aiogram.types import FSInputFile, Message, ReplyKeyboardMarkup, KeyboardButton
 from dotenv import load_dotenv
 from openpyxl import Workbook
 
@@ -55,7 +55,16 @@ bot = Bot(
     default=DefaultBotProperties(parse_mode=ParseMode.HTML),
 )
 dp = Dispatcher()
-
+MAIN_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📦 Товары"), KeyboardButton(text="📊 Остатки")],
+        [KeyboardButton(text="🛒 Заказы"), KeyboardButton(text="📉 Заканчиваются")],
+        [KeyboardButton(text="📄 Excel-отчёт"), KeyboardButton(text="⚙️ Статус")],
+        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="🔌 Подключение")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выберите раздел",
+)
 
 class ConnectStates(StatesGroup):
     waiting_for_token = State()
@@ -184,7 +193,7 @@ async def connect_token(message: Message, token: str, state: FSMContext | None =
 async def start(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     connected = "✅ подключён" if db.has_uzum_connection(telegram_id) else "❌ не подключён"
-    await message.answer(
+    await message.answer( 
         "👋 <b>Uzum Seller Assistant</b>\n\n"
         f"Статус Uzum API: {connected}\n\n"
         "Основные команды:\n"
@@ -201,7 +210,8 @@ async def start(message: Message) -> None:
         "• <code>/export_products</code> — Excel: FBO, FBS/DBS, итого\n"
         "• <code>/debug_product</code> — сырой JSON первого товара\n"
         "• <code>/status</code> — статус подключения\n\n"
-        "Для начала нажмите: <code>/connect</code>"
+        "Для начала нажмите: <code>/connect</code>",
+        reply_markup=MAIN_MENU,
     )
 
 
