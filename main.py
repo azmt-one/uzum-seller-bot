@@ -57,13 +57,13 @@ bot = Bot(
 dp = Dispatcher()
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📦 Товары"), KeyboardButton(text="📊 Остатки")],
-        [KeyboardButton(text="🛒 Заказы"), KeyboardButton(text="📉 Заканчиваются")],
-        [KeyboardButton(text="📄 Excel-отчёт"), KeyboardButton(text="⚙️ Статус")],
-        [KeyboardButton(text="🏪 Магазины")],
+        [KeyboardButton(text="/products"), KeyboardButton(text="/stock")],
+        [KeyboardButton(text="/orders"), KeyboardButton(text="/lowstock")],
+        [KeyboardButton(text="/export_products"), KeyboardButton(text="/status")],
+        [KeyboardButton(text="/shops")],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Выберите действие",
+    input_field_placeholder="Выберите команду",
 )
 
 class ConnectStates(StatesGroup):
