@@ -92,12 +92,13 @@ dp = Dispatcher()
 # а ниже есть обработчики, которые вызывают уже рабочие команды.
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Товары")],
-        [KeyboardButton(text="📊 Остатки"), KeyboardButton(text="🛒 Заказы")],
-        [KeyboardButton(text="⚠️ Заканчиваются"), KeyboardButton(text="📄 Excel-отчёт")],
-        [KeyboardButton(text="⚙️ Статус"), KeyboardButton(text="🏪 Магазины")],
-        [KeyboardButton(text="⭐ Отзывы"), KeyboardButton(text="🔔 Новые заказы")],
-        [KeyboardButton(text="📉 Низкие остатки"), KeyboardButton(text="❌ Нет в наличии")],
+        [KeyboardButton(text="📈 Сводка"), KeyboardButton(text="💰 Продажи")],
+        [KeyboardButton(text="📦 Товары"), KeyboardButton(text="📊 Остатки")],
+        [KeyboardButton(text="🛒 Заказы"), KeyboardButton(text="⚠️ Заканчиваются")],
+        [KeyboardButton(text="📄 Excel-отчёт"), KeyboardButton(text="⚙️ Статус")],
+        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="⭐ Отзывы")],
+        [KeyboardButton(text="🔔 Новые заказы"), KeyboardButton(text="📉 Низкие остатки")],
+        [KeyboardButton(text="❌ Нет в наличии"), KeyboardButton(text="📊 Сводка заказов")],
         [KeyboardButton(text="❓ Помощь")],
     ],
     resize_keyboard=True,
@@ -573,15 +574,21 @@ def _epoch_ms(dt: datetime) -> int:
     return int(dt.timestamp() * 1000)
 
 
+UZT = timezone(timedelta(hours=5))
+
+
 def _today_range_ms() -> tuple[int, int]:
-    now = datetime.now(timezone.utc)
+    # Считаем день по времени Узбекистана, а не по UTC.
+    now = datetime.now(UZT)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     return _epoch_ms(start), _epoch_ms(now)
 
 
 def _days_range_ms(days: int) -> tuple[int, int]:
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(days=max(1, days))
+    # 7 дней = с начала дня 6 дней назад до текущего момента по Ташкенту.
+    now = datetime.now(UZT)
+    start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = start_today - timedelta(days=max(1, days) - 1)
     return _epoch_ms(start), _epoch_ms(now)
 
 
@@ -965,6 +972,225 @@ async def sales_7(message: Message) -> None:
 @dp.message(Command("sales_30"))
 async def sales_30(message: Message) -> None:
     await _send_sales_details(message, 30)
+
+
+
+# --- Общая сводка магазина / заказы по статусам ---
+# Дополняет Finance API. Если Finance API вернул 0 продаж, сводка всё равно покажет
+# текущие заказы FBS/DBS и состояние остатков.
+FBS_STATUS_LABELS: dict[str, str] = {
+    "CREATED": "Создан",
+    "PACKING": "Сборка",
+    "PENDING_DELIVERY": "Ожидает доставки",
+    "DELIVERING": "В доставке",
+    "DELIVERED": "Доставлен",
+    "ACCEPTED_AT_DP": "Принят в ПВЗ/ДП",
+    "DELIVERED_TO_CUSTOMER_DELIVERY_POINT": "В пункте выдачи",
+    "COMPLETED": "Завершён",
+    "CANCELED": "Отменён",
+    "RETURNED": "Возврат",
+}
+
+
+def _extract_count(data: Any) -> int:
+    if isinstance(data, bool):
+        return 0
+    if isinstance(data, (int, float)):
+        return int(data)
+    if isinstance(data, str):
+        try:
+            return int(float(data))
+        except Exception:
+            return 0
+    if isinstance(data, dict):
+        for key in ("payload", "data", "result", "value", "count", "total", "totalElements", "totalAmount"):
+            if key in data:
+                value = data.get(key)
+                if isinstance(value, dict):
+                    nested = _extract_count(value)
+                    if nested:
+                        return nested
+                else:
+                    number = _num_from_value(value)
+                    if number is not None:
+                        return int(number)
+        # Последняя попытка — ищем первое числовое поле.
+        for value in data.values():
+            if isinstance(value, (dict, list)):
+                nested = _extract_count(value)
+                if nested:
+                    return nested
+            else:
+                number = _num_from_value(value)
+                if number is not None:
+                    return int(number)
+    if isinstance(data, list):
+        return len(data)
+    return 0
+
+
+async def _fbs_order_count(
+    client: UzumClient,
+    shop_id: int,
+    status: str,
+    *,
+    date_from_ms: int,
+    date_to_ms: int,
+) -> int:
+    params = [
+        ("shopIds", shop_id),
+        ("status", status),
+        ("dateFrom", date_from_ms),
+        ("dateTo", date_to_ms),
+    ]
+    path = "/v2/fbs/orders/count?" + urlencode(params)
+    data = await client._request("GET", path)
+    return _extract_count(data)
+
+
+async def _orders_counts_for_days(client: UzumClient, shop_id: int, days: int) -> dict[str, int]:
+    date_from, date_to = _today_range_ms() if days == 1 else _days_range_ms(days)
+    counts: dict[str, int] = {}
+    for status in FBS_STATUS_LABELS:
+        try:
+            counts[status] = await _fbs_order_count(
+                client, shop_id, status, date_from_ms=date_from, date_to_ms=date_to
+            )
+        except Exception:
+            # Некоторые статусы/права могут быть недоступны; не валим всю сводку.
+            counts[status] = 0
+    return counts
+
+
+def _format_orders_counts(title: str, counts: dict[str, int]) -> str:
+    useful = {k: v for k, v in counts.items() if v}
+    if not useful:
+        return f"<b>{escape(title)}</b>\n• Заказов по основным статусам не найдено"
+    lines = [f"<b>{escape(title)}</b>"]
+    for status, count in useful.items():
+        label = FBS_STATUS_LABELS.get(status, status)
+        lines.append(f"• {escape(label)}: <b>{count}</b>")
+    lines.append(f"• Итого: <b>{sum(useful.values())}</b>")
+    return "\n".join(lines)
+
+
+def _build_stock_stats(rows: list[dict[str, Any]]) -> dict[str, float | int]:
+    total_skus = len(rows)
+    total_units = 0.0
+    fbo_units = 0.0
+    fbs_units = 0.0
+    low_count = 0
+    zero_count = 0
+    stock_value = 0.0
+    active_count = 0
+
+    for r in rows:
+        total = _num_from_value(r.get("total")) or 0.0
+        fbo = _num_from_value(r.get("fbo")) or 0.0
+        fbs = _num_from_value(r.get("fbs")) or 0.0
+        price = _num_from_value(r.get("price")) or 0.0
+        status = str(status_display(r.get("status")) if r.get("status") else r.get("status") or "").upper()
+
+        total_units += total
+        fbo_units += fbo
+        fbs_units += fbs
+        stock_value += max(0.0, total) * max(0.0, price)
+        if total <= 0:
+            zero_count += 1
+        elif total <= LOW_STOCK_THRESHOLD:
+            low_count += 1
+        if "RUN_OUT" not in status and total > 0:
+            active_count += 1
+
+    return {
+        "total_skus": total_skus,
+        "total_units": total_units,
+        "fbo_units": fbo_units,
+        "fbs_units": fbs_units,
+        "low_count": low_count,
+        "zero_count": zero_count,
+        "stock_value": stock_value,
+        "active_count": active_count,
+    }
+
+
+@dp.message(Command("orders_summary"))
+async def orders_summary(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+    await message.answer("⏳ Считаю заказы по статусам...", reply_markup=MAIN_MENU)
+    try:
+        today = await _orders_counts_for_days(client, shop_id, 1)
+        week = await _orders_counts_for_days(client, shop_id, 7)
+        month = await _orders_counts_for_days(client, shop_id, 30)
+        await message.answer(
+            f"📊 <b>Сводка заказов</b>\nМагазин: <code>{shop_id}</code>\n\n"
+            + _format_orders_counts("Сегодня", today)
+            + "\n\n"
+            + _format_orders_counts("7 дней", week)
+            + "\n\n"
+            + _format_orders_counts("30 дней", month),
+            reply_markup=MAIN_MENU,
+        )
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+@dp.message(Command("dashboard", "summary", "report"))
+async def dashboard(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+    await message.answer("⏳ Собираю общую сводку магазина...", reply_markup=MAIN_MENU)
+    try:
+        sales_7, _ = await _sales_period_stats(client, shop_id, 7)
+        sales_30, _ = await _sales_period_stats(client, shop_id, 30)
+        counts_7 = await _orders_counts_for_days(client, shop_id, 7)
+        rows = await load_sku_rows(client, shop_id, max_pages=50)
+        st = _build_stock_stats(rows)
+
+        active_orders = sum(
+            counts_7.get(s, 0)
+            for s in (
+                "CREATED",
+                "PACKING",
+                "PENDING_DELIVERY",
+                "DELIVERING",
+                "DELIVERED",
+                "ACCEPTED_AT_DP",
+                "DELIVERED_TO_CUSTOMER_DELIVERY_POINT",
+            )
+        )
+        completed_7 = counts_7.get("COMPLETED", 0)
+        canceled_7 = counts_7.get("CANCELED", 0)
+        returned_7 = counts_7.get("RETURNED", 0)
+
+        await message.answer(
+            f"📈 <b>Сводка магазина</b>\n"
+            f"Магазин: <code>{shop_id}</code>\n\n"
+            f"💰 <b>Продажи Finance API</b>\n"
+            f"• 7 дней: <b>{_format_money(float(sales_7['revenue']))}</b> / строк: <b>{sales_7['active_rows']}</b>\n"
+            f"• 30 дней: <b>{_format_money(float(sales_30['revenue']))}</b> / строк: <b>{sales_30['active_rows']}</b>\n\n"
+            f"🛒 <b>Заказы FBS/DBS за 7 дней</b>\n"
+            f"• Активные статусы: <b>{active_orders}</b>\n"
+            f"• Завершено: <b>{completed_7}</b>\n"
+            f"• Отменено: <b>{canceled_7}</b>\n"
+            f"• Возвраты: <b>{returned_7}</b>\n\n"
+            f"📦 <b>Остатки</b>\n"
+            f"• SKU: <b>{int(st['total_skus'])}</b>\n"
+            f"• Общий остаток: <b>{float(st['total_units']):.0f}</b> шт\n"
+            f"• FBO: <b>{float(st['fbo_units']):.0f}</b> шт / FBS: <b>{float(st['fbs_units']):.0f}</b> шт\n"
+            f"• Заканчиваются ≤ {LOW_STOCK_THRESHOLD}: <b>{int(st['low_count'])}</b>\n"
+            f"• Нет в наличии: <b>{int(st['zero_count'])}</b>\n"
+            f"• Примерная стоимость остатка: <b>{_format_money(float(st['stock_value']))}</b>\n\n"
+            f"Подробно: <code>/sales</code>, <code>/orders_summary</code>, <code>/lowstock</code>",
+            reply_markup=MAIN_MENU,
+        )
+    except Exception as e:
+        await send_api_error(message, e)
 
 
 
@@ -1673,6 +1899,17 @@ async def outofstock_notify_status(message: Message) -> None:
 # --- Русские кнопки меню ---
 # Эти обработчики не заменяют старые /commands, а просто вызывают их.
 # Поэтому старые команды продолжают работать как раньше.
+
+@dp.message(F.text == "📈 Сводка")
+async def button_dashboard(message: Message) -> None:
+    await dashboard(message)
+
+
+@dp.message(F.text == "📊 Сводка заказов")
+async def button_orders_summary(message: Message) -> None:
+    await orders_summary(message)
+
+
 @dp.message(F.text == "💰 Продажи")
 async def button_sales(message: Message) -> None:
     await sales(message)
