@@ -6,7 +6,9 @@ import json
 import logging
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 from html import escape
+from urllib.parse import urlencode
 from pathlib import Path
 from typing import Any
 
@@ -90,12 +92,13 @@ dp = Dispatcher()
 # а ниже есть обработчики, которые вызывают уже рабочие команды.
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📦 Товары"), KeyboardButton(text="📊 Остатки")],
-        [KeyboardButton(text="🛒 Заказы"), KeyboardButton(text="⚠️ Заканчиваются")],
-        [KeyboardButton(text="📄 Excel-отчёт"), KeyboardButton(text="⚙️ Статус")],
-        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="⭐ Отзывы")],
-        [KeyboardButton(text="🔔 Новые заказы"), KeyboardButton(text="📉 Низкие остатки")],
-        [KeyboardButton(text="❌ Нет в наличии"), KeyboardButton(text="❓ Помощь")],
+        [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Товары")],
+        [KeyboardButton(text="📊 Остатки"), KeyboardButton(text="🛒 Заказы")],
+        [KeyboardButton(text="⚠️ Заканчиваются"), KeyboardButton(text="📄 Excel-отчёт")],
+        [KeyboardButton(text="⚙️ Статус"), KeyboardButton(text="🏪 Магазины")],
+        [KeyboardButton(text="⭐ Отзывы"), KeyboardButton(text="🔔 Новые заказы")],
+        [KeyboardButton(text="📉 Низкие остатки"), KeyboardButton(text="❌ Нет в наличии")],
+        [KeyboardButton(text="❓ Помощь")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите раздел",
@@ -559,6 +562,409 @@ async def orders(message: Message) -> None:
         )
     except Exception as e:
         await send_api_error(message, e)
+
+
+
+# --- Продажи / Финансы ---
+# Используем официальный Finance endpoint Uzum Seller OpenAPI:
+# GET /v1/finance/orders?shopIds=...&dateFrom=...&dateTo=...
+
+def _epoch_ms(dt: datetime) -> int:
+    return int(dt.timestamp() * 1000)
+
+
+def _today_range_ms() -> tuple[int, int]:
+    now = datetime.now(timezone.utc)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return _epoch_ms(start), _epoch_ms(now)
+
+
+def _days_range_ms(days: int) -> tuple[int, int]:
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(days=max(1, days))
+    return _epoch_ms(start), _epoch_ms(now)
+
+
+def _deep_items(obj: Any) -> list[dict[str, Any]]:
+    """Достаём список строк из разных возможных форматов ответа Uzum."""
+    direct = extract_items(obj)
+    if direct:
+        return [x for x in direct if isinstance(x, dict)]
+
+    keys = (
+        "orderItems",
+        "orders",
+        "items",
+        "content",
+        "data",
+        "payload",
+        "result",
+        "list",
+        "financeOrders",
+        "sellerOrders",
+    )
+    found: list[dict[str, Any]] = []
+
+    def walk(x: Any) -> None:
+        if isinstance(x, dict):
+            for k in keys:
+                v = x.get(k)
+                if isinstance(v, list):
+                    for item in v:
+                        if isinstance(item, dict):
+                            found.append(item)
+                elif isinstance(v, dict):
+                    walk(v)
+        elif isinstance(x, list):
+            for item in x:
+                if isinstance(item, dict):
+                    found.append(item)
+
+    walk(obj)
+    # Убираем явные дубли по JSON-представлению.
+    unique: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in found:
+        sig = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)[:1000]
+        if sig not in seen:
+            seen.add(sig)
+            unique.append(item)
+    return unique
+
+
+def _num_from_value(value: Any) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        cleaned = (
+            value.replace(" ", "")
+            .replace("\u00a0", "")
+            .replace("сум", "")
+            .replace("UZS", "")
+            .replace(",", ".")
+        )
+        try:
+            return float(cleaned)
+        except Exception:
+            return None
+    return None
+
+
+def _pick_number(item: dict[str, Any], names: tuple[str, ...]) -> float | None:
+    for name in names:
+        value = item.get(name)
+        number = _num_from_value(value)
+        if number is not None:
+            return number
+    return None
+
+
+def _finance_status(item: dict[str, Any]) -> str:
+    value = pick(
+        item,
+        "status",
+        "orderStatus",
+        "financeStatus",
+        "state",
+        "statusName",
+        "statusTitle",
+    )
+    if isinstance(value, dict):
+        value = pick(value, "title", "name", "value", "code")
+    return str(value or "UNKNOWN")
+
+
+def _finance_title(item: dict[str, Any]) -> str:
+    value = pick(
+        item,
+        "skuTitle",
+        "productTitle",
+        "productName",
+        "title",
+        "name",
+        "skuName",
+        "offerName",
+    )
+    if isinstance(value, dict):
+        value = pick(value, "title", "name")
+    return str(value or "Без названия")
+
+
+def _finance_qty(item: dict[str, Any]) -> float:
+    return _pick_number(
+        item,
+        (
+            "quantity",
+            "amount",
+            "count",
+            "qty",
+            "skuAmount",
+            "productAmount",
+            "quantityPurchased",
+        ),
+    ) or 1.0
+
+
+def _finance_revenue(item: dict[str, Any]) -> float:
+    # Пробуем готовые суммы.
+    direct = _pick_number(
+        item,
+        (
+            "totalPrice",
+            "totalAmount",
+            "totalSum",
+            "sellerAmount",
+            "sellerPrice",
+            "totalSellerPrice",
+            "purchasePrice",
+            "priceWithDiscount",
+            "orderItemPrice",
+            "orderPrice",
+            "amountToWithdraw",
+            "accrual",
+            "sum",
+        ),
+    )
+    if direct is not None:
+        return max(0.0, direct)
+
+    # Если есть только цена за штуку — умножаем на количество.
+    price = _pick_number(item, ("price", "itemPrice", "skuPrice", "sellPrice"))
+    if price is not None:
+        return max(0.0, price * _finance_qty(item))
+    return 0.0
+
+
+def _is_cancelled_status(status: str) -> bool:
+    s = status.upper()
+    return "CANCEL" in s or "ОТМЕН" in s
+
+
+def _format_money(value: float) -> str:
+    return f"{value:,.0f}".replace(",", " ") + " сум"
+
+
+async def _finance_orders_request(
+    client: UzumClient,
+    shop_id: int,
+    *,
+    date_from_ms: int,
+    date_to_ms: int,
+    page: int = 0,
+    size: int = 100,
+) -> Any:
+    params = [
+        ("page", page),
+        ("size", size),
+        ("group", "false"),
+        ("dateFrom", date_from_ms),
+        ("dateTo", date_to_ms),
+        ("shopIds", shop_id),
+    ]
+    path = "/v1/finance/orders?" + urlencode(params)
+    return await client._request("GET", path)
+
+
+async def _load_finance_orders(
+    client: UzumClient,
+    shop_id: int,
+    *,
+    date_from_ms: int,
+    date_to_ms: int,
+    max_pages: int = 10,
+    page_size: int = 100,
+) -> tuple[list[dict[str, Any]], Any | None]:
+    rows: list[dict[str, Any]] = []
+    first_response: Any | None = None
+    for page in range(max_pages):
+        data = await _finance_orders_request(
+            client,
+            shop_id,
+            date_from_ms=date_from_ms,
+            date_to_ms=date_to_ms,
+            page=page,
+            size=page_size,
+        )
+        if first_response is None:
+            first_response = data
+        items = _deep_items(data)
+        if not items:
+            break
+        rows.extend(items)
+        if len(items) < page_size:
+            break
+    return rows, first_response
+
+
+def _build_sales_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    total_rows = len(rows)
+    cancelled_rows = 0
+    revenue = 0.0
+    units = 0.0
+    statuses: dict[str, int] = {}
+    products: dict[str, dict[str, float | str]] = {}
+
+    for item in rows:
+        status = _finance_status(item)
+        statuses[status] = statuses.get(status, 0) + 1
+        qty = _finance_qty(item)
+        amount = _finance_revenue(item)
+        if _is_cancelled_status(status):
+            cancelled_rows += 1
+            continue
+        revenue += amount
+        units += qty
+        title = _finance_title(item)
+        if title not in products:
+            products[title] = {"title": title, "qty": 0.0, "revenue": 0.0}
+        products[title]["qty"] = float(products[title]["qty"]) + qty
+        products[title]["revenue"] = float(products[title]["revenue"]) + amount
+
+    top_products = sorted(
+        products.values(), key=lambda x: float(x.get("revenue") or 0), reverse=True
+    )[:5]
+    avg = revenue / max(1, (total_rows - cancelled_rows))
+    return {
+        "rows": total_rows,
+        "cancelled": cancelled_rows,
+        "active_rows": max(0, total_rows - cancelled_rows),
+        "revenue": revenue,
+        "units": units,
+        "avg": avg,
+        "statuses": statuses,
+        "top_products": top_products,
+    }
+
+
+def _short_period_title(days: int) -> str:
+    if days == 1:
+        return "сегодня"
+    return f"за {days} дней"
+
+
+async def _sales_period_stats(
+    client: UzumClient, shop_id: int, days: int
+) -> tuple[dict[str, Any], Any | None]:
+    if days == 1:
+        date_from, date_to = _today_range_ms()
+    else:
+        date_from, date_to = _days_range_ms(days)
+    rows, first = await _load_finance_orders(
+        client, shop_id, date_from_ms=date_from, date_to_ms=date_to
+    )
+    return _build_sales_stats(rows), first
+
+
+def _format_sales_summary_line(title: str, stats: dict[str, Any]) -> str:
+    return (
+        f"<b>{escape(title)}</b>\n"
+        f"• Выручка: <b>{_format_money(float(stats['revenue']))}</b>\n"
+        f"• Позиций/строк: <b>{stats['active_rows']}</b>\n"
+        f"• Штук: <b>{float(stats['units']):.0f}</b>\n"
+        f"• Средняя строка: <b>{_format_money(float(stats['avg']))}</b>"
+    )
+
+
+def _format_sales_details(days: int, shop_id: int, stats: dict[str, Any], first_response: Any | None) -> str:
+    title = _short_period_title(days)
+    lines = [
+        f"💰 <b>Продажи {title}</b>",
+        f"Магазин: <code>{shop_id}</code>",
+        "",
+        f"Выручка: <b>{_format_money(float(stats['revenue']))}</b>",
+        f"Проданных строк/позиций: <b>{stats['active_rows']}</b>",
+        f"Штук: <b>{float(stats['units']):.0f}</b>",
+        f"Средняя строка: <b>{_format_money(float(stats['avg']))}</b>",
+        f"Отменённых строк: <b>{stats['cancelled']}</b>",
+    ]
+
+    statuses = stats.get("statuses") or {}
+    if statuses:
+        lines.append("")
+        lines.append("<b>Статусы:</b>")
+        for status, count in sorted(statuses.items(), key=lambda x: str(x[0]))[:8]:
+            lines.append(f"• <code>{escape(str(status))}</code>: {count}")
+
+    top_products = stats.get("top_products") or []
+    if top_products:
+        lines.append("")
+        lines.append("<b>Топ товаров по сумме:</b>")
+        for idx, item in enumerate(top_products, start=1):
+            title_item = str(item.get("title") or "Без названия")
+            if len(title_item) > 70:
+                title_item = title_item[:67] + "..."
+            lines.append(
+                f"{idx}. {escape(title_item)} — "
+                f"{float(item.get('qty') or 0):.0f} шт, "
+                f"{_format_money(float(item.get('revenue') or 0))}"
+            )
+
+    if stats.get("rows") == 0 and first_response is not None:
+        lines.append("")
+        lines.append("Ответ Finance API пришёл, но строки продаж не найдены.")
+        lines.append("Фрагмент ответа:")
+        lines.append("<code>" + escape(compact_json_preview(first_response)) + "</code>")
+
+    return "\n".join(lines)
+
+
+@dp.message(Command("sales"))
+async def sales(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+    await message.answer("⏳ Считаю продажи за сегодня, 7 и 30 дней...", reply_markup=MAIN_MENU)
+    try:
+        today, _ = await _sales_period_stats(client, shop_id, 1)
+        week, _ = await _sales_period_stats(client, shop_id, 7)
+        month, _ = await _sales_period_stats(client, shop_id, 30)
+        await message.answer(
+            "💰 <b>Сводка продаж</b>\n"
+            f"Магазин: <code>{shop_id}</code>\n\n"
+            + _format_sales_summary_line("Сегодня", today)
+            + "\n\n"
+            + _format_sales_summary_line("7 дней", week)
+            + "\n\n"
+            + _format_sales_summary_line("30 дней", month)
+            + "\n\nПодробно: <code>/sales_today</code>, <code>/sales_7</code>, <code>/sales_30</code>",
+            reply_markup=MAIN_MENU,
+        )
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+async def _send_sales_details(message: Message, days: int) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+    try:
+        stats, first = await _sales_period_stats(client, shop_id, days)
+        await message.answer(
+            _format_sales_details(days, shop_id, stats, first), reply_markup=MAIN_MENU
+        )
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+@dp.message(Command("sales_today"))
+async def sales_today(message: Message) -> None:
+    await _send_sales_details(message, 1)
+
+
+@dp.message(Command("sales_7"))
+async def sales_7(message: Message) -> None:
+    await _send_sales_details(message, 7)
+
+
+@dp.message(Command("sales_30"))
+async def sales_30(message: Message) -> None:
+    await _send_sales_details(message, 30)
 
 
 
@@ -1267,6 +1673,11 @@ async def outofstock_notify_status(message: Message) -> None:
 # --- Русские кнопки меню ---
 # Эти обработчики не заменяют старые /commands, а просто вызывают их.
 # Поэтому старые команды продолжают работать как раньше.
+@dp.message(F.text == "💰 Продажи")
+async def button_sales(message: Message) -> None:
+    await sales(message)
+
+
 @dp.message(F.text == "📦 Товары")
 async def button_products(message: Message) -> None:
     await products(message)
@@ -1340,4 +1751,5 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
