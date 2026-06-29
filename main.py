@@ -160,7 +160,13 @@ async def send_api_error(message: Message, error: Exception) -> None:
 
 
 def parse_args(text: str) -> str:
-    parts = (text or "").split(maxsplit=1)
+    text = (text or "").strip()
+    # Аргументы берём только у настоящих slash-команд.
+    # Если пользователь нажал русскую кнопку вроде "📦 Товары",
+    # это не должно уходить в Uzum API как поисковый запрос или статус заказа.
+    if not text.startswith("/"):
+        return ""
+    parts = text.split(maxsplit=1)
     return parts[1].strip() if len(parts) > 1 else ""
 
 
@@ -1096,4 +1102,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
