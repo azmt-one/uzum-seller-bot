@@ -72,6 +72,11 @@ OUT_OF_STOCK_NOTIFICATIONS = (
 OUT_OF_STOCK_CHECK_INTERVAL_SECONDS = int(
     os.getenv("OUT_OF_STOCK_CHECK_INTERVAL_SECONDS", "1800") or "1800"
 )
+SALE_NOTIFICATIONS = (
+    os.getenv("SALE_NOTIFICATIONS", "1").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
+SALE_CHECK_INTERVAL_SECONDS = int(os.getenv("SALE_CHECK_INTERVAL_SECONDS", "300") or "300")
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError(
@@ -97,8 +102,9 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton(text="🛒 Заказы"), KeyboardButton(text="⚠️ Заканчиваются")],
         [KeyboardButton(text="📄 Excel-отчёт"), KeyboardButton(text="⚙️ Статус")],
         [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="⭐ Отзывы")],
-        [KeyboardButton(text="🔔 Новые заказы"), KeyboardButton(text="📉 Низкие остатки")],
-        [KeyboardButton(text="❌ Нет в наличии"), KeyboardButton(text="📊 Сводка заказов")],
+        [KeyboardButton(text="🔔 Новые заказы"), KeyboardButton(text="💸 Новые продажи")],
+        [KeyboardButton(text="📉 Низкие остатки"), KeyboardButton(text="❌ Нет в наличии")],
+        [KeyboardButton(text="📊 Сводка заказов")],
         [KeyboardButton(text="❓ Помощь")],
     ],
     resize_keyboard=True,
@@ -1896,6 +1902,164 @@ async def outofstock_notify_status(message: Message) -> None:
     )
 
 
+# --- Уведомления о новых продажах через Finance API ---
+# Важно: старое уведомление "Новые заказы" смотрит только FBS/DBS заказы CREATED.
+# Если продажа была FBO или уже не имеет статус CREATED, она может не попасть в этот список.
+# Этот watcher смотрит финансовые строки продаж за сегодня и присылает уведомление о новых строках.
+_seen_sale_keys_by_user: dict[int, set[str]] = {}
+_sales_watch_initialized: set[int] = set()
+
+
+def sale_key(item: dict[str, Any]) -> str:
+    for key in (
+        "id",
+        "orderItemId",
+        "orderItem_id",
+        "orderId",
+        "order_id",
+        "skuId",
+        "sku_id",
+        "postingNumber",
+        "number",
+        "barcode",
+    ):
+        value = item.get(key)
+        if value not in (None, ""):
+            # Добавляем дату/сумму, чтобы разные продажи одного SKU не слиплись.
+            date_part = ""
+            for dk in ("date", "orderDate", "createdAt", "operationDate", "saleDate"):
+                dv = item.get(dk)
+                if dv not in (None, ""):
+                    date_part = str(dv)
+                    break
+            amount = _finance_revenue(item)
+            qty = _finance_qty(item)
+            return f"{key}:{value}|{date_part}|{qty}|{amount}"
+    raw = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+    return "hash:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def format_sale_line(item: dict[str, Any]) -> str:
+    title = escape(_finance_title(item))
+    qty = _finance_qty(item)
+    amount = _finance_revenue(item)
+    status = escape(_finance_status(item))
+    extra = []
+    for k in ("orderId", "order_id", "skuId", "sku_id", "barcode"):
+        v = item.get(k)
+        if v not in (None, ""):
+            extra.append(f"{k}: <code>{escape(str(v))}</code>")
+            break
+    extra_text = "\n" + " | ".join(extra) if extra else ""
+    return (
+        f"• <b>{title}</b>\n"
+        f"  Штук: <b>{qty:g}</b> | Сумма: <b>{_format_money(amount)}</b> | Статус: <code>{status}</code>"
+        f"{extra_text}"
+    )
+
+
+async def check_new_sales_once() -> None:
+    users = connected_users_for_order_watch()
+    date_from, date_to = _today_range_ms()
+
+    for row in users:
+        telegram_id = int(row["telegram_id"])
+        shop_id = int(row["default_shop_id"])
+        encrypted_token = row["uzum_token_encrypted"]
+
+        try:
+            token = cipher.decrypt(encrypted_token)
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            rows, first_response = await _load_finance_orders(
+                client,
+                shop_id,
+                date_from_ms=date_from,
+                date_to_ms=date_to,
+                max_pages=5,
+                page_size=100,
+            )
+        except Exception:
+            logging.exception("Sales watcher: failed to check sales for %s", telegram_id)
+            continue
+
+        keys_now = [sale_key(item) for item in rows]
+        known = _seen_sale_keys_by_user.setdefault(telegram_id, set())
+
+        # Первый проход: запоминаем текущие продажи за сегодня, чтобы не прислать старые.
+        if telegram_id not in _sales_watch_initialized:
+            known.update(keys_now)
+            _sales_watch_initialized.add(telegram_id)
+            logging.info(
+                "Sales watcher initialized for user=%s shop=%s sales_rows=%s",
+                telegram_id,
+                shop_id,
+                len(keys_now),
+            )
+            continue
+
+        new_rows = [item for item, key in zip(rows, keys_now) if key not in known]
+        known.update(keys_now)
+
+        if len(known) > 3000:
+            _seen_sale_keys_by_user[telegram_id] = set(keys_now)
+
+        if not new_rows:
+            continue
+
+        stats = _build_sales_stats(new_rows)
+        lines = [format_sale_line(item) for item in new_rows[:8]]
+        more = "" if len(new_rows) <= 8 else f"\n\nЕщё новых строк продаж: {len(new_rows) - 8}"
+        text = (
+            f"💸 <b>Новая продажа</b>\n"
+            f"Магазин: <code>{shop_id}</code>\n"
+            f"Новых строк: <b>{len(new_rows)}</b>\n"
+            f"Сумма: <b>{_format_money(float(stats['revenue']))}</b>\n"
+            f"Штук: <b>{float(stats['units']):g}</b>\n\n"
+            + "\n\n".join(lines)
+            + more
+            + "\n\nПодробно: <code>/sales_today</code>"
+        )
+
+        try:
+            await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+        except Exception:
+            logging.exception("Sales watcher: failed to send notification to %s", telegram_id)
+
+
+async def sales_watch_loop() -> None:
+    await asyncio.sleep(40)
+    logging.info(
+        "Sales watcher started. Interval: %s seconds. Enabled: %s",
+        SALE_CHECK_INTERVAL_SECONDS,
+        SALE_NOTIFICATIONS,
+    )
+    while True:
+        try:
+            await check_new_sales_once()
+        except Exception:
+            logging.exception("Sales watcher loop error")
+        await asyncio.sleep(max(60, SALE_CHECK_INTERVAL_SECONDS))
+
+
+@dp.message(Command("sales_notify_status"))
+async def sales_notify_status(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, _, shop_id = req
+    initialized = telegram_id in _sales_watch_initialized
+    await message.answer(
+        "💸 <b>Уведомления о новых продажах</b>\n\n"
+        f"Статус: {'✅ включены' if SALE_NOTIFICATIONS else '❌ выключены'}\n"
+        f"Магазин: <code>{shop_id}</code>\n"
+        f"Проверка каждые: <b>{max(60, SALE_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
+        f"Состояние: {'продажи уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
+        "Бот смотрит Finance API за сегодня. Если Finance API отдаёт продажу с задержкой, уведомление тоже придёт с задержкой.",
+        reply_markup=MAIN_MENU,
+    )
+
+
 # --- Русские кнопки меню ---
 # Эти обработчики не заменяют старые /commands, а просто вызывают их.
 # Поэтому старые команды продолжают работать как раньше.
@@ -1955,6 +2119,11 @@ async def button_notify_status(message: Message) -> None:
     await notify_status(message)
 
 
+@dp.message(F.text == "💸 Новые продажи")
+async def button_sales_notify_status(message: Message) -> None:
+    await sales_notify_status(message)
+
+
 @dp.message(F.text == "📉 Низкие остатки")
 async def button_lowstock_notify_status(message: Message) -> None:
     await lowstock_notify_status(message)
@@ -1983,6 +2152,8 @@ async def main() -> None:
         asyncio.create_task(low_stock_watch_loop())
     if OUT_OF_STOCK_NOTIFICATIONS:
         asyncio.create_task(out_of_stock_watch_loop())
+    if SALE_NOTIFICATIONS:
+        asyncio.create_task(sales_watch_loop())
     await dp.start_polling(bot)
 
 
