@@ -1,61 +1,136 @@
-# Uzum Seller Telegram Bot — Multi-seller MVP fix3
+# UZUM Seller Telegram Bot — первая рабочая версия
 
-Версия с точными остатками FBO + FBS/DBS по SKU из ответа `/v1/product/shop/{shopId}`.
+Это стартовый проект бота для Telegram. Он уже умеет:
 
-## Как считаются остатки
+- запускаться 24/7 на сервере;
+- показывать меню с кнопками;
+- пускать только разрешенных пользователей по Telegram ID;
+- хранить данные в постоянной SQLite-базе;
+- переживать перезагрузку, если база лежит в `/data`;
+- иметь готовые разделы: продажи, баланс, заказы, остатки, отзывы, накладная.
 
-По реальному ответу Uzum Seller API внутри `skuList` есть поля:
+Пока данные UZUM стоят в демо-режиме. Следующий шаг — подключить реальные запросы к кабинету/API UZUM.
 
-- `quantityAvailable` — общий доступный остаток;
-- `quantityActive` — активный остаток в продаже;
-- `quantityFbs` — остаток FBS/DBS на складе продавца;
-- `quantityAdditional` — дополнительный остаток, если передан;
-- `quantitySold`, `quantityReturned`, `quantityMissing`, `quantityDefected`, `quantityPending` — служебные количества.
+---
 
-Если отдельного поля FBO нет, бот считает:
+## 1. Что нужно подготовить
 
-```text
-FBO = quantityAvailable - quantityFbs
-Итого = quantityAvailable
-FBS/DBS = quantityFbs
+1. Токен бота от `@BotFather`.
+2. Твой Telegram ID. Узнать можно командой `/id` в боте после запуска.
+3. Telegram ID жены, если ей тоже нужен доступ. Уже можно указать `938965878`.
+4. Сервер bothost.ru.
+
+---
+
+## 2. Настройка `.env`
+
+Скопируй файл:
+
+```bash
+cp .env.example .env
 ```
 
-Например, если `quantityAvailable=5`, `quantityFbs=0`, значит:
-- FBO: 5
-- FBS/DBS: 0
-- Итого: 5
-
-## Команды
-
-- `/connect` — подключить личный Uzum API-токен селлера
-- `/disconnect` — удалить подключение
-- `/status` — статус подключения
-- `/pinguzum` — проверить Uzum API
-- `/shops` — список магазинов селлера
-- `/setshop SHOP_ID` — выбрать основной магазин
-- `/products [поиск]` — товары, цены и агрегированный остаток
-- `/stock [поиск]` — FBO + FBS/DBS + итого по SKU
-- `/fbo [поиск]` — только FBO-остатки
-- `/fbs [поиск]` — только FBS/DBS-остатки
-- `/lowstock [порог]` — низкие остатки по общему количеству
-- `/orders [status]` — FBS/DBS заказы
-- `/export_products` — Excel с колонками FBO, FBS/DBS, итого
-- `/debug_product` — сырой JSON первого товара
-
-## Переменные окружения
+Открой `.env` и заполни:
 
 ```env
-TELEGRAM_BOT_TOKEN=...
-ENCRYPTION_KEY=...
-OWNER_TELEGRAM_ID=
-DB_PATH=bot.db
-UZUM_API_BASE_URL=https://api-seller.uzum.uz/api/seller-openapi
+TELEGRAM_TOKEN=токен_от_BotFather
+ADMIN_IDS=твой_id,938965878
+BOT_DB_PATH=/data/uzum_bot.db
+UZUM_TOKEN=
 ```
 
-Сгенерировать `ENCRYPTION_KEY`:
+Важно: на bothost.ru лучше добавлять эти значения в **Environment / Переменные окружения**, а не писать токен прямо в коде.
 
-```python
-import base64, os; print(base64.urlsafe_b64encode(os.urandom(32)).decode())
+---
+
+## 3. Запуск на компьютере через Docker
+
+```bash
+docker compose up -d --build
 ```
 
-`ENCRYPTION_KEY` нельзя терять. Если он изменится, старые Uzum API-токены в базе нельзя будет расшифровать.
+Посмотреть логи:
+
+```bash
+docker compose logs -f bot
+```
+
+Остановить:
+
+```bash
+docker compose down
+```
+
+---
+
+## 4. Запуск без Docker
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+python -m app.main
+```
+
+На Linux/Mac:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python -m app.main
+```
+
+---
+
+## 5. Как загрузить на bothost.ru
+
+1. Загрузи папку проекта или подключи GitHub-репозиторий.
+2. Укажи запуск через Dockerfile, если bothost это поддерживает.
+3. В переменные окружения добавь:
+
+```env
+TELEGRAM_TOKEN=токен_от_BotFather
+ADMIN_IDS=твой_id,938965878
+BOT_DB_PATH=/data/uzum_bot.db
+UZUM_TOKEN=
+```
+
+4. Обязательно сделай постоянную папку/volume `/data`, чтобы база не исчезала после обновления.
+5. Запусти проект.
+6. Напиши боту `/start`.
+
+---
+
+## 6. Команды бота
+
+```text
+/start — открыть меню
+/id — узнать свой Telegram ID
+/sales — продажи
+/balance — баланс
+/orders — заказы
+/stock — остатки
+/reviews — отзывы
+/invoice DEMO-001 — демо-накладная
+```
+
+---
+
+## 7. Что делать дальше
+
+Когда бот запустится и будет отвечать, нужно подключить реальные данные UZUM.
+
+Для этого нужно понять, какой доступ есть к UZUM seller-кабинету:
+
+- официальный API;
+- токен/ключ API;
+- или запросы, которые делает личный кабинет.
+
+Подключение делается в файле:
+
+```text
+app/services/uzum_client.py
+```
+
+Там сейчас демо-данные. Мы будем постепенно заменять их на настоящие запросы.
