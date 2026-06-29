@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 import tempfile
@@ -48,6 +50,11 @@ UZUM_API_BASE_URL = os.getenv(
 ).strip()
 DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
+ORDER_CHECK_INTERVAL_SECONDS = int(os.getenv("ORDER_CHECK_INTERVAL_SECONDS", "300") or "300")
+NEW_ORDER_NOTIFICATIONS = (
+    os.getenv("NEW_ORDER_NOTIFICATIONS", "1").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError(
@@ -70,7 +77,8 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton(text="/products"), KeyboardButton(text="/stock")],
         [KeyboardButton(text="/orders"), KeyboardButton(text="/lowstock")],
         [KeyboardButton(text="/export_products"), KeyboardButton(text="/status")],
-        [KeyboardButton(text="/shops"), KeyboardButton(text="/help")],
+        [KeyboardButton(text="/shops"), KeyboardButton(text="/notify_status")],
+        [KeyboardButton(text="/help")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите команду",
@@ -246,7 +254,8 @@ async def start(message: Message) -> None:
         "• <code>/orders [CREATED]</code> — FBS/DBS заказы\n"
         "• <code>/export_products</code> — Excel: FBO, FBS/DBS, итого\n"
         "• <code>/debug_product</code> — сырой JSON первого товара\n"
-        "• <code>/status</code> — статус подключения\n\n"
+        "• <code>/status</code> — статус подключения\n"
+        "• <code>/notify_status</code> — статус уведомлений о новых заказах\n\n"
         "Для начала нажмите: <code>/connect</code>",
         reply_markup=MAIN_MENU,
     )
@@ -628,10 +637,157 @@ async def export_products(message: Message) -> None:
         await send_api_error(message, e)
 
 
+# --- Уведомления о новых заказах ---
+# Логика простая и безопасная:
+# 1) при первом запуске бот запоминает текущие CREATED-заказы и не спамит ими;
+# 2) дальше каждые ORDER_CHECK_INTERVAL_SECONDS секунд проверяет новые CREATED-заказы;
+# 3) если появился новый заказ, пишет продавцу в Telegram.
+_seen_order_keys_by_user: dict[int, set[str]] = {}
+_orders_watch_initialized: set[int] = set()
+
+
+def order_key(order: Any) -> str:
+    """Делаем стабильный ключ заказа из ID. Если ID в ответе API спрятан, берём hash JSON."""
+    if isinstance(order, dict):
+        for key in (
+            "id",
+            "orderId",
+            "order_id",
+            "shipmentId",
+            "shipment_id",
+            "postingNumber",
+            "posting_number",
+            "number",
+            "barcode",
+        ):
+            value = order.get(key)
+            if value not in (None, ""):
+                return f"{key}:{value}"
+
+        # Иногда ID лежит внутри вложенного объекта.
+        for value in order.values():
+            if isinstance(value, dict):
+                nested = order_key(value)
+                if nested:
+                    return nested
+
+    raw = json.dumps(order, ensure_ascii=False, sort_keys=True, default=str)
+    return "hash:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def connected_users_for_order_watch() -> list[dict[str, Any]]:
+    """Берём всех пользователей, у кого подключён Uzum-токен и выбран магазин."""
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT telegram_id, default_shop_id, uzum_token_encrypted
+            FROM users
+            WHERE uzum_token_encrypted IS NOT NULL
+              AND default_shop_id IS NOT NULL
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+async def check_new_orders_once() -> None:
+    users = connected_users_for_order_watch()
+    for row in users:
+        telegram_id = int(row["telegram_id"])
+        shop_id = int(row["default_shop_id"])
+        encrypted_token = row["uzum_token_encrypted"]
+
+        try:
+            token = cipher.decrypt(encrypted_token)
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            data = await client.get_fbs_orders(shop_id, status="CREATED", page=0, size=20)
+            items = extract_items(data)
+        except Exception:
+            logging.exception("Order watcher: failed to check orders for %s", telegram_id)
+            continue
+
+        keys_now = [order_key(item) for item in items]
+        known = _seen_order_keys_by_user.setdefault(telegram_id, set())
+
+        # Первый проход: просто запоминаем текущие заказы, чтобы не прислать старые как новые.
+        if telegram_id not in _orders_watch_initialized:
+            known.update(keys_now)
+            _orders_watch_initialized.add(telegram_id)
+            logging.info(
+                "Order watcher initialized for user=%s shop=%s orders=%s",
+                telegram_id,
+                shop_id,
+                len(keys_now),
+            )
+            continue
+
+        new_items = [item for item, key in zip(items, keys_now) if key not in known]
+        known.update(keys_now)
+
+        # Чтобы память не росла бесконечно.
+        if len(known) > 1000:
+            _seen_order_keys_by_user[telegram_id] = set(keys_now)
+
+        if not new_items:
+            continue
+
+        lines = [format_order_line(item) for item in new_items[:5]]
+        more = "" if len(new_items) <= 5 else f"\n\nЕщё новых заказов: {len(new_items) - 5}"
+        text = (
+            f"🔔 <b>Новый заказ CREATED</b>\n"
+            f"Магазин: <code>{shop_id}</code>\n"
+            f"Новых заказов: <b>{len(new_items)}</b>\n\n"
+            + "\n\n".join(lines)
+            + more
+            + "\n\nОткрыть список: <code>/orders</code>"
+        )
+
+        try:
+            await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+        except Exception:
+            logging.exception("Order watcher: failed to send notification to %s", telegram_id)
+
+
+async def order_watch_loop() -> None:
+    await asyncio.sleep(10)
+    logging.info(
+        "Order watcher started. Interval: %s seconds. Enabled: %s",
+        ORDER_CHECK_INTERVAL_SECONDS,
+        NEW_ORDER_NOTIFICATIONS,
+    )
+    while True:
+        try:
+            await check_new_orders_once()
+        except Exception:
+            logging.exception("Order watcher loop error")
+        await asyncio.sleep(max(60, ORDER_CHECK_INTERVAL_SECONDS))
+
+
+@dp.message(Command("notify_status"))
+async def notify_status(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, _, shop_id = req
+    initialized = telegram_id in _orders_watch_initialized
+    await message.answer(
+        "🔔 <b>Уведомления о новых заказах</b>\n\n"
+        f"Статус: {'✅ включены' if NEW_ORDER_NOTIFICATIONS else '❌ выключены'}\n"
+        f"Магазин: <code>{shop_id}</code>\n"
+        f"Проверка каждые: <b>{max(60, ORDER_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
+        f"Состояние: {'заказы уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
+        "Бот уведомит, когда появится новый заказ со статусом <code>CREATED</code>.",
+        reply_markup=MAIN_MENU,
+    )
+
+
 async def main() -> None:
     await bot.delete_webhook(drop_pending_updates=True)
+    if NEW_ORDER_NOTIFICATIONS:
+        asyncio.create_task(order_watch_loop())
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
