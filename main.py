@@ -63,6 +63,13 @@ LOW_STOCK_CHECK_INTERVAL_SECONDS = int(
     os.getenv("LOW_STOCK_CHECK_INTERVAL_SECONDS", "1800") or "1800"
 )
 LOW_STOCK_THRESHOLD = int(os.getenv("LOW_STOCK_THRESHOLD", "5") or "5")
+OUT_OF_STOCK_NOTIFICATIONS = (
+    os.getenv("OUT_OF_STOCK_NOTIFICATIONS", "1").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
+OUT_OF_STOCK_CHECK_INTERVAL_SECONDS = int(
+    os.getenv("OUT_OF_STOCK_CHECK_INTERVAL_SECONDS", "1800") or "1800"
+)
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError(
@@ -79,17 +86,19 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# Простое надежное меню: кнопки отправляют обычные команды, которые уже работают.
+# Красивое меню на русском. Кнопки отправляют обычный текст,
+# а ниже есть обработчики, которые вызывают уже рабочие команды.
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="/products"), KeyboardButton(text="/stock")],
-        [KeyboardButton(text="/orders"), KeyboardButton(text="/lowstock")],
-        [KeyboardButton(text="/export_products"), KeyboardButton(text="/status")],
-        [KeyboardButton(text="/shops"), KeyboardButton(text="/notify_status")],
-        [KeyboardButton(text="/lowstock_notify_status"), KeyboardButton(text="/help")],
+        [KeyboardButton(text="📦 Товары"), KeyboardButton(text="📊 Остатки")],
+        [KeyboardButton(text="🛒 Заказы"), KeyboardButton(text="⚠️ Заканчиваются")],
+        [KeyboardButton(text="📄 Excel-отчёт"), KeyboardButton(text="⚙️ Статус")],
+        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="🔔 Новые заказы")],
+        [KeyboardButton(text="📉 Низкие остатки"), KeyboardButton(text="❌ Нет в наличии")],
+        [KeyboardButton(text="❓ Помощь")],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Выберите команду",
+    input_field_placeholder="Выберите раздел",
 )
 
 
@@ -264,7 +273,8 @@ async def start(message: Message) -> None:
         "• <code>/debug_product</code> — сырой JSON первого товара\n"
         "• <code>/status</code> — статус подключения\n"
         "• <code>/notify_status</code> — статус уведомлений о новых заказах\n"
-        "• <code>/lowstock_notify_status</code> — статус уведомлений о низких остатках\n\n"
+        "• <code>/lowstock_notify_status</code> — статус уведомлений о низких остатках\n"
+        "• <code>/outofstock_notify_status</code> — статус уведомлений о нулевых остатках\n\n"
         "Для начала нажмите: <code>/connect</code>",
         reply_markup=MAIN_MENU,
     )
@@ -273,7 +283,7 @@ async def start(message: Message) -> None:
 @dp.message(Command("menu"))
 async def menu(message: Message) -> None:
     upsert_from_message(message)
-    await message.answer("Выберите команду 👇", reply_markup=MAIN_MENU)
+    await message.answer("Выберите раздел 👇", reply_markup=MAIN_MENU)
 
 
 @dp.message(Command("cancel"))
@@ -910,14 +920,180 @@ async def lowstock_notify_status(message: Message) -> None:
     )
 
 
+# --- Уведомления о товарах с нулевым остатком ---
+# Логика:
+# 1) при первом запуске бот запоминает текущие SKU с остатком 0 и не спамит ими;
+# 2) дальше проверяет остатки каждые OUT_OF_STOCK_CHECK_INTERVAL_SECONDS секунд;
+# 3) если SKU впервые стал равен 0, бот присылает отдельное срочное уведомление.
+_seen_out_of_stock_keys_by_user: dict[int, set[str]] = {}
+_out_of_stock_watch_initialized: set[int] = set()
+
+
+async def check_out_of_stock_once() -> None:
+    users = connected_users_for_order_watch()
+
+    for row in users:
+        telegram_id = int(row["telegram_id"])
+        shop_id = int(row["default_shop_id"])
+        encrypted_token = row["uzum_token_encrypted"]
+
+        try:
+            token = cipher.decrypt(encrypted_token)
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            rows = await load_sku_rows(client, shop_id, max_pages=50)
+        except Exception:
+            logging.exception("Out of stock watcher: failed to check stocks for %s", telegram_id)
+            continue
+
+        zero_rows = [
+            r
+            for r in rows
+            if r.get("total") is not None and int(r.get("total") or 0) == 0
+        ]
+        zero_keys_now = [stock_row_key(r) for r in zero_rows]
+        known = _seen_out_of_stock_keys_by_user.setdefault(telegram_id, set())
+
+        # Первый проход: запоминаем текущие нулевые остатки, чтобы не прислать старые как новые.
+        if telegram_id not in _out_of_stock_watch_initialized:
+            known.update(zero_keys_now)
+            _out_of_stock_watch_initialized.add(telegram_id)
+            logging.info(
+                "Out of stock watcher initialized for user=%s shop=%s zero_skus=%s",
+                telegram_id,
+                shop_id,
+                len(zero_keys_now),
+            )
+            continue
+
+        new_zero_rows = [r for r, key in zip(zero_rows, zero_keys_now) if key not in known]
+
+        # Если товар снова появился в наличии, удаляем его из known.
+        # Тогда при повторном падении до 0 бот снова уведомит.
+        _seen_out_of_stock_keys_by_user[telegram_id] = set(zero_keys_now)
+
+        if not new_zero_rows:
+            continue
+
+        lines = [format_sku_stock_line(item, mode="all") for item in new_zero_rows[:10]]
+        more = "" if len(new_zero_rows) <= 10 else f"\n\nЕщё SKU с нулевым остатком: {len(new_zero_rows) - 10}"
+        text = (
+            f"❌ <b>Товар закончился</b>\n"
+            f"Магазин: <code>{shop_id}</code>\n"
+            f"Новых позиций с остатком 0: <b>{len(new_zero_rows)}</b>\n\n"
+            + "\n\n".join(lines)
+            + more
+            + "\n\nПоказать товары с низким остатком: <code>/lowstock 0</code>"
+        )
+
+        try:
+            await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+        except Exception:
+            logging.exception("Out of stock watcher: failed to send notification to %s", telegram_id)
+
+
+async def out_of_stock_watch_loop() -> None:
+    await asyncio.sleep(30)
+    logging.info(
+        "Out of stock watcher started. Interval: %s seconds. Enabled: %s",
+        OUT_OF_STOCK_CHECK_INTERVAL_SECONDS,
+        OUT_OF_STOCK_NOTIFICATIONS,
+    )
+    while True:
+        try:
+            await check_out_of_stock_once()
+        except Exception:
+            logging.exception("Out of stock watcher loop error")
+        await asyncio.sleep(max(300, OUT_OF_STOCK_CHECK_INTERVAL_SECONDS))
+
+
+@dp.message(Command("outofstock_notify_status"))
+async def outofstock_notify_status(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, _, shop_id = req
+    initialized = telegram_id in _out_of_stock_watch_initialized
+    await message.answer(
+        "❌ <b>Уведомления о нулевых остатках</b>\n\n"
+        f"Статус: {'✅ включены' if OUT_OF_STOCK_NOTIFICATIONS else '❌ выключены'}\n"
+        f"Магазин: <code>{shop_id}</code>\n"
+        f"Проверка каждые: <b>{max(300, OUT_OF_STOCK_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
+        f"Состояние: {'нулевые остатки уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
+        "Бот уведомит, когда товар впервые опустится до остатка <b>0</b>.",
+        reply_markup=MAIN_MENU,
+    )
+
+
+# --- Русские кнопки меню ---
+# Эти обработчики не заменяют старые /commands, а просто вызывают их.
+# Поэтому старые команды продолжают работать как раньше.
+@dp.message(F.text == "📦 Товары")
+async def button_products(message: Message) -> None:
+    await products(message)
+
+
+@dp.message(F.text == "📊 Остатки")
+async def button_stock(message: Message) -> None:
+    await stock(message)
+
+
+@dp.message(F.text == "🛒 Заказы")
+async def button_orders(message: Message) -> None:
+    await orders(message)
+
+
+@dp.message(F.text == "⚠️ Заканчиваются")
+async def button_lowstock(message: Message) -> None:
+    await lowstock(message)
+
+
+@dp.message(F.text == "📄 Excel-отчёт")
+async def button_export_products(message: Message) -> None:
+    await export_products(message)
+
+
+@dp.message(F.text == "⚙️ Статус")
+async def button_status(message: Message) -> None:
+    await status(message)
+
+
+@dp.message(F.text == "🏪 Магазины")
+async def button_shops(message: Message) -> None:
+    await shops(message)
+
+
+@dp.message(F.text == "🔔 Новые заказы")
+async def button_notify_status(message: Message) -> None:
+    await notify_status(message)
+
+
+@dp.message(F.text == "📉 Низкие остатки")
+async def button_lowstock_notify_status(message: Message) -> None:
+    await lowstock_notify_status(message)
+
+
+@dp.message(F.text == "❌ Нет в наличии")
+async def button_outofstock_notify_status(message: Message) -> None:
+    await outofstock_notify_status(message)
+
+
+@dp.message(F.text == "❓ Помощь")
+async def button_help(message: Message) -> None:
+    await start(message)
+
+
 async def main() -> None:
     await bot.delete_webhook(drop_pending_updates=True)
     if NEW_ORDER_NOTIFICATIONS:
         asyncio.create_task(order_watch_loop())
     if LOW_STOCK_NOTIFICATIONS:
         asyncio.create_task(low_stock_watch_loop())
+    if OUT_OF_STOCK_NOTIFICATIONS:
+        asyncio.create_task(out_of_stock_watch_loop())
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
