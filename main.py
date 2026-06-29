@@ -100,72 +100,25 @@ bot = Bot(
 )
 dp = Dispatcher()
 
-# Минималистичное меню по разделам.
-# ВАЖНО: в разделах явно разделены FBO и FBS/DBS.
-# FBS/DBS-заказы берём из Orders API, а FBO лучше отслеживать через остатки,
-# потому что FBO-заказ может не появляться в /orders CREATED.
+# Минималистичное меню в стиле Noorza Bot.
+# Главное меню оставляем коротким: только самые важные разделы.
+# Все старые команды остаются рабочими: /products, /stock, /orders, /reviews и т.д.
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Аналитика"), KeyboardButton(text="📦 Товары")],
-        [KeyboardButton(text="🛒 Заказы/продажи"), KeyboardButton(text="🔔 Уведомления")],
-        [KeyboardButton(text="⭐ Отзывы"), KeyboardButton(text="⚙️ Настройки")],
+        [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="📊 Сегодня")],
+        [KeyboardButton(text="📦 Остатки"), KeyboardButton(text="⚠️ Заканчивается")],
+        [KeyboardButton(text="🧭 Потерянные"), KeyboardButton(text="ℹ️ Помощь")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите раздел",
 )
 
-ANALYTICS_MENU = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="💰 Продажи Finance"), KeyboardButton(text="📈 Сводка FBO/FBS")],
-        [KeyboardButton(text="📊 Сводка FBS/DBS"), KeyboardButton(text="📦 FBO/FBS движение")],
-        [KeyboardButton(text="⬅️ Главное меню")],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Аналитика",
-)
-
-PRODUCTS_MENU = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="📦 Все товары"), KeyboardButton(text="📊 Все остатки")],
-        [KeyboardButton(text="🏬 Остатки FBO"), KeyboardButton(text="🚚 Остатки FBS/DBS")],
-        [KeyboardButton(text="⚠️ Заканчиваются"), KeyboardButton(text="📄 Excel-отчёт")],
-        [KeyboardButton(text="⬅️ Главное меню")],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Товары: FBO + FBS/DBS",
-)
-
-ORDERS_MENU = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🛒 FBS/DBS заказы")],
-        [KeyboardButton(text="📦 FBO/FBS движение остатков")],
-        [KeyboardButton(text="📊 Сводка FBS/DBS")],
-        [KeyboardButton(text="⬅️ Главное меню")],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Заказы и продажи",
-)
-
-NOTIFICATIONS_MENU = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="🔔 FBS/DBS новые заказы"), KeyboardButton(text="💸 Продажи Finance")],
-        [KeyboardButton(text="📦 Изменение FBO/FBS")],
-        [KeyboardButton(text="📉 Низкие остатки FBO/FBS"), KeyboardButton(text="❌ Нет в наличии")],
-        [KeyboardButton(text="⬅️ Главное меню")],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Уведомления FBO + FBS/DBS",
-)
-
-SETTINGS_MENU = ReplyKeyboardMarkup(
-    keyboard=[
-        [KeyboardButton(text="⚙️ Статус"), KeyboardButton(text="🏪 Магазины")],
-        [KeyboardButton(text="❓ Помощь")],
-        [KeyboardButton(text="⬅️ Главное меню")],
-    ],
-    resize_keyboard=True,
-    input_field_placeholder="Настройки",
-)
+# Для совместимости: старые обработчики разделов могут ссылаться на эти переменные.
+ANALYTICS_MENU = MAIN_MENU
+PRODUCTS_MENU = MAIN_MENU
+ORDERS_MENU = MAIN_MENU
+NOTIFICATIONS_MENU = MAIN_MENU
+SETTINGS_MENU = MAIN_MENU
 
 class ConnectStates(StatesGroup):
     waiting_for_token = State()
@@ -981,6 +934,284 @@ def _format_sales_details(days: int, shop_id: int, stats: dict[str, Any], first_
     return "\n".join(lines)
 
 
+# --- Короткие разделы в стиле Noorza Bot ---
+# Блок "Сегодня" работает в стиле второго бота: берёт Finance API за текущий день
+# и показывает выручку, комиссию, логистику и к выплате.
+
+def _deep_pick_number(obj: Any, names: tuple[str, ...]) -> float | None:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in names:
+                n = _num_from_value(v)
+                if n is not None:
+                    return n
+        for v in obj.values():
+            n = _deep_pick_number(v, names)
+            if n is not None:
+                return n
+    elif isinstance(obj, list):
+        for v in obj:
+            n = _deep_pick_number(v, names)
+            if n is not None:
+                return n
+    return None
+
+
+def _finance_gross_revenue(item: dict[str, Any]) -> float:
+    direct = _deep_pick_number(
+        item,
+        (
+            "totalPrice", "totalAmount", "totalSum", "productPrice", "skuPrice",
+            "sellPrice", "soldPrice", "priceWithDiscount", "orderItemPrice",
+            "orderPrice", "purchasePrice", "price",
+        ),
+    )
+    if direct is not None:
+        return max(0.0, direct)
+    return _finance_revenue(item)
+
+
+def _finance_commission(item: dict[str, Any]) -> float:
+    value = _deep_pick_number(
+        item,
+        (
+            "commission", "commissionAmount", "commissionSum", "uzumCommission",
+            "marketplaceCommission", "sellerCommission", "fee", "feeAmount",
+        ),
+    )
+    return abs(value or 0.0)
+
+
+def _finance_logistics(item: dict[str, Any]) -> float:
+    value = _deep_pick_number(
+        item,
+        (
+            "logistics", "logistic", "logisticAmount", "logisticsAmount",
+            "logisticsSum", "delivery", "deliveryAmount", "deliveryPrice",
+            "deliveryCost", "shipping", "shippingAmount",
+        ),
+    )
+    return abs(value or 0.0)
+
+
+def _finance_payout_direct(item: dict[str, Any]) -> float | None:
+    return _deep_pick_number(
+        item,
+        (
+            "amountToWithdraw", "toWithdraw", "withdrawAmount", "sellerPayout",
+            "payout", "payoutAmount", "sellerAmount", "accrual", "accrualAmount",
+        ),
+    )
+
+
+def _finance_withdrawn(item: dict[str, Any]) -> float:
+    value = _deep_pick_number(
+        item,
+        (
+            "withdrawn", "withdrawnAmount", "paid", "paidAmount", "transferred",
+            "transferredAmount", "alreadyWithdrawn",
+        ),
+    )
+    return max(0.0, value or 0.0)
+
+
+async def _finance_orders_request_extra(
+    client: UzumClient,
+    shop_id: int,
+    *,
+    date_from_ms: int,
+    date_to_ms: int,
+    extra_params: list[tuple[str, Any]] | None = None,
+    page: int = 0,
+    size: int = 100,
+) -> Any:
+    params: list[tuple[str, Any]] = [
+        ("page", page),
+        ("size", size),
+        ("group", "false"),
+        ("dateFrom", date_from_ms),
+        ("dateTo", date_to_ms),
+        ("shopIds", shop_id),
+    ]
+    if extra_params:
+        params.extend(extra_params)
+    path = "/v1/finance/orders?" + urlencode(params)
+    return await client._request("GET", path)
+
+
+async def _load_today_finance_flexible(
+    client: UzumClient, shop_id: int
+) -> tuple[list[dict[str, Any]], Any | None, str]:
+    date_from, date_to = _today_range_ms()
+    attempts: list[tuple[str, list[tuple[str, Any]]]] = [
+        ("без статуса", []),
+        ("statuses=PROCESSING", [("statuses", "PROCESSING")]),
+        ("statuses=TO_WITHDRAW", [("statuses", "TO_WITHDRAW")]),
+        ("status=PROCESSING", [("status", "PROCESSING")]),
+        ("status=TO_WITHDRAW", [("status", "TO_WITHDRAW")]),
+    ]
+    all_rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    first_response: Any | None = None
+    used_attempts: list[str] = []
+    for label, extra in attempts:
+        try:
+            data = await _finance_orders_request_extra(
+                client,
+                shop_id,
+                date_from_ms=date_from,
+                date_to_ms=date_to,
+                extra_params=extra,
+            )
+            if first_response is None:
+                first_response = data
+            rows = _deep_items(data)
+            used_attempts.append(label)
+            for row in rows:
+                sig = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)[:1500]
+                if sig not in seen:
+                    seen.add(sig)
+                    all_rows.append(row)
+            if all_rows and label == "без статуса":
+                break
+            await asyncio.sleep(0.15)
+        except Exception as e:
+            logging.info("Finance attempt failed: %s: %s", label, e)
+            continue
+    return all_rows, first_response, ", ".join(used_attempts)
+
+
+def _build_noorza_today_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    active_rows = 0
+    returns = 0.0
+    units = 0.0
+    revenue = 0.0
+    commission = 0.0
+    logistics = 0.0
+    payout_total = 0.0
+    withdrawn = 0.0
+    statuses: dict[str, int] = {}
+    for item in rows:
+        status = _finance_status(item)
+        statuses[status] = statuses.get(status, 0) + 1
+        qty = _finance_qty(item)
+        if _is_cancelled_status(status) or "RETURN" in status.upper() or "ВОЗВР" in status.upper():
+            returns += abs(qty)
+            continue
+        active_rows += 1
+        units += qty
+        gross = _finance_gross_revenue(item)
+        comm = _finance_commission(item)
+        logi = _finance_logistics(item)
+        payout_direct = _finance_payout_direct(item)
+        payout = payout_direct if payout_direct is not None else max(0.0, gross - comm - logi)
+        revenue += gross
+        commission += comm
+        logistics += logi
+        payout_total += max(0.0, payout)
+        withdrawn += _finance_withdrawn(item)
+    return {
+        "rows": active_rows,
+        "units": units,
+        "returns": returns,
+        "revenue": revenue,
+        "commission": commission,
+        "logistics": logistics,
+        "payout_total": payout_total,
+        "withdrawn": withdrawn,
+        "left_to_withdraw": max(0.0, payout_total - withdrawn),
+        "statuses": statuses,
+    }
+
+
+def _format_noorza_today(shop_id: int, stats: dict[str, Any], rows: list[dict[str, Any]]) -> str:
+    statuses = stats.get("statuses") or {}
+    status_lines = []
+    for key in ("PROCESSING", "TO_WITHDRAW"):
+        status_lines.append(f"{key}: <b>{int(statuses.get(key, 0))}</b>")
+    for k, v in sorted(statuses.items()):
+        if k not in {"PROCESSING", "TO_WITHDRAW"}:
+            status_lines.append(f"{escape(str(k))}: <b>{int(v)}</b>")
+        if len(status_lines) >= 7:
+            break
+    extra = ""
+    if not rows:
+        extra = (
+            "\n\n<i>Finance API пока не вернул строки продаж за сегодня. "
+            "Если в кабинете продажа уже есть, она может появиться здесь позже.</i>"
+        )
+    return (
+        "💰 <b>Продажи Uzum FBO/FBS за сегодня</b>\n"
+        f"Магазин: <code>{shop_id}</code>\n\n"
+        f"<b>Позиции продаж:</b> {int(stats['rows'])}\n"
+        f"<b>Кол-во товаров:</b> {float(stats['units']):.0f} шт.\n"
+        f"<b>Возвраты:</b> {float(stats['returns']):.0f} шт.\n\n"
+        f"<b>Выручка:</b> {_format_money(float(stats['revenue']))}\n"
+        f"<b>Комиссия Uzum:</b> {_format_money(float(stats['commission']))}\n"
+        f"<b>Логистика:</b> {_format_money(float(stats['logistics']))}\n\n"
+        f"<b>К выплате всего:</b> {_format_money(float(stats['payout_total']))}\n"
+        f"<b>Уже выведено:</b> {_format_money(float(stats['withdrawn']))}\n"
+        f"<b>Остаток к выплате:</b> {_format_money(float(stats['left_to_withdraw']))}\n\n"
+        "<b>Статусы:</b>\n" + "\n".join(status_lines) +
+        "\n\n<i>Расчёт по данным /v1/finance/orders. Если в кабинете Uzum есть корректировки/расходы, итог может отличаться.</i>" + extra
+    )
+
+
+@dp.message(Command("today"))
+async def today_sales(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+    await message.answer("⌛ Считаю продажи за сегодня...", reply_markup=MAIN_MENU)
+    try:
+        rows, _, _ = await _load_today_finance_flexible(client, shop_id)
+        stats = _build_noorza_today_stats(rows)
+        await message.answer(_format_noorza_today(shop_id, stats, rows), reply_markup=MAIN_MENU)
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+@dp.message(Command("balance"))
+async def balance(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+    await message.answer("⌛ Считаю баланс по Finance API...", reply_markup=MAIN_MENU)
+    try:
+        rows, _, _ = await _load_today_finance_flexible(client, shop_id)
+        stats = _build_noorza_today_stats(rows)
+        await message.answer(
+            "💰 <b>Баланс за сегодня</b>\n"
+            f"Магазин: <code>{shop_id}</code>\n\n"
+            f"К выплате всего: <b>{_format_money(float(stats['payout_total']))}</b>\n"
+            f"Уже выведено: <b>{_format_money(float(stats['withdrawn']))}</b>\n"
+            f"Остаток к выплате: <b>{_format_money(float(stats['left_to_withdraw']))}</b>\n\n"
+            f"Выручка: {_format_money(float(stats['revenue']))}\n"
+            f"Комиссия Uzum: {_format_money(float(stats['commission']))}\n"
+            f"Логистика: {_format_money(float(stats['logistics']))}\n\n"
+            "<i>Пока это расчёт по сегодняшним строкам Finance API.</i>",
+            reply_markup=MAIN_MENU,
+        )
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+@dp.message(Command("lost"))
+async def lost_goods(message: Message) -> None:
+    await message.answer(
+        "🧭 <b>Потерянные товары</b>\n\n"
+        "Этот раздел пока в заготовке.\n"
+        "Чтобы сделать его корректно, нужен API-метод Uzum по потерянным/расхождениям/актам.\n\n"
+        "Пока можно использовать:\n"
+        "• <code>/stock</code> — текущие остатки FBO/FBS\n"
+        "• <code>/stock_change_notify_status</code> — уведомления об изменении остатков",
+        reply_markup=MAIN_MENU,
+    )
+
+
+
 @dp.message(Command("sales"))
 async def sales(message: Message) -> None:
     req = await require_connection(message)
@@ -1053,6 +1284,16 @@ FBS_STATUS_LABELS: dict[str, str] = {
     "RETURNED": "Возврат",
 }
 
+# Минимальный набор статусов для сводки, чтобы не ловить 429 Too Many Requests.
+# Полную детализацию статусов добавим позже, когда подберём лимиты Uzum API.
+FBS_SUMMARY_STATUSES: tuple[str, ...] = (
+    "CREATED",
+    "PACKING",
+    "COMPLETED",
+    "CANCELED",
+)
+ORDER_SUMMARY_REQUEST_DELAY_SECONDS = float(os.getenv("ORDER_SUMMARY_REQUEST_DELAY_SECONDS", "0.45") or "0.45")
+
 
 def _extract_count(data: Any) -> int:
     if isinstance(data, bool):
@@ -1113,14 +1354,18 @@ async def _fbs_order_count(
 async def _orders_counts_for_days(client: UzumClient, shop_id: int, days: int) -> dict[str, int]:
     date_from, date_to = _today_range_ms() if days == 1 else _days_range_ms(days)
     counts: dict[str, int] = {}
-    for status in FBS_STATUS_LABELS:
+    for status in FBS_SUMMARY_STATUSES:
         try:
             counts[status] = await _fbs_order_count(
                 client, shop_id, status, date_from_ms=date_from, date_to_ms=date_to
             )
-        except Exception:
-            # Некоторые статусы/права могут быть недоступны; не валим всю сводку.
+        except Exception as e:
+            # Если Uzum вернул 429/403 по одному статусу, не валим всю сводку.
+            logging.warning("FBS count failed status=%s days=%s: %s", status, days, e)
             counts[status] = 0
+
+        # Маленькая пауза, чтобы не упираться в лимиты Uzum API.
+        await asyncio.sleep(max(0.0, ORDER_SUMMARY_REQUEST_DELAY_SECONDS))
     return counts
 
 
@@ -1214,18 +1459,7 @@ async def dashboard(message: Message) -> None:
         rows = await load_sku_rows(client, shop_id, max_pages=50)
         st = _build_stock_stats(rows)
 
-        active_orders = sum(
-            counts_7.get(s, 0)
-            for s in (
-                "CREATED",
-                "PACKING",
-                "PENDING_DELIVERY",
-                "DELIVERING",
-                "DELIVERED",
-                "ACCEPTED_AT_DP",
-                "DELIVERED_TO_CUSTOMER_DELIVERY_POINT",
-            )
-        )
+        active_orders = sum(counts_7.get(s, 0) for s in ("CREATED", "PACKING"))
         completed_7 = counts_7.get("COMPLETED", 0)
         canceled_7 = counts_7.get("CANCELED", 0)
         returned_7 = counts_7.get("RETURNED", 0)
@@ -2282,63 +2516,76 @@ async def stock_change_notify_status(message: Message) -> None:
         reply_markup=MAIN_MENU,
     )
 
-# --- Меню по разделам ---
-# Эти обработчики не заменяют старые /commands, а просто открывают разделы
-# или вызывают уже рабочие команды. Старые команды продолжают работать.
 
+# --- Главное меню в стиле Noorza Bot ---
 @dp.message(F.text == "⬅️ Главное меню")
+@dp.message(F.text == "Меню")
 async def button_main_menu(message: Message) -> None:
     await message.answer("Главное меню 👇", reply_markup=MAIN_MENU)
 
 
+@dp.message(F.text == "💰 Баланс")
+async def button_balance(message: Message) -> None:
+    await balance(message)
+
+
+@dp.message(F.text == "📊 Сегодня")
+async def button_today(message: Message) -> None:
+    await today_sales(message)
+
+
+@dp.message(F.text == "📦 Остатки")
+async def button_stock_short(message: Message) -> None:
+    await stock(message)
+
+
+@dp.message(F.text == "⚠️ Заканчивается")
+@dp.message(F.text == "⚠️ Заканчиваются")
+async def button_lowstock_short(message: Message) -> None:
+    await lowstock(message)
+
+
+@dp.message(F.text == "🧭 Потерянные")
+async def button_lost(message: Message) -> None:
+    await lost_goods(message)
+
+
+@dp.message(F.text == "ℹ️ Помощь")
+@dp.message(F.text == "❓ Помощь")
+async def button_help(message: Message) -> None:
+    await start(message)
+
+
+# Старые красивые кнопки оставлены для совместимости, если они остались у пользователя в Telegram.
 @dp.message(F.text == "📊 Аналитика")
 async def section_analytics(message: Message) -> None:
-    await message.answer(
-        "📊 <b>Аналитика</b>\n\n"
-        "Выберите, что посмотреть:",
-        reply_markup=ANALYTICS_MENU,
-    )
+    await message.answer("Главное меню 👇", reply_markup=MAIN_MENU)
 
 
 @dp.message(F.text == "📦 Товары")
 async def section_products(message: Message) -> None:
-    await message.answer(
-        "📦 <b>Товары и остатки</b>\n\n"
-        "Здесь учитываем <b>FBO + FBS/DBS</b>. Выберите действие:",
-        reply_markup=PRODUCTS_MENU,
-    )
+    await stock(message)
 
 
 @dp.message(F.text == "🛒 Заказы/продажи")
 async def section_orders(message: Message) -> None:
-    await message.answer(
-        "🛒 <b>Заказы/продажи</b>\n\n"
-        "FBS/DBS заказы идут через Orders API. FBO продажи отслеживаем через изменение остатков.\n\n"
-        "Выберите действие:",
-        reply_markup=ORDERS_MENU,
-    )
+    await orders(message)
 
 
 @dp.message(F.text == "🔔 Уведомления")
 async def section_notifications(message: Message) -> None:
-    await message.answer(
-        "🔔 <b>Уведомления</b>\n\n"
-        "Разделено по FBS/DBS заказам, Finance продажам и движению FBO/FBS остатков.\n\n"
-        "Выберите тип:",
-        reply_markup=NOTIFICATIONS_MENU,
-    )
+    await notify_status(message)
 
 
 @dp.message(F.text == "⚙️ Настройки")
 async def section_settings(message: Message) -> None:
-    await message.answer(
-        "⚙️ <b>Настройки</b>\n\n"
-        "Выберите действие:",
-        reply_markup=SETTINGS_MENU,
-    )
+    await status(message)
 
 
-# --- Кнопки внутри разделов ---
+@dp.message(F.text == "⭐ Отзывы")
+async def button_reviews(message: Message) -> None:
+    await reviews(message)
+
 
 @dp.message(F.text == "📈 Сводка")
 @dp.message(F.text == "📈 Сводка FBO/FBS")
@@ -2363,7 +2610,6 @@ async def button_products(message: Message) -> None:
     await products(message)
 
 
-@dp.message(F.text == "📊 Остатки")
 @dp.message(F.text == "📊 Все остатки")
 async def button_stock(message: Message) -> None:
     await stock(message)
@@ -2383,11 +2629,6 @@ async def button_fbs_stock(message: Message) -> None:
 @dp.message(F.text == "🛒 FBS/DBS заказы")
 async def button_orders(message: Message) -> None:
     await orders(message)
-
-
-@dp.message(F.text == "⚠️ Заканчиваются")
-async def button_lowstock(message: Message) -> None:
-    await lowstock(message)
 
 
 @dp.message(F.text == "📄 Excel-отчёт")
@@ -2435,15 +2676,6 @@ async def button_lowstock_notify_status(message: Message) -> None:
 async def button_outofstock_notify_status(message: Message) -> None:
     await outofstock_notify_status(message)
 
-
-@dp.message(F.text == "⭐ Отзывы")
-async def button_reviews(message: Message) -> None:
-    await reviews(message)
-
-
-@dp.message(F.text == "❓ Помощь")
-async def button_help(message: Message) -> None:
-    await start(message)
 
 async def main() -> None:
     await bot.delete_webhook(drop_pending_updates=True)
