@@ -98,6 +98,19 @@ SUBSCRIPTION_PLANS_TEXT = os.getenv(
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "azmt_one").strip().lstrip("@")
 ADMIN_CONTACT_URL = os.getenv("ADMIN_CONTACT_URL", "").strip()
 REPORT_INVOICE_PRODUCT_LIMIT = int(os.getenv("REPORT_INVOICE_PRODUCT_LIMIT", "10") or "10")
+SMART_LOW_STOCK_DAYS = int(os.getenv("SMART_LOW_STOCK_DAYS", "3") or "3")
+TOP_PRODUCTS_DAYS = int(os.getenv("TOP_PRODUCTS_DAYS", "30") or "30")
+DEAD_STOCK_DAYS = int(os.getenv("DEAD_STOCK_DAYS", "30") or "30")
+DAILY_REPORTS = (
+    os.getenv("DAILY_REPORTS", "0").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
+DAILY_REPORT_HOUR_UZT = int(os.getenv("DAILY_REPORT_HOUR_UZT", "9") or "9")
+SUBSCRIPTION_REMINDERS = (
+    os.getenv("SUBSCRIPTION_REMINDERS", "1").strip().lower()
+    not in {"0", "false", "no", "off"}
+)
+SUBSCRIPTION_REMINDER_DAYS = int(os.getenv("SUBSCRIPTION_REMINDER_DAYS", "1") or "1")
 
 def _parse_admin_ids() -> set[int]:
     values: list[str] = []
@@ -396,12 +409,15 @@ init_subscription_tables()
 # Все старые команды остаются рабочими: /products, /stock, /orders, /reviews и т.д.
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="📊 Сегодня")],
-        [KeyboardButton(text="📆 Вчера"), KeyboardButton(text="🗓 7 дней")],
-        [KeyboardButton(text="📅 30 дней"), KeyboardButton(text="📦 Остатки")],
-        [KeyboardButton(text="⚠️ Заканчивается"), KeyboardButton(text="🧭 Потерянные")],
+        [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="🌐 Все магазины")],
+        [KeyboardButton(text="📊 Сегодня"), KeyboardButton(text="📆 Вчера")],
+        [KeyboardButton(text="🗓 7 дней"), KeyboardButton(text="📅 30 дней")],
+        [KeyboardButton(text="📦 Остатки"), KeyboardButton(text="⚠️ Прогноз остатков")],
+        [KeyboardButton(text="🏆 Топ товаров"), KeyboardButton(text="🐢 Не продаётся")],
+        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="🧭 Потерянные")],
         [KeyboardButton(text="📄 Накладные FBO"), KeyboardButton(text="📊 Excel отчёт")],
-        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="🌙 Утренний отчёт"), KeyboardButton(text="💎 Подписка")],
+        [KeyboardButton(text="ℹ️ Помощь")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите действие",
@@ -3663,7 +3679,7 @@ def format_sale_line(item: dict[str, Any]) -> str:
     )
 
 
-def build_new_sale_message(item: dict[str, Any]) -> str:
+def build_new_sale_message(item: dict[str, Any], shop_id: int | None = None) -> str:
     title = escape(_finance_title(item))
     sku = escape(_finance_sku_title(item))
     qty = _finance_qty(item)
@@ -3678,8 +3694,10 @@ def build_new_sale_message(item: dict[str, Any]) -> str:
     payout_direct = _finance_payout_direct(item)
     payout = payout_direct if payout_direct is not None else max(0.0, _finance_gross_revenue(item) - commission - logistics)
 
+    shop_line = f"Магазин: <code>{shop_id}</code>\n" if shop_id is not None else ""
     return (
         "🛒 <b>Новая продажа Uzum FBO</b>\n\n"
+        + shop_line +
         f"<b>Товар:</b> {title}\n"
         f"<b>SKU:</b> {sku}\n"
         f"<b>Кол-во:</b> {qty:g} шт.\n\n"
@@ -3747,7 +3765,7 @@ async def check_new_sales_once() -> None:
             try:
                 await bot.send_message(
                     telegram_id,
-                    build_new_sale_message(item),
+                    build_new_sale_message(item, shop_id=shop_id),
                     reply_markup=MAIN_MENU,
                 )
                 await asyncio.sleep(0.15)
@@ -4153,6 +4171,578 @@ async def button_outofstock_notify_status(message: Message) -> None:
 
 
 
+
+
+# --- PRO FEATURES: multi-shop, analytics, reports, reminders ---
+def _shop_id_from_any(shop: Any) -> int | None:
+    if isinstance(shop, dict):
+        for key in ("shopId", "shop_id", "id", "value"):
+            value = shop.get(key)
+            try:
+                if value not in (None, ""):
+                    return int(value)
+            except Exception:
+                pass
+        for value in shop.values():
+            if isinstance(value, dict):
+                found = _shop_id_from_any(value)
+                if found is not None:
+                    return found
+    else:
+        for attr in ("shop_id", "shopId", "id"):
+            value = getattr(shop, attr, None)
+            try:
+                if value not in (None, ""):
+                    return int(value)
+            except Exception:
+                pass
+    return None
+
+
+def _shop_name_from_any(shop: Any) -> str:
+    if isinstance(shop, dict):
+        value = pick(shop, "title", "name", "shopName", "storeName", "legalName", "displayName")
+        if value not in (None, ""):
+            return str(value)
+        for v in shop.values():
+            if isinstance(v, dict):
+                nested = _shop_name_from_any(v)
+                if nested != "":
+                    return nested
+    return ""
+
+
+async def _user_shop_list(telegram_id: int, client: UzumClient | None = None) -> list[dict[str, Any]]:
+    shops_raw = db.list_shops(telegram_id) or []
+    if not shops_raw and client is not None:
+        try:
+            data = await client.get_shops()
+            items = extract_items(data)
+            encrypted = db.get_encrypted_token(telegram_id)
+            if encrypted and items:
+                db.save_connection(telegram_id, encrypted, items)
+            shops_raw = db.list_shops(telegram_id) or items
+        except Exception:
+            shops_raw = []
+
+    result: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for item in shops_raw:
+        sid = _shop_id_from_any(item)
+        if sid is None or sid in seen:
+            continue
+        seen.add(sid)
+        result.append({"shop_id": sid, "name": _shop_name_from_any(item), "raw": item})
+    return result
+
+
+def _stock_row_title(row: dict[str, Any]) -> str:
+    value = pick(row, "skuTitle", "sku_title", "title", "productTitle", "product_title", "name")
+    if value in (None, ""):
+        value = _deep_pick_value(row, ("skuTitle", "productTitle", "title", "name"))
+    return str(value or "Без названия")
+
+
+def _stock_row_sku(row: dict[str, Any]) -> str:
+    value = pick(row, "sku", "skuId", "sku_id", "barcode", "offerId", "shopSku")
+    if value in (None, ""):
+        value = _deep_pick_value(row, ("sku", "skuId", "barcode", "offerId"))
+    return str(value or "")
+
+
+def _stock_row_total(row: dict[str, Any]) -> int:
+    value = _num_from_value(pick(row, "total", "quantity", "available", "stock", "qty"))
+    if value is None:
+        value = _deep_pick_number(row, ("total", "quantity", "available", "stock", "qty"))
+    return int(value or 0)
+
+
+def _stock_row_price(row: dict[str, Any]) -> float:
+    value = _num_from_value(pick(row, "sellPrice", "price", "purchasePrice", "oldPrice"))
+    if value is None:
+        value = _deep_pick_number(row, ("sellPrice", "price", "purchasePrice", "oldPrice"))
+    return float(value or 0.0)
+
+
+def _sale_match_keys(item: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for value in (_finance_sku_title(item), _finance_title(item), str(_deep_pick_value(item, ("skuId", "sku", "barcode", "offerId")) or "")):
+        value = str(value or "").strip().lower()
+        if value and value != "-":
+            keys.add(value)
+    return keys
+
+
+def _stock_match_keys(row: dict[str, Any]) -> set[str]:
+    keys: set[str] = set()
+    for value in (_stock_row_sku(row), _stock_row_title(row)):
+        value = str(value or "").strip().lower()
+        if value:
+            keys.add(value)
+    return keys
+
+
+def _merge_noorza_stats(stats_list: list[dict[str, Any]]) -> dict[str, Any]:
+    result = {
+        "rows": 0.0,
+        "units": 0.0,
+        "returns": 0.0,
+        "revenue": 0.0,
+        "commission": 0.0,
+        "logistics": 0.0,
+        "payout_total": 0.0,
+        "withdrawn": 0.0,
+        "left_to_withdraw": 0.0,
+        "statuses": {},
+    }
+    statuses: dict[str, int] = {}
+    for stats in stats_list:
+        for key in ("rows", "units", "returns", "revenue", "commission", "logistics", "payout_total", "withdrawn", "left_to_withdraw"):
+            result[key] = float(result.get(key) or 0) + float(stats.get(key) or 0)
+        for status, count in (stats.get("statuses") or {}).items():
+            statuses[str(status)] = statuses.get(str(status), 0) + int(count or 0)
+    result["statuses"] = statuses
+    return result
+
+
+def _format_all_shops_balance(days_title: str, shops_count: int, stats: dict[str, Any], per_shop: list[str]) -> str:
+    statuses = stats.get("statuses") or {}
+    status_lines = []
+    for key in ("PROCESSING", "TO_WITHDRAW"):
+        status_lines.append(f"{key}: <b>{int(statuses.get(key, 0))}</b>")
+    for k, v in sorted(statuses.items()):
+        if k not in {"PROCESSING", "TO_WITHDRAW"}:
+            status_lines.append(f"{escape(str(k))}: <b>{int(v)}</b>")
+        if len(status_lines) >= 7:
+            break
+    text = (
+        f"🌐 <b>Баланс по всем магазинам {escape(days_title)}</b>\n\n"
+        f"Магазинов: <b>{shops_count}</b>\n"
+        f"Позиции продаж: <b>{int(stats['rows'])}</b>\n"
+        f"Кол-во товаров: <b>{float(stats['units']):.0f} шт.</b>\n"
+        f"Возвраты: <b>{float(stats['returns']):.0f} шт.</b>\n\n"
+        f"Выручка: <b>{_format_money(float(stats['revenue']))}</b>\n"
+        f"Комиссия Uzum: <b>{_format_money(float(stats['commission']))}</b>\n"
+        f"Логистика: <b>{_format_money(float(stats['logistics']))}</b>\n\n"
+        f"К выплате всего: <b>{_format_money(float(stats['payout_total']))}</b>\n"
+        f"Уже выведено: <b>{_format_money(float(stats['withdrawn']))}</b>\n"
+        f"Остаток к выплате: <b>{_format_money(float(stats['left_to_withdraw']))}</b>\n\n"
+        "<b>Статусы:</b>\n" + "\n".join(status_lines)
+    )
+    if per_shop:
+        text += "\n\n<b>По магазинам:</b>\n" + "\n".join(per_shop[:20])
+    return text
+
+
+async def _all_shops_finance_stats(telegram_id: int, client: UzumClient, date_from: int, date_to: int) -> tuple[dict[str, Any], list[str], int]:
+    shops_list = await _user_shop_list(telegram_id, client)
+    if not shops_list:
+        default_shop = db.get_default_shop_id(telegram_id)
+        if default_shop:
+            shops_list = [{"shop_id": int(default_shop), "name": "", "raw": {}}]
+    stats_list: list[dict[str, Any]] = []
+    per_shop: list[str] = []
+    for shop in shops_list:
+        sid = int(shop["shop_id"])
+        try:
+            rows, _ = await _load_finance_orders(client, sid, date_from_ms=date_from, date_to_ms=date_to, max_pages=5, page_size=100)
+            stats = _build_noorza_today_stats(rows)
+            stats_list.append(stats)
+            name = f" — {escape(shop['name'])}" if shop.get("name") else ""
+            per_shop.append(
+                f"• <code>{sid}</code>{name}: {_format_money(float(stats['revenue']))}, "
+                f"{float(stats['units']):.0f} шт., к выплате {_format_money(float(stats['payout_total']))}"
+            )
+            await asyncio.sleep(0.2)
+        except Exception as e:
+            logging.exception("All shops balance: failed for shop=%s", sid)
+            per_shop.append(f"• <code>{sid}</code>: ошибка API — {escape(str(e)[:80])}")
+    return _merge_noorza_stats(stats_list), per_shop, len(shops_list)
+
+
+@dp.message(Command("balance_all", "all_balance", "allshops", "all_shops"))
+async def balance_all_shops(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    if not await require_active_subscription(message, telegram_id):
+        return
+    client = get_uzum_for_user(telegram_id)
+    if client is None:
+        await message.answer("Сначала подключите Uzum API-токен: <code>/connect</code>", reply_markup=MAIN_MENU)
+        return
+    await message.answer("⌛ Считаю баланс по всем магазинам за 30 дней...", reply_markup=MAIN_MENU)
+    try:
+        date_from, date_to = _days_range_ms(30)
+        stats, per_shop, shops_count = await _all_shops_finance_stats(telegram_id, client, date_from, date_to)
+        await message.answer(_format_all_shops_balance("за 30 дней", shops_count, stats, per_shop), reply_markup=MAIN_MENU)
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+async def _top_products_for_shop(client: UzumClient, shop_id: int, days: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    date_from, date_to = _days_range_ms(days)
+    rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=5, page_size=100)
+    groups: dict[str, dict[str, Any]] = {}
+    for item in rows:
+        if _is_cancelled_status(_finance_status(item)):
+            continue
+        title = _finance_title(item)
+        sku = _finance_sku_title(item)
+        key = (sku or title or "-").strip().lower()
+        if not key:
+            key = title.strip().lower()
+        entry = groups.setdefault(key, {"title": title, "sku": sku, "qty": 0.0, "revenue": 0.0, "payout": 0.0})
+        gross = _finance_gross_revenue(item)
+        commission = _finance_commission(item)
+        logistics = _finance_logistics(item)
+        payout_direct = _finance_payout_direct(item)
+        payout = payout_direct if payout_direct is not None else max(0.0, gross - commission - logistics)
+        entry["qty"] += _finance_qty(item)
+        entry["revenue"] += gross
+        entry["payout"] += max(0.0, payout)
+    top = sorted(groups.values(), key=lambda x: float(x.get("revenue") or 0), reverse=True)
+    return top, _build_noorza_today_stats(rows)
+
+
+@dp.message(Command("top", "top_products"))
+async def top_products(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+    days = TOP_PRODUCTS_DAYS
+    await message.answer(f"⌛ Считаю топ товаров за {days} дней...", reply_markup=MAIN_MENU)
+    try:
+        top, stats = await _top_products_for_shop(client, shop_id, days)
+        if not top:
+            await message.answer(f"🏆 <b>Топ товаров за {days} дней</b>\nМагазин: <code>{shop_id}</code>\n\nПродаж не найдено.", reply_markup=MAIN_MENU)
+            return
+        lines = [
+            f"🏆 <b>Топ товаров за {days} дней</b>",
+            f"Магазин: <code>{shop_id}</code>",
+            f"Всего продано: <b>{float(stats['units']):.0f} шт.</b>",
+            f"Выручка: <b>{_format_money(float(stats['revenue']))}</b>",
+        ]
+        for idx, item in enumerate(top[:20], start=1):
+            title = escape(_short_text(item.get("title"), 85))
+            sku = escape(_short_text(item.get("sku"), 60))
+            sku_line = f"\nSKU: <code>{sku}</code>" if sku and sku != "-" else ""
+            lines.append(
+                f"{idx}. <b>{title}</b>{sku_line}\n"
+                f"Продано: <b>{float(item.get('qty') or 0):.0f} шт.</b> | "
+                f"Выручка: <b>{_format_money(float(item.get('revenue') or 0))}</b> | "
+                f"К выплате: <b>{_format_money(float(item.get('payout') or 0))}</b>"
+            )
+        for part in _split_long_message("\n\n".join(lines)):
+            await message.answer(part, reply_markup=MAIN_MENU)
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+@dp.message(Command("deadstock", "no_sales", "stuck"))
+async def dead_stock(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+    days = DEAD_STOCK_DAYS
+    await message.answer(f"⌛ Ищу товары с остатком, но без продаж за {days} дней...", reply_markup=MAIN_MENU)
+    try:
+        date_from, date_to = _days_range_ms(days)
+        sales_rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=5, page_size=100)
+        sold_keys: set[str] = set()
+        for item in sales_rows:
+            if not _is_cancelled_status(_finance_status(item)):
+                sold_keys.update(_sale_match_keys(item))
+        stock_rows = await load_sku_rows(client, shop_id, max_pages=50)
+        candidates: list[dict[str, Any]] = []
+        for row in stock_rows:
+            total = _stock_row_total(row)
+            if total <= 0:
+                continue
+            keys = _stock_match_keys(row)
+            if keys and not keys.intersection(sold_keys):
+                price = _stock_row_price(row)
+                candidates.append({"row": row, "total": total, "price": price, "value": total * price})
+        candidates.sort(key=lambda x: float(x.get("value") or 0), reverse=True)
+        if not candidates:
+            await message.answer(f"🐢 <b>Товары без продаж за {days} дней</b>\nМагазин: <code>{shop_id}</code>\n\nНе нашёл товаров с остатком и нулевыми продажами.", reply_markup=MAIN_MENU)
+            return
+        total_value = sum(float(x.get("value") or 0) for x in candidates)
+        lines = [
+            f"🐢 <b>Товары без продаж за {days} дней</b>",
+            f"Магазин: <code>{shop_id}</code>",
+            f"Позиций: <b>{len(candidates)}</b>",
+            f"Примерно заморожено: <b>{_format_money(total_value)}</b>",
+        ]
+        for idx, item in enumerate(candidates[:30], start=1):
+            row = item["row"]
+            title = escape(_short_text(_stock_row_title(row), 85))
+            sku = escape(_short_text(_stock_row_sku(row), 60))
+            sku_line = f"\nSKU: <code>{sku}</code>" if sku else ""
+            lines.append(
+                f"{idx}. <b>{title}</b>{sku_line}\n"
+                f"Остаток: <b>{int(item['total'])} шт.</b> | "
+                f"Цена: {_format_money(float(item['price']))} | "
+                f"Сумма: <b>{_format_money(float(item['value']))}</b>"
+            )
+        lines.append("<i>Расчёт примерный: бот сопоставляет продажи и остатки по SKU/названию.</i>")
+        for part in _split_long_message("\n\n".join(lines)):
+            await message.answer(part, reply_markup=MAIN_MENU)
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+@dp.message(Command("smart_lowstock", "forecast_stock"))
+async def smart_lowstock(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+    await message.answer("⌛ Считаю, на сколько дней хватит остатков...", reply_markup=MAIN_MENU)
+    try:
+        date_from, date_to = _days_range_ms(7)
+        sales_rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=5, page_size=100)
+        sold_qty: dict[str, float] = {}
+        for item in sales_rows:
+            if _is_cancelled_status(_finance_status(item)):
+                continue
+            keys = _sale_match_keys(item)
+            for key in keys:
+                sold_qty[key] = sold_qty.get(key, 0.0) + _finance_qty(item)
+        stock_rows = await load_sku_rows(client, shop_id, max_pages=50)
+        alerts: list[dict[str, Any]] = []
+        for row in stock_rows:
+            total = _stock_row_total(row)
+            if total <= 0:
+                continue
+            keys = _stock_match_keys(row)
+            qty_7 = max([sold_qty.get(k, 0.0) for k in keys] or [0.0])
+            avg_day = qty_7 / 7.0
+            days_left = 9999.0 if avg_day <= 0 else total / avg_day
+            if total <= LOW_STOCK_THRESHOLD or days_left <= SMART_LOW_STOCK_DAYS:
+                alerts.append({"row": row, "total": total, "qty_7": qty_7, "days_left": days_left})
+        alerts.sort(key=lambda x: (float(x.get("days_left") or 9999), int(x.get("total") or 0)))
+        if not alerts:
+            await message.answer(
+                f"⚠️ <b>Умное 'Заканчивается'</b>\nМагазин: <code>{shop_id}</code>\n\n"
+                f"Критичных товаров не нашёл. Порог: ≤ {LOW_STOCK_THRESHOLD} шт. или хватит меньше чем на {SMART_LOW_STOCK_DAYS} дня.",
+                reply_markup=MAIN_MENU,
+            )
+            return
+        lines = [
+            "⚠️ <b>Умное 'Заканчивается'</b>",
+            f"Магазин: <code>{shop_id}</code>",
+            f"Порог: ≤ {LOW_STOCK_THRESHOLD} шт. или хватит меньше чем на {SMART_LOW_STOCK_DAYS} дня",
+        ]
+        for idx, item in enumerate(alerts[:30], start=1):
+            row = item["row"]
+            title = escape(_short_text(_stock_row_title(row), 85))
+            sku = escape(_short_text(_stock_row_sku(row), 60))
+            days_left = float(item["days_left"])
+            days_text = "нет продаж за 7 дней" if days_left > 9000 else f"примерно на {days_left:.1f} дн."
+            sku_line = f"\nSKU: <code>{sku}</code>" if sku else ""
+            lines.append(
+                f"{idx}. <b>{title}</b>{sku_line}\n"
+                f"Остаток: <b>{int(item['total'])} шт.</b> | "
+                f"Продажи за 7 дней: <b>{float(item['qty_7']):.0f} шт.</b> | "
+                f"Хватит: <b>{escape(days_text)}</b>"
+            )
+        for part in _split_long_message("\n\n".join(lines)):
+            await message.answer(part, reply_markup=MAIN_MENU)
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+async def _build_morning_report_text(telegram_id: int, client: UzumClient) -> str:
+    now_uzt = datetime.now(UZT)
+    end = now_uzt.replace(hour=0, minute=0, second=0, microsecond=0)
+    start = end - timedelta(days=1)
+    date_from = int(start.timestamp() * 1000)
+    date_to = int(end.timestamp() * 1000)
+    stats, per_shop, shops_count = await _all_shops_finance_stats(telegram_id, client, date_from, date_to)
+    return (
+        "🌙 <b>Утренний отчёт Uzum</b>\n"
+        f"За вчера: <b>{start.strftime('%d.%m.%Y')}</b>\n\n"
+        + _format_all_shops_balance("за вчера", shops_count, stats, per_shop).replace("🌐 <b>Баланс по всем магазинам за вчера</b>\n\n", "")
+        + "\n\n<i>Автоотчёт можно включить переменной DAILY_REPORTS=1.</i>"
+    )
+
+
+@dp.message(Command("morning_report", "daily_report"))
+async def morning_report(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    if not await require_active_subscription(message, telegram_id):
+        return
+    client = get_uzum_for_user(telegram_id)
+    if client is None:
+        await message.answer("Сначала подключите Uzum API-токен: <code>/connect</code>", reply_markup=MAIN_MENU)
+        return
+    await message.answer("⌛ Готовлю утренний отчёт за вчера...", reply_markup=MAIN_MENU)
+    try:
+        await message.answer(await _build_morning_report_text(telegram_id, client), reply_markup=MAIN_MENU)
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+@dp.message(Command("extend1", "extend_month"))
+async def admin_extend_1_month(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    arg = parse_args(message.text or "").split()
+    if not arg or not arg[0].isdigit():
+        await message.answer("Напишите так: <code>/extend1 TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        return
+    target = int(arg[0])
+    new_until = extend_subscription_days(target, 30)
+    await message.answer(f"✅ Продлено на 1 месяц для <code>{target}</code>. До: <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+
+
+@dp.message(Command("extend3"))
+async def admin_extend_3_months(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    arg = parse_args(message.text or "").split()
+    if not arg or not arg[0].isdigit():
+        await message.answer("Напишите так: <code>/extend3 TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        return
+    target = int(arg[0])
+    new_until = extend_subscription_days(target, 90)
+    await message.answer(f"✅ Продлено на 3 месяца для <code>{target}</code>. До: <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+
+
+@dp.message(Command("extend6"))
+async def admin_extend_6_months(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    arg = parse_args(message.text or "").split()
+    if not arg or not arg[0].isdigit():
+        await message.answer("Напишите так: <code>/extend6 TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        return
+    target = int(arg[0])
+    new_until = extend_subscription_days(target, 180)
+    await message.answer(f"✅ Продлено на 6 месяцев для <code>{target}</code>. До: <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+
+
+@dp.message(F.text == "🌐 Все магазины")
+async def button_all_shops(message: Message) -> None:
+    await balance_all_shops(message)
+
+
+@dp.message(F.text == "🏆 Топ товаров")
+async def button_top_products(message: Message) -> None:
+    await top_products(message)
+
+
+@dp.message(F.text == "🐢 Не продаётся")
+async def button_dead_stock(message: Message) -> None:
+    await dead_stock(message)
+
+
+@dp.message(F.text == "🌙 Утренний отчёт")
+async def button_morning_report(message: Message) -> None:
+    await morning_report(message)
+
+
+@dp.message(F.text == "⚠️ Прогноз остатков")
+async def button_smart_lowstock(message: Message) -> None:
+    await smart_lowstock(message)
+
+
+_daily_report_sent: set[tuple[int, str]] = set()
+_subscription_reminder_sent: set[tuple[int, str]] = set()
+
+
+def _connected_users_basic() -> list[dict[str, Any]]:
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT telegram_id, uzum_token_encrypted, default_shop_id
+            FROM users
+            WHERE uzum_token_encrypted IS NOT NULL
+            """
+        ).fetchall()
+    return [dict(row) for row in rows if has_active_subscription(int(row["telegram_id"]))]
+
+
+async def daily_report_loop() -> None:
+    await asyncio.sleep(90)
+    logging.info("Daily report loop started. Enabled: %s. Hour UZT: %s", DAILY_REPORTS, DAILY_REPORT_HOUR_UZT)
+    while True:
+        try:
+            now = datetime.now(UZT)
+            today_key = now.strftime("%Y-%m-%d")
+            if DAILY_REPORTS and now.hour == DAILY_REPORT_HOUR_UZT:
+                for row in _connected_users_basic():
+                    telegram_id = int(row["telegram_id"])
+                    key = (telegram_id, today_key)
+                    if key in _daily_report_sent:
+                        continue
+                    try:
+                        token = cipher.decrypt(row["uzum_token_encrypted"])
+                        client = UzumClient(token, UZUM_API_BASE_URL)
+                        text = await _build_morning_report_text(telegram_id, client)
+                        await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+                        _daily_report_sent.add(key)
+                        await asyncio.sleep(0.5)
+                    except Exception:
+                        logging.exception("Daily report: failed to send for user=%s", telegram_id)
+            # Чистим старые ключи раз в сутки, чтобы память не росла.
+            if now.hour == 0:
+                _daily_report_sent.intersection_update({k for k in _daily_report_sent if k[1] == today_key})
+        except Exception:
+            logging.exception("Daily report loop error")
+        await asyncio.sleep(1800)
+
+
+async def subscription_reminder_loop() -> None:
+    await asyncio.sleep(120)
+    logging.info("Subscription reminder loop started. Enabled: %s", SUBSCRIPTION_REMINDERS)
+    while True:
+        try:
+            if SUBSCRIPTION_REMINDERS:
+                now = _utc_now()
+                today_key = now.strftime("%Y-%m-%d")
+                with db.connect() as conn:
+                    rows = conn.execute(
+                        """
+                        SELECT telegram_id, trial_until, subscription_until, blocked
+                        FROM subscriptions
+                        WHERE blocked = 0
+                        """
+                    ).fetchall()
+                for row in rows:
+                    telegram_id = int(row["telegram_id"])
+                    if is_admin(telegram_id):
+                        continue
+                    until = subscription_active_until(dict(row))
+                    if not until:
+                        continue
+                    delta = until - now
+                    if timedelta(0) < delta <= timedelta(days=SUBSCRIPTION_REMINDER_DAYS):
+                        key = (telegram_id, today_key)
+                        if key in _subscription_reminder_sent:
+                            continue
+                        try:
+                            await bot.send_message(
+                                telegram_id,
+                                "⏳ <b>Скоро закончится доступ</b>\n\n"
+                                f"Подписка/trial активны до: <b>{_fmt_dt(until)}</b>\n\n"
+                                "Чтобы бот продолжил работать без остановки, продлите подписку заранее.\n"
+                                "Оплата: <code>/subscribe</code>",
+                                reply_markup=MAIN_MENU,
+                            )
+                            _subscription_reminder_sent.add(key)
+                            await asyncio.sleep(0.2)
+                        except Exception:
+                            logging.exception("Subscription reminder: failed for user=%s", telegram_id)
+        except Exception:
+            logging.exception("Subscription reminder loop error")
+        await asyncio.sleep(3600)
+
+
 # --- OPTIMIZED WATCHERS: защита от 429 Too Many Requests ---
 # Если один и тот же Uzum API-токен / магазин подключён у нескольких Telegram-пользователей
 # (например, владелец и жена), старые watcher-функции делали одинаковый запрос для каждого пользователя.
@@ -4378,7 +4968,7 @@ async def check_new_sales_once() -> None:
 
             for item in new_rows[:10]:
                 try:
-                    await bot.send_message(telegram_id, build_new_sale_message(item), reply_markup=MAIN_MENU)
+                    await bot.send_message(telegram_id, build_new_sale_message(item, shop_id=shop_id), reply_markup=MAIN_MENU)
                     await asyncio.sleep(0.15)
                 except Exception:
                     logging.exception("Sales watcher: failed to send sale notification to %s", telegram_id)
@@ -4470,9 +5060,14 @@ async def main() -> None:
         asyncio.create_task(sales_watch_loop())
     if STOCK_CHANGE_NOTIFICATIONS:
         asyncio.create_task(stock_change_watch_loop())
+    if DAILY_REPORTS:
+        asyncio.create_task(daily_report_loop())
+    if SUBSCRIPTION_REMINDERS:
+        asyncio.create_task(subscription_reminder_loop())
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
