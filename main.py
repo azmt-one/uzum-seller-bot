@@ -18,7 +18,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import FSInputFile, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 from openpyxl import Workbook
 
@@ -88,8 +88,14 @@ TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "3") or "3")
 SUBSCRIPTION_PRICE_TEXT = os.getenv("SUBSCRIPTION_PRICE_TEXT", "99 000 сум / 1 месяц").strip()
 PAYMENT_TEXT = os.getenv(
     "PAYMENT_TEXT",
-    "Для оплаты напишите администратору и отправьте чек. После проверки доступ будет продлён."
+    "Нажмите кнопку ниже, напишите администратору и отправьте чек. После проверки доступ будет продлён."
 ).strip()
+SUBSCRIPTION_PLANS_TEXT = os.getenv(
+    "SUBSCRIPTION_PLANS_TEXT",
+    "1 месяц — 99 000 сум\n3 месяца — 249 000 сум\n6 месяцев — 449 000 сум"
+).strip()
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "azmt_one").strip().lstrip("@")
+ADMIN_CONTACT_URL = os.getenv("ADMIN_CONTACT_URL", "").strip()
 
 def _parse_admin_ids() -> set[int]:
     values: list[str] = []
@@ -236,13 +242,29 @@ def subscription_status_text(telegram_id: int) -> str:
 
 def subscription_full_text(telegram_id: int) -> str:
     row = ensure_subscription(telegram_id)
+    status = subscription_status_text(telegram_id)
+
+    if is_admin(telegram_id):
+        return (
+            "💎 <b>Моя подписка</b>\n\n"
+            f"Telegram ID: <code>{telegram_id}</code>\n"
+            f"Статус: {status}\n\n"
+            "Trial и дата оплаты для администратора не важны — доступ всегда открыт.\n\n"
+            "Команды администратора:\n"
+            "• <code>/users</code> — пользователи\n"
+            "• <code>/extend ID 30</code> — продлить доступ\n"
+            "• <code>/block ID</code> — заблокировать\n"
+            "• <code>/unblock ID</code> — разблокировать"
+        )
+
     return (
         "💎 <b>Моя подписка</b>\n\n"
         f"Telegram ID: <code>{telegram_id}</code>\n"
-        f"Статус: {subscription_status_text(telegram_id)}\n"
+        f"Статус: {status}\n"
         f"Trial до: <b>{_fmt_dt(row.get('trial_until'))}</b>\n"
         f"Оплачено до: <b>{_fmt_dt(row.get('subscription_until'))}</b>\n\n"
-        f"Тариф: <b>{escape(SUBSCRIPTION_PRICE_TEXT)}</b>\n"
+        "Тарифы:\n"
+        f"<b>{escape(SUBSCRIPTION_PLANS_TEXT)}</b>\n\n"
         f"{escape(PAYMENT_TEXT)}"
     )
 
@@ -266,6 +288,31 @@ async def require_active_subscription(message: Message, telegram_id: int | None 
 
 def admin_only(telegram_id: int) -> bool:
     return is_admin(int(telegram_id))
+
+
+def admin_contact_link() -> str | None:
+    if ADMIN_CONTACT_URL:
+        return ADMIN_CONTACT_URL
+    if ADMIN_USERNAME:
+        return f"https://t.me/{ADMIN_USERNAME}"
+    return None
+
+
+def admin_contact_markup() -> InlineKeyboardMarkup | None:
+    url = admin_contact_link()
+    if not url:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="✍️ Написать администратору", url=url)]]
+    )
+
+
+def admin_contact_text() -> str:
+    if ADMIN_USERNAME:
+        return f"@{escape(ADMIN_USERNAME)}"
+    if ADMIN_CONTACT_URL:
+        return escape(ADMIN_CONTACT_URL)
+    return "администратору"
 
 
 def extend_subscription_days(telegram_id: int, days: int) -> datetime:
@@ -526,29 +573,34 @@ async def start(message: Message) -> None:
     ensure_subscription(telegram_id)
     connected = "✅ подключён" if db.has_uzum_connection(telegram_id) else "❌ не подключён"
     sub_line = subscription_status_text(telegram_id)
+
+    admin_part = ""
+    if is_admin(telegram_id):
+        admin_part = (
+            "\n👑 <b>Админ-команды</b>\n"
+            "• <code>/users</code> — список пользователей\n"
+            "• <code>/extend ID 30</code> — продлить доступ\n"
+            "• <code>/block ID</code> / <code>/unblock ID</code> — блокировка\n"
+            "• <code>/broadcast текст</code> — рассылка\n"
+        )
+
     await message.answer(
-        "👋 <b>Uzum Seller Assistant</b>\n\n"
-        f"Статус Uzum API: {connected}\n\n"
-        "Основные команды:\n"
-        "• <code>/menu</code> — показать кнопки\n"
-        "• <code>/connect</code> — подключить Uzum API-токен\n"
-        "• <code>/disconnect</code> — удалить подключение\n"
-        "• <code>/shops</code> — мои магазины\n"
-        "• <code>/setshop SHOP_ID</code> — выбрать основной магазин\n"
-        "• <code>/products [поиск]</code> — товары, цены и общий остаток\n"
-        "• <code>/stock [поиск]</code> — FBO + FBS/DBS + итого по SKU\n"
-        "• <code>/fbo [поиск]</code> — остатки FBO\n"
-        "• <code>/fbs [поиск]</code> — остатки FBS/DBS\n"
-        "• <code>/lowstock [порог]</code> — товары, которые заканчиваются\n"
-        "• <code>/orders [CREATED]</code> — FBS/DBS заказы\n"
-        "• <code>/export_products</code> — Excel: FBO, FBS/DBS, итого\n"
-        "• <code>/debug_product</code> — сырой JSON первого товара\n"
-        "• <code>/status</code> — статус подключения\n"
-        "• <code>/notify_status</code> — уведомления о новых FBS/DBS заказах\n"
-        "• <code>/lowstock_notify_status</code> — низкие остатки FBO + FBS/DBS\n"
-        "• <code>/outofstock_notify_status</code> — нулевые остатки FBO + FBS/DBS\n"
-        "• <code>/stock_change_notify_status</code> — изменение остатков FBO + FBS/DBS\n\n"
-        "Для начала нажмите: <code>/connect</code>",
+        "👋 <b>Добро пожаловать в Uzum Seller Assistant</b>\n\n"
+        "Бот помогает селлерам Uzum быстро смотреть важные данные прямо в Telegram:\n"
+        "📊 продажи за сегодня, вчера, 7 и 30 дней\n"
+        "📦 остатки FBO/FBS/DBS\n"
+        "⚠️ товары, которые заканчиваются\n"
+        "🧭 потерянные товары по данным Uzum\n"
+        "🔔 уведомления о продажах и изменении остатков\n\n"
+        f"Uzum API: {connected}\n"
+        f"Доступ: {sub_line}\n\n"
+        "🚀 <b>Как начать</b>\n"
+        "1. Нажмите <code>/connect</code>\n"
+        "2. Отправьте свой Uzum Seller OpenAPI token\n"
+        "3. Нажмите <b>📊 Сегодня</b> или <b>📦 Остатки</b>\n\n"
+        "Не знаете, где взять токен? Напишите <code>/api_token</code>.\n"
+        "Подписка и оплата: <code>/subscribe</code>."
+        + admin_part,
         reply_markup=MAIN_MENU,
     )
 
@@ -592,7 +644,9 @@ async def connect(message: Message, state: FSMContext) -> None:
     upsert_from_message(message)
     await state.set_state(ConnectStates.waiting_for_token)
     await message.answer(
+        "🔑 <b>Подключение Uzum API</b>\n\n"
         "Отправьте ваш Uzum Seller OpenAPI token следующим сообщением.\n\n"
+        "Где взять токен: <code>/api_token</code>\n\n"
         "Важно:\n"
         "• токен будет сохранён в зашифрованном виде;\n"
         "• после проверки я постараюсь удалить сообщение с токеном;\n"
@@ -2189,11 +2243,34 @@ async def subscribe(message: Message) -> None:
     ensure_subscription(telegram_id)
     await message.answer(
         "💎 <b>Подписка Uzum Seller Assistant</b>\n\n"
-        f"🎁 Trial: <b>{TRIAL_DAYS} дня</b> для нового пользователя\n"
-        f"💰 Тариф: <b>{escape(SUBSCRIPTION_PRICE_TEXT)}</b>\n\n"
+        "Что входит:\n"
+        "✅ продажи FBO/FBS за сегодня, вчера, 7 и 30 дней\n"
+        "✅ остатки и товары, которые заканчиваются\n"
+        "✅ потерянные товары, если Uzum отдаёт их в API\n"
+        "✅ уведомления о новых продажах и остатках\n\n"
+        f"🎁 Trial: <b>{TRIAL_DAYS} дня</b> для нового пользователя\n\n"
+        "💰 <b>Тарифы</b>\n"
+        f"{escape(SUBSCRIPTION_PLANS_TEXT)}\n\n"
+        f"Для оплаты напишите администратору: <b>{admin_contact_text()}</b>\n"
         f"{escape(PAYMENT_TEXT)}\n\n"
-        "После оплаты администратор продлит доступ.\n"
+        "После проверки чекa администратор продлит доступ.\n"
         "Проверить статус: <code>/my_subscription</code>",
+        reply_markup=admin_contact_markup(),
+    )
+
+
+@dp.message(Command("api_token", "token_help", "how_token"))
+async def api_token_help(message: Message) -> None:
+    upsert_from_message(message)
+    await message.answer(
+        "🔑 <b>Где взять Uzum Seller OpenAPI token</b>\n\n"
+        "Обычно это делается так:\n"
+        "1. Откройте кабинет продавца Uzum Seller.\n"
+        "2. Найдите раздел настроек или интеграций OpenAPI.\n"
+        "3. Создайте или скопируйте API-токен.\n"
+        "4. Вернитесь в этот бот и нажмите <code>/connect</code>.\n"
+        "5. Отправьте токен одним сообщением.\n\n"
+        "Важно: не отправляйте токен посторонним. Бот сохранит его в зашифрованном виде и постарается удалить сообщение с токеном после проверки.",
         reply_markup=MAIN_MENU,
     )
 
@@ -3186,7 +3263,7 @@ async def button_lost(message: Message) -> None:
 
 @dp.message(F.text == "💎 Подписка")
 async def button_subscription(message: Message) -> None:
-    await my_subscription(message)
+    await subscribe(message)
 
 
 @dp.message(F.text == "ℹ️ Помощь")
@@ -3334,6 +3411,7 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
