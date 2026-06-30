@@ -84,6 +84,27 @@ STOCK_CHANGE_NOTIFICATIONS = (
 STOCK_CHANGE_CHECK_INTERVAL_SECONDS = int(
     os.getenv("STOCK_CHANGE_CHECK_INTERVAL_SECONDS", "300") or "300"
 )
+TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "3") or "3")
+SUBSCRIPTION_PRICE_TEXT = os.getenv("SUBSCRIPTION_PRICE_TEXT", "99 000 сум / 1 месяц").strip()
+PAYMENT_TEXT = os.getenv(
+    "PAYMENT_TEXT",
+    "Для оплаты напишите администратору и отправьте чек. После проверки доступ будет продлён."
+).strip()
+
+def _parse_admin_ids() -> set[int]:
+    values: list[str] = []
+    for key in ("ADMIN_IDS", "OWNER_TELEGRAM_ID", "OWNER_ID"):
+        raw = os.getenv(key, "")
+        if raw:
+            values.extend(raw.replace(";", ",").split(","))
+    ids: set[int] = set()
+    for value in values:
+        value = value.strip()
+        if value.isdigit():
+            ids.add(int(value))
+    return ids
+
+ADMIN_IDS = _parse_admin_ids()
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError(
@@ -100,6 +121,227 @@ bot = Bot(
 )
 dp = Dispatcher()
 
+# --- Подписки / trial ---
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _dt_to_db(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    return dt.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+def _dt_from_db(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        text = str(value).replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _fmt_dt(value: Any) -> str:
+    dt = value if isinstance(value, datetime) else _dt_from_db(value)
+    if not dt:
+        return "—"
+    return dt.astimezone(timezone(timedelta(hours=5))).strftime("%d.%m.%Y %H:%M")
+
+
+def is_admin(telegram_id: int) -> bool:
+    return int(telegram_id) in ADMIN_IDS
+
+
+def init_subscription_tables() -> None:
+    with db.connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS subscriptions (
+                telegram_id INTEGER PRIMARY KEY,
+                trial_started_at TEXT,
+                trial_until TEXT,
+                subscription_until TEXT,
+                blocked INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def get_subscription_row(telegram_id: int) -> dict[str, Any] | None:
+    with db.connect() as conn:
+        row = conn.execute("SELECT * FROM subscriptions WHERE telegram_id = ?", (int(telegram_id),)).fetchone()
+    return dict(row) if row else None
+
+
+def ensure_subscription(telegram_id: int) -> dict[str, Any]:
+    row = get_subscription_row(telegram_id)
+    if row:
+        return row
+    now = _utc_now()
+    trial_until = now + timedelta(days=TRIAL_DAYS)
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO subscriptions
+            (telegram_id, trial_started_at, trial_until, subscription_until, blocked, created_at, updated_at)
+            VALUES (?, ?, ?, NULL, 0, ?, ?)
+            """,
+            (int(telegram_id), _dt_to_db(now), _dt_to_db(trial_until), _dt_to_db(now), _dt_to_db(now)),
+        )
+        conn.commit()
+    return get_subscription_row(telegram_id) or {}
+
+
+def subscription_active_until(row: dict[str, Any] | None) -> datetime | None:
+    if not row:
+        return None
+    dates = [_dt_from_db(row.get("trial_until")), _dt_from_db(row.get("subscription_until"))]
+    dates = [d for d in dates if d is not None]
+    return max(dates) if dates else None
+
+
+def has_active_subscription(telegram_id: int) -> bool:
+    if is_admin(telegram_id):
+        return True
+    row = ensure_subscription(telegram_id)
+    if int(row.get("blocked") or 0) == 1:
+        return False
+    until = subscription_active_until(row)
+    return bool(until and until > _utc_now())
+
+
+def subscription_status_text(telegram_id: int) -> str:
+    row = ensure_subscription(telegram_id)
+    if is_admin(telegram_id):
+        return "👑 Админ-доступ: без ограничений"
+    if int(row.get("blocked") or 0) == 1:
+        return "⛔ Пользователь заблокирован"
+    now = _utc_now()
+    trial_until = _dt_from_db(row.get("trial_until"))
+    paid_until = _dt_from_db(row.get("subscription_until"))
+    until = subscription_active_until(row)
+    if until and until > now:
+        if paid_until and paid_until == until:
+            return f"✅ Подписка активна до {_fmt_dt(paid_until)}"
+        return f"🎁 Trial активен до {_fmt_dt(trial_until)}"
+    return "⛔ Подписка закончилась"
+
+
+def subscription_full_text(telegram_id: int) -> str:
+    row = ensure_subscription(telegram_id)
+    return (
+        "💎 <b>Моя подписка</b>\n\n"
+        f"Telegram ID: <code>{telegram_id}</code>\n"
+        f"Статус: {subscription_status_text(telegram_id)}\n"
+        f"Trial до: <b>{_fmt_dt(row.get('trial_until'))}</b>\n"
+        f"Оплачено до: <b>{_fmt_dt(row.get('subscription_until'))}</b>\n\n"
+        f"Тариф: <b>{escape(SUBSCRIPTION_PRICE_TEXT)}</b>\n"
+        f"{escape(PAYMENT_TEXT)}"
+    )
+
+
+async def require_active_subscription(message: Message, telegram_id: int | None = None) -> bool:
+    if telegram_id is None:
+        telegram_id = upsert_from_message(message)
+    ensure_subscription(int(telegram_id))
+    if has_active_subscription(int(telegram_id)):
+        return True
+    await message.answer(
+        "⛔ <b>Доступ ограничен</b>\n\n"
+        "Trial или подписка закончились.\n"
+        "Ваш Uzum-токен и настройки сохранены — после продления всё снова заработает.\n\n"
+        "Проверить подписку: <code>/my_subscription</code>\n"
+        "Оплата: <code>/subscribe</code>",
+        reply_markup=MAIN_MENU,
+    )
+    return False
+
+
+def admin_only(telegram_id: int) -> bool:
+    return is_admin(int(telegram_id))
+
+
+def extend_subscription_days(telegram_id: int, days: int) -> datetime:
+    ensure_subscription(telegram_id)
+    row = get_subscription_row(telegram_id) or {}
+    now = _utc_now()
+    candidates = [now, _dt_from_db(row.get("subscription_until")), _dt_from_db(row.get("trial_until"))]
+    base = max([d for d in candidates if d is not None])
+    new_until = base + timedelta(days=max(1, int(days)))
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE subscriptions SET subscription_until = ?, blocked = 0, updated_at = ? WHERE telegram_id = ?",
+            (_dt_to_db(new_until), _dt_to_db(now), int(telegram_id)),
+        )
+        conn.commit()
+    return new_until
+
+
+def set_trial_days(telegram_id: int, days: int) -> datetime:
+    ensure_subscription(telegram_id)
+    now = _utc_now()
+    new_until = now + timedelta(days=max(1, int(days)))
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE subscriptions SET trial_until = ?, blocked = 0, updated_at = ? WHERE telegram_id = ?",
+            (_dt_to_db(new_until), _dt_to_db(now), int(telegram_id)),
+        )
+        conn.commit()
+    return new_until
+
+
+def set_blocked(telegram_id: int, blocked: bool) -> None:
+    ensure_subscription(telegram_id)
+    now = _utc_now()
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE subscriptions SET blocked = ?, updated_at = ? WHERE telegram_id = ?",
+            (1 if blocked else 0, _dt_to_db(now), int(telegram_id)),
+        )
+        conn.commit()
+
+
+def list_subscription_users(limit: int = 30) -> list[dict[str, Any]]:
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT u.telegram_id, u.username, u.first_name, u.default_shop_id,
+                   s.trial_until, s.subscription_until, s.blocked
+            FROM users u
+            LEFT JOIN subscriptions s ON s.telegram_id = u.telegram_id
+            ORDER BY u.updated_at DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def subscription_compact_line(row: dict[str, Any]) -> str:
+    telegram_id = int(row.get("telegram_id"))
+    username = row.get("username") or ""
+    name = row.get("first_name") or ""
+    label = f"@{username}" if username else (name or "без имени")
+    if row.get("blocked"):
+        status_label = "⛔ block"
+    else:
+        untils = [_dt_from_db(row.get("subscription_until")), _dt_from_db(row.get("trial_until"))]
+        untils = [d for d in untils if d]
+        until = max(untils) if untils else None
+        status_label = "✅" if until and until > _utc_now() else "❌"
+    until_value = row.get("subscription_until") or row.get("trial_until")
+    return f"{status_label} <code>{telegram_id}</code> — {escape(str(label))} | до: {_fmt_dt(until_value)}"
+
+
+init_subscription_tables()
+
 # Минималистичное меню в стиле Noorza Bot.
 # Главное меню оставляем коротким: только самые важные разделы.
 # Все старые команды остаются рабочими: /products, /stock, /orders, /reviews и т.д.
@@ -108,7 +350,8 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton(text="📊 Сегодня"), KeyboardButton(text="📆 Вчера")],
         [KeyboardButton(text="🗓 7 дней"), KeyboardButton(text="📅 30 дней")],
         [KeyboardButton(text="📦 Остатки"), KeyboardButton(text="⚠️ Заканчивается")],
-        [KeyboardButton(text="🧭 Потерянные"), KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="🧭 Потерянные"), KeyboardButton(text="💎 Подписка")],
+        [KeyboardButton(text="⚙️ Статус"), KeyboardButton(text="ℹ️ Помощь")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите действие",
@@ -149,6 +392,8 @@ def get_uzum_for_user(telegram_id: int) -> UzumClient | None:
 
 async def require_connection(message: Message) -> tuple[int, UzumClient, int] | None:
     telegram_id = upsert_from_message(message)
+    if not await require_active_subscription(message, telegram_id):
+        return None
     client = get_uzum_for_user(telegram_id)
     shop_id = db.get_default_shop_id(telegram_id)
 
@@ -278,7 +523,9 @@ async def connect_token(
 @dp.message(Command("start", "help"))
 async def start(message: Message) -> None:
     telegram_id = upsert_from_message(message)
+    ensure_subscription(telegram_id)
     connected = "✅ подключён" if db.has_uzum_connection(telegram_id) else "❌ не подключён"
+    sub_line = subscription_status_text(telegram_id)
     await message.answer(
         "👋 <b>Uzum Seller Assistant</b>\n\n"
         f"Статус Uzum API: {connected}\n\n"
@@ -321,6 +568,7 @@ async def cancel(message: Message, state: FSMContext) -> None:
 @dp.message(Command("status"))
 async def status(message: Message) -> None:
     telegram_id = upsert_from_message(message)
+    ensure_subscription(telegram_id)
     user = db.get_user(telegram_id)
     shops = db.list_shops(telegram_id)
     connected = bool(user and user["uzum_token_encrypted"])
@@ -329,11 +577,10 @@ async def status(message: Message) -> None:
         "⚙️ <b>Статус</b>\n\n"
         f"Uzum API: {'✅ подключён' if connected else '❌ не подключён'}\n"
         f"Магазинов: {len(shops)}\n"
-        f"Основной магазин: {f'<code>{default_shop_id}</code>' if default_shop_id else 'не выбран'}\n\n"
-        "Подписки и trial добавим следующим шагом.",
+        f"Основной магазин: {f'<code>{default_shop_id}</code>' if default_shop_id else 'не выбран'}\n"
+        f"Подписка: {subscription_status_text(telegram_id)}\n",
         reply_markup=MAIN_MENU,
     )
-
 
 @dp.message(Command("connect"))
 async def connect(message: Message, state: FSMContext) -> None:
@@ -1936,6 +2183,164 @@ async def reply_review(message: Message) -> None:
     )
 
 
+@dp.message(Command("subscribe"))
+async def subscribe(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    ensure_subscription(telegram_id)
+    await message.answer(
+        "💎 <b>Подписка Uzum Seller Assistant</b>\n\n"
+        f"🎁 Trial: <b>{TRIAL_DAYS} дня</b> для нового пользователя\n"
+        f"💰 Тариф: <b>{escape(SUBSCRIPTION_PRICE_TEXT)}</b>\n\n"
+        f"{escape(PAYMENT_TEXT)}\n\n"
+        "После оплаты администратор продлит доступ.\n"
+        "Проверить статус: <code>/my_subscription</code>",
+        reply_markup=MAIN_MENU,
+    )
+
+
+@dp.message(Command("my_subscription", "subscription"))
+async def my_subscription(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    await message.answer(subscription_full_text(telegram_id), reply_markup=MAIN_MENU)
+
+
+@dp.message(Command("users"))
+async def admin_users(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    if not admin_only(telegram_id):
+        return
+    rows = list_subscription_users(30)
+    if not rows:
+        await message.answer("Пользователей пока нет.", reply_markup=MAIN_MENU)
+        return
+    lines = [subscription_compact_line(row) for row in rows]
+    await message.answer(
+        "👥 <b>Пользователи</b>\n\n"
+        + "\n".join(lines)
+        + "\n\nКоманды: <code>/extend ID 30</code>, <code>/block ID</code>, <code>/unblock ID</code>",
+        reply_markup=MAIN_MENU,
+    )
+
+
+@dp.message(Command("user"))
+async def admin_user_info(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    arg = parse_args(message.text or "")
+    if not arg.split() or not arg.split()[0].isdigit():
+        await message.answer("Напишите так: <code>/user TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        return
+    target = int(arg.split()[0])
+    row = ensure_subscription(target)
+    user = db.get_user(target)
+    username_text = f"@{escape(str(user['username']))}" if user and user['username'] else "—"
+    shop_text = f"<code>{user['default_shop_id']}</code>" if user and user['default_shop_id'] else "—"
+    await message.answer(
+        "👤 <b>Пользователь</b>\n\n"
+        f"ID: <code>{target}</code>\n"
+        f"Username: {username_text}\n"
+        f"Uzum API: {'✅ подключён' if user and user['uzum_token_encrypted'] else '❌ не подключён'}\n"
+        f"Магазин: {shop_text}\n"
+        f"Статус: {subscription_status_text(target)}\n"
+        f"Trial до: <b>{_fmt_dt(row.get('trial_until'))}</b>\n"
+        f"Оплачено до: <b>{_fmt_dt(row.get('subscription_until'))}</b>",
+        reply_markup=MAIN_MENU,
+    )
+
+
+@dp.message(Command("extend"))
+async def admin_extend(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    parts = parse_args(message.text or "").split()
+    if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        await message.answer("Напишите так: <code>/extend TELEGRAM_ID 30</code>", reply_markup=MAIN_MENU)
+        return
+    target = int(parts[0])
+    days = int(parts[1])
+    new_until = extend_subscription_days(target, days)
+    await message.answer(
+        f"✅ Доступ продлён для <code>{target}</code> на {days} дней.\n"
+        f"Активен до: <b>{_fmt_dt(new_until)}</b>",
+        reply_markup=MAIN_MENU,
+    )
+    try:
+        await bot.send_message(
+            target,
+            f"✅ Ваша подписка продлена на {days} дней.\nАктивна до: <b>{_fmt_dt(new_until)}</b>",
+            reply_markup=MAIN_MENU,
+        )
+    except Exception:
+        pass
+
+
+@dp.message(Command("trial"))
+async def admin_trial(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    parts = parse_args(message.text or "").split()
+    if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
+        await message.answer("Напишите так: <code>/trial TELEGRAM_ID 3</code>", reply_markup=MAIN_MENU)
+        return
+    target = int(parts[0])
+    days = int(parts[1])
+    new_until = set_trial_days(target, days)
+    await message.answer(f"🎁 Trial для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+
+
+@dp.message(Command("block"))
+async def admin_block(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    arg = parse_args(message.text or "").split()
+    if not arg or not arg[0].isdigit():
+        await message.answer("Напишите так: <code>/block TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        return
+    target = int(arg[0])
+    set_blocked(target, True)
+    await message.answer(f"⛔ Пользователь <code>{target}</code> заблокирован.", reply_markup=MAIN_MENU)
+
+
+@dp.message(Command("unblock"))
+async def admin_unblock(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    arg = parse_args(message.text or "").split()
+    if not arg or not arg[0].isdigit():
+        await message.answer("Напишите так: <code>/unblock TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        return
+    target = int(arg[0])
+    set_blocked(target, False)
+    await message.answer(f"✅ Пользователь <code>{target}</code> разблокирован.", reply_markup=MAIN_MENU)
+
+
+@dp.message(Command("broadcast"))
+async def admin_broadcast(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    text = parse_args(message.text or "")
+    if not text:
+        await message.answer("Напишите так: <code>/broadcast текст рассылки</code>", reply_markup=MAIN_MENU)
+        return
+    rows = list_subscription_users(500)
+    sent = 0
+    for row in rows:
+        target = int(row["telegram_id"])
+        try:
+            await bot.send_message(target, "📢 <b>Сообщение от администратора</b>\n\n" + text, reply_markup=MAIN_MENU)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    await message.answer(f"✅ Рассылка завершена. Отправлено: {sent}", reply_markup=MAIN_MENU)
+
+
 @dp.message(Command("debug_product"))
 async def debug_product(message: Message) -> None:
     req = await require_connection(message)
@@ -2086,7 +2491,7 @@ def connected_users_for_order_watch() -> list[dict[str, Any]]:
               AND default_shop_id IS NOT NULL
             """
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [dict(row) for row in rows if has_active_subscription(int(row["telegram_id"]))]
 
 
 async def check_new_orders_once() -> None:
@@ -2779,6 +3184,11 @@ async def button_lost(message: Message) -> None:
     await lost_goods(message)
 
 
+@dp.message(F.text == "💎 Подписка")
+async def button_subscription(message: Message) -> None:
+    await my_subscription(message)
+
+
 @dp.message(F.text == "ℹ️ Помощь")
 @dp.message(F.text == "❓ Помощь")
 async def button_help(message: Message) -> None:
@@ -2923,7 +3333,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
 
 
 
