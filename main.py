@@ -53,9 +53,9 @@ UZUM_API_BASE_URL = os.getenv(
 ).strip()
 DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
-ORDER_CHECK_INTERVAL_SECONDS = int(os.getenv("ORDER_CHECK_INTERVAL_SECONDS", "300") or "300")
+ORDER_CHECK_INTERVAL_SECONDS = int(os.getenv("ORDER_CHECK_INTERVAL_SECONDS", "900") or "900")
 NEW_ORDER_NOTIFICATIONS = (
-    os.getenv("NEW_ORDER_NOTIFICATIONS", "1").strip().lower()
+    os.getenv("NEW_ORDER_NOTIFICATIONS", "0").strip().lower()
     not in {"0", "false", "no", "off"}
 )
 LOW_STOCK_NOTIFICATIONS = (
@@ -83,7 +83,7 @@ STOCK_CHANGE_NOTIFICATIONS = (
     not in {"0", "false", "no", "off"}
 )
 STOCK_CHANGE_CHECK_INTERVAL_SECONDS = int(
-    os.getenv("STOCK_CHANGE_CHECK_INTERVAL_SECONDS", "300") or "300"
+    os.getenv("STOCK_CHANGE_CHECK_INTERVAL_SECONDS", "900") or "900"
 )
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "3") or "3")
 SUBSCRIPTION_PRICE_TEXT = os.getenv("SUBSCRIPTION_PRICE_TEXT", "250 000 сум / 1 месяц").strip()
@@ -4151,6 +4151,311 @@ async def button_lowstock_notify_status(message: Message) -> None:
 async def button_outofstock_notify_status(message: Message) -> None:
     await outofstock_notify_status(message)
 
+
+
+# --- OPTIMIZED WATCHERS: защита от 429 Too Many Requests ---
+# Если один и тот же Uzum API-токен / магазин подключён у нескольких Telegram-пользователей
+# (например, владелец и жена), старые watcher-функции делали одинаковый запрос для каждого пользователя.
+# Ниже мы переопределяем check_*_once: один запрос на связку token+shop, потом рассылка всем пользователям группы.
+def connected_watch_groups() -> list[dict[str, Any]]:
+    groups: dict[str, dict[str, Any]] = {}
+    for row in connected_users_for_order_watch():
+        telegram_id = int(row["telegram_id"])
+        shop_id = int(row["default_shop_id"])
+        encrypted_token = row["uzum_token_encrypted"]
+        key = hashlib.sha1(f"{shop_id}:{encrypted_token}".encode("utf-8")).hexdigest()
+        if key not in groups:
+            groups[key] = {
+                "shop_id": shop_id,
+                "uzum_token_encrypted": encrypted_token,
+                "telegram_ids": [],
+            }
+        if telegram_id not in groups[key]["telegram_ids"]:
+            groups[key]["telegram_ids"].append(telegram_id)
+    return list(groups.values())
+
+
+async def check_new_orders_once() -> None:
+    for group in connected_watch_groups():
+        shop_id = int(group["shop_id"])
+        encrypted_token = group["uzum_token_encrypted"]
+        telegram_ids = [int(x) for x in group["telegram_ids"]]
+
+        try:
+            token = cipher.decrypt(encrypted_token)
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            data = await client.get_fbs_orders(shop_id, status="CREATED", page=0, size=20)
+            items = extract_items(data)
+        except Exception:
+            logging.exception("Order watcher optimized: failed to check shop=%s users=%s", shop_id, telegram_ids)
+            await asyncio.sleep(3)
+            continue
+
+        keys_now = [order_key(item) for item in items]
+        for telegram_id in telegram_ids:
+            known = _seen_order_keys_by_user.setdefault(telegram_id, set())
+            if telegram_id not in _orders_watch_initialized:
+                known.update(keys_now)
+                _orders_watch_initialized.add(telegram_id)
+                logging.info(
+                    "Order watcher initialized for user=%s shop=%s orders=%s",
+                    telegram_id, shop_id, len(keys_now),
+                )
+                continue
+
+            new_items = [item for item, key in zip(items, keys_now) if key not in known]
+            known.update(keys_now)
+            if len(known) > 1000:
+                _seen_order_keys_by_user[telegram_id] = set(keys_now)
+            if not new_items:
+                continue
+
+            lines = [format_order_line(item) for item in new_items[:5]]
+            more = "" if len(new_items) <= 5 else f"\n\nЕщё новых заказов: {len(new_items) - 5}"
+            text = (
+                f"🔔 <b>Новый заказ CREATED</b>\n"
+                f"Магазин: <code>{shop_id}</code>\n"
+                f"Новых заказов: <b>{len(new_items)}</b>\n\n"
+                + "\n\n".join(lines)
+                + more
+                + "\n\nОткрыть список: <code>/orders</code>"
+            )
+            try:
+                await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+                await asyncio.sleep(0.15)
+            except Exception:
+                logging.exception("Order watcher: failed to send notification to %s", telegram_id)
+        await asyncio.sleep(0.5)
+
+
+async def check_low_stock_once() -> None:
+    threshold = max(0, LOW_STOCK_THRESHOLD)
+    for group in connected_watch_groups():
+        shop_id = int(group["shop_id"])
+        encrypted_token = group["uzum_token_encrypted"]
+        telegram_ids = [int(x) for x in group["telegram_ids"]]
+
+        try:
+            token = cipher.decrypt(encrypted_token)
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            rows = await load_sku_rows(client, shop_id, max_pages=50)
+        except Exception:
+            logging.exception("Low stock watcher optimized: failed to check shop=%s users=%s", shop_id, telegram_ids)
+            await asyncio.sleep(3)
+            continue
+
+        low_rows = [r for r in rows if r.get("total") is not None and int(r.get("total") or 0) <= threshold]
+        low_keys_now = [stock_row_key(r) for r in low_rows]
+
+        for telegram_id in telegram_ids:
+            known = _seen_low_stock_keys_by_user.setdefault(telegram_id, set())
+            if telegram_id not in _low_stock_watch_initialized:
+                known.update(low_keys_now)
+                _low_stock_watch_initialized.add(telegram_id)
+                logging.info(
+                    "Low stock watcher initialized for user=%s shop=%s low_skus=%s threshold=%s",
+                    telegram_id, shop_id, len(low_keys_now), threshold,
+                )
+                continue
+
+            new_low_rows = [r for r, key in zip(low_rows, low_keys_now) if key not in known]
+            _seen_low_stock_keys_by_user[telegram_id] = set(low_keys_now)
+            if not new_low_rows:
+                continue
+
+            lines = [format_sku_stock_line(item, mode="all") for item in new_low_rows[:10]]
+            more = "" if len(new_low_rows) <= 10 else f"\n\nЕщё SKU с низким остатком: {len(new_low_rows) - 10}"
+            text = (
+                f"📉 <b>Товар заканчивается</b>\n"
+                f"Магазин: <code>{shop_id}</code>\n"
+                f"Порог: ≤ <b>{threshold}</b> шт.\n"
+                f"Новых позиций с низким остатком: <b>{len(new_low_rows)}</b>\n\n"
+                + "\n\n".join(lines)
+                + more
+                + f"\n\nПоказать все низкие остатки: <code>/lowstock {threshold}</code>"
+            )
+            try:
+                await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+                await asyncio.sleep(0.15)
+            except Exception:
+                logging.exception("Low stock watcher: failed to send notification to %s", telegram_id)
+        await asyncio.sleep(0.5)
+
+
+async def check_out_of_stock_once() -> None:
+    for group in connected_watch_groups():
+        shop_id = int(group["shop_id"])
+        encrypted_token = group["uzum_token_encrypted"]
+        telegram_ids = [int(x) for x in group["telegram_ids"]]
+
+        try:
+            token = cipher.decrypt(encrypted_token)
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            rows = await load_sku_rows(client, shop_id, max_pages=50)
+        except Exception:
+            logging.exception("Out of stock watcher optimized: failed to check shop=%s users=%s", shop_id, telegram_ids)
+            await asyncio.sleep(3)
+            continue
+
+        zero_rows = [r for r in rows if r.get("total") is not None and int(r.get("total") or 0) == 0]
+        zero_keys_now = [stock_row_key(r) for r in zero_rows]
+
+        for telegram_id in telegram_ids:
+            known = _seen_out_of_stock_keys_by_user.setdefault(telegram_id, set())
+            if telegram_id not in _out_of_stock_watch_initialized:
+                known.update(zero_keys_now)
+                _out_of_stock_watch_initialized.add(telegram_id)
+                logging.info(
+                    "Out of stock watcher initialized for user=%s shop=%s zero_skus=%s",
+                    telegram_id, shop_id, len(zero_keys_now),
+                )
+                continue
+
+            new_zero_rows = [r for r, key in zip(zero_rows, zero_keys_now) if key not in known]
+            _seen_out_of_stock_keys_by_user[telegram_id] = set(zero_keys_now)
+            if not new_zero_rows:
+                continue
+
+            lines = [format_sku_stock_line(item, mode="all") for item in new_zero_rows[:10]]
+            more = "" if len(new_zero_rows) <= 10 else f"\n\nЕщё SKU с нулевым остатком: {len(new_zero_rows) - 10}"
+            text = (
+                "❌ <b>Товар закончился</b>\n"
+                f"Магазин: <code>{shop_id}</code>\n"
+                f"Новых позиций с остатком 0: <b>{len(new_zero_rows)}</b>\n\n"
+                + "\n\n".join(lines)
+                + more
+                + "\n\nПоказать остатки: <code>/stock</code>"
+            )
+            try:
+                await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+                await asyncio.sleep(0.15)
+            except Exception:
+                logging.exception("Out of stock watcher: failed to send notification to %s", telegram_id)
+        await asyncio.sleep(0.5)
+
+
+async def check_new_sales_once() -> None:
+    date_from, date_to = _today_range_ms()
+    for group in connected_watch_groups():
+        shop_id = int(group["shop_id"])
+        encrypted_token = group["uzum_token_encrypted"]
+        telegram_ids = [int(x) for x in group["telegram_ids"]]
+
+        try:
+            token = cipher.decrypt(encrypted_token)
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            rows, first_response = await _load_finance_orders(
+                client,
+                shop_id,
+                date_from_ms=date_from,
+                date_to_ms=date_to,
+                max_pages=5,
+                page_size=100,
+            )
+        except Exception:
+            logging.exception("Sales watcher optimized: failed to check shop=%s users=%s", shop_id, telegram_ids)
+            await asyncio.sleep(3)
+            continue
+
+        keys_now = [sale_key(item) for item in rows]
+        for telegram_id in telegram_ids:
+            known = _seen_sale_keys_by_user.setdefault(telegram_id, set())
+            if telegram_id not in _sales_watch_initialized:
+                known.update(keys_now)
+                _sales_watch_initialized.add(telegram_id)
+                logging.info(
+                    "Sales watcher initialized for user=%s shop=%s sales_rows=%s",
+                    telegram_id, shop_id, len(keys_now),
+                )
+                continue
+
+            new_rows = [item for item, key in zip(rows, keys_now) if key not in known]
+            known.update(keys_now)
+            if len(known) > 3000:
+                _seen_sale_keys_by_user[telegram_id] = set(keys_now)
+            if not new_rows:
+                continue
+
+            for item in new_rows[:10]:
+                try:
+                    await bot.send_message(telegram_id, build_new_sale_message(item), reply_markup=MAIN_MENU)
+                    await asyncio.sleep(0.15)
+                except Exception:
+                    logging.exception("Sales watcher: failed to send sale notification to %s", telegram_id)
+
+            if len(new_rows) > 10:
+                try:
+                    await bot.send_message(
+                        telegram_id,
+                        f"➕ Ещё новых строк продаж: <b>{len(new_rows) - 10}</b>\nПодробно: <code>/balance</code>",
+                        reply_markup=MAIN_MENU,
+                    )
+                except Exception:
+                    logging.exception("Sales watcher: failed to send summary notification to %s", telegram_id)
+        await asyncio.sleep(0.5)
+
+
+async def check_stock_change_once() -> None:
+    for group in connected_watch_groups():
+        shop_id = int(group["shop_id"])
+        encrypted_token = group["uzum_token_encrypted"]
+        telegram_ids = [int(x) for x in group["telegram_ids"]]
+
+        try:
+            token = cipher.decrypt(encrypted_token)
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            rows = await load_sku_rows(client, shop_id, max_pages=20)
+            snapshot_now = _stock_change_snapshot(rows)
+        except Exception:
+            logging.exception("Stock change watcher optimized: failed to check shop=%s users=%s", shop_id, telegram_ids)
+            await asyncio.sleep(3)
+            continue
+
+        for telegram_id in telegram_ids:
+            previous = _stock_snapshot_by_user.setdefault(telegram_id, {})
+            if telegram_id not in _stock_change_watch_initialized:
+                _stock_snapshot_by_user[telegram_id] = snapshot_now
+                _stock_change_watch_initialized.add(telegram_id)
+                logging.info(
+                    "Stock change watcher initialized for user=%s shop=%s skus=%s",
+                    telegram_id, shop_id, len(snapshot_now),
+                )
+                continue
+
+            decreased: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+            for key, after in snapshot_now.items():
+                before = previous.get(key)
+                if not before:
+                    continue
+                before_total = int(before.get("total") or 0)
+                after_total = int(after.get("total") or 0)
+                before_fbo = int(before.get("fbo") or 0)
+                after_fbo = int(after.get("fbo") or 0)
+                before_fbs = int(before.get("fbs") or 0)
+                after_fbs = int(after.get("fbs") or 0)
+                if after_total < before_total or after_fbo < before_fbo or after_fbs < before_fbs:
+                    decreased.append((key, before, after))
+
+            _stock_snapshot_by_user[telegram_id] = snapshot_now
+            if not decreased:
+                continue
+
+            lines = [_format_stock_change_line(key, before, after) for key, before, after in decreased[:10]]
+            more = "" if len(decreased) <= 10 else f"\n\nЕщё изменений: {len(decreased) - 10}"
+            text = (
+                "📦 <b>Изменение остатков</b>\n"
+                f"Магазин: <code>{shop_id}</code>\n"
+                "Уменьшился остаток по SKU. Это может быть продажа, резерв, списание или изменение склада.\n\n"
+                + "\n\n".join(lines)
+                + more
+                + "\n\nПроверить остатки: <code>/stock</code>"
+            )
+            try:
+                await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+                await asyncio.sleep(0.15)
+            except Exception:
+                logging.exception("Stock change watcher: failed to send notification to %s", telegram_id)
+        await asyncio.sleep(0.5)
 
 async def main() -> None:
     logging.info("FINANCE_SECONDS_PATCH_LOADED: dateFrom for Finance = seconds, dateTo = milliseconds")
