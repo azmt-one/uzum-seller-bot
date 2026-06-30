@@ -396,12 +396,12 @@ init_subscription_tables()
 # Все старые команды остаются рабочими: /products, /stock, /orders, /reviews и т.д.
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Сегодня"), KeyboardButton(text="📆 Вчера")],
-        [KeyboardButton(text="🗓 7 дней"), KeyboardButton(text="📅 30 дней")],
-        [KeyboardButton(text="📦 Остатки"), KeyboardButton(text="⚠️ Заканчивается")],
-        [KeyboardButton(text="🧭 Потерянные"), KeyboardButton(text="📄 Накладные FBO")],
-        [KeyboardButton(text="📊 Excel отчёт"), KeyboardButton(text="💎 Подписка")],
-        [KeyboardButton(text="⚙️ Статус"), KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="📊 Сегодня")],
+        [KeyboardButton(text="📆 Вчера"), KeyboardButton(text="🗓 7 дней")],
+        [KeyboardButton(text="📅 30 дней"), KeyboardButton(text="📦 Остатки")],
+        [KeyboardButton(text="⚠️ Заканчивается"), KeyboardButton(text="🧭 Потерянные")],
+        [KeyboardButton(text="📄 Накладные FBO"), KeyboardButton(text="📊 Excel отчёт")],
+        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="ℹ️ Помощь")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите действие",
@@ -1280,16 +1280,27 @@ def _deep_pick_number(obj: Any, names: tuple[str, ...]) -> float | None:
 
 
 def _finance_gross_revenue(item: dict[str, Any]) -> float:
-    direct = _deep_pick_number(
+    # В Finance API Uzum поле sellPrice обычно является ценой за 1 штуку.
+    # Поэтому для выручки умножаем sellPrice на amount, как в рабочем Noorza Bot.
+    direct_total = _deep_pick_number(
         item,
         (
-            "totalPrice", "totalAmount", "totalSum", "productPrice", "skuPrice",
-            "sellPrice", "soldPrice", "priceWithDiscount", "orderItemPrice",
-            "orderPrice", "purchasePrice", "price",
+            "totalPrice", "totalAmount", "totalSum", "totalSellerPrice",
+            "orderItemPrice", "orderPrice", "sellerPrice", "sellerAmount",
         ),
     )
-    if direct is not None:
-        return max(0.0, direct)
+    if direct_total is not None:
+        return max(0.0, direct_total)
+
+    unit_price = _deep_pick_number(
+        item,
+        (
+            "sellPrice", "soldPrice", "productPrice", "skuPrice",
+            "priceWithDiscount", "purchasePrice", "price",
+        ),
+    )
+    if unit_price is not None:
+        return max(0.0, unit_price * _finance_qty(item))
     return _finance_revenue(item)
 
 
@@ -1308,7 +1319,7 @@ def _finance_logistics(item: dict[str, Any]) -> float:
     value = _deep_pick_number(
         item,
         (
-            "logistics", "logistic", "logisticAmount", "logisticsAmount",
+            "logisticDeliveryFee", "logistics", "logistic", "logisticAmount", "logisticsAmount",
             "logisticsSum", "delivery", "deliveryAmount", "deliveryPrice",
             "deliveryCost", "shipping", "shippingAmount",
         ),
@@ -1320,7 +1331,7 @@ def _finance_payout_direct(item: dict[str, Any]) -> float | None:
     return _deep_pick_number(
         item,
         (
-            "amountToWithdraw", "toWithdraw", "withdrawAmount", "sellerPayout",
+            "sellerProfit", "amountToWithdraw", "toWithdraw", "withdrawAmount", "sellerPayout",
             "payout", "payoutAmount", "sellerAmount", "accrual", "accrualAmount",
         ),
     )
@@ -1330,7 +1341,7 @@ def _finance_withdrawn(item: dict[str, Any]) -> float:
     value = _deep_pick_number(
         item,
         (
-            "withdrawn", "withdrawnAmount", "paid", "paidAmount", "transferred",
+            "withdrawnProfit", "withdrawn", "withdrawnAmount", "paid", "paidAmount", "transferred",
             "transferredAmount", "alreadyWithdrawn",
         ),
     )
@@ -1411,6 +1422,8 @@ async def _load_finance_range_flexible(
 
 
 def _build_noorza_today_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    # Логика максимально приближена к рабочему Noorza Bot:
+    # sellPrice * amount, commission, logisticDeliveryFee, sellerProfit, withdrawnProfit.
     active_rows = 0
     returns = 0.0
     units = 0.0
@@ -1422,18 +1435,22 @@ def _build_noorza_today_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     statuses: dict[str, int] = {}
     for item in rows:
         status = _finance_status(item)
-        statuses[status] = statuses.get(status, 0) + 1
         qty = _finance_qty(item)
-        if _is_cancelled_status(status) or "RETURN" in status.upper() or "ВОЗВР" in status.upper():
-            returns += abs(qty)
+        if _is_cancelled_status(status):
+            statuses[status] = statuses.get(status, 0) + 1
             continue
+
+        statuses[status] = statuses.get(status, 0) + 1
         active_rows += 1
         units += qty
+        returns += abs(_deep_pick_number(item, ("amountReturns", "returnAmount", "returnedAmount", "quantityReturns")) or 0.0)
+
         gross = _finance_gross_revenue(item)
         comm = _finance_commission(item)
         logi = _finance_logistics(item)
         payout_direct = _finance_payout_direct(item)
         payout = payout_direct if payout_direct is not None else max(0.0, gross - comm - logi)
+
         revenue += gross
         commission += comm
         logistics += logi
@@ -1548,20 +1565,13 @@ async def balance(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
-    await message.answer("⌛ Считаю баланс по Finance API...", reply_markup=MAIN_MENU)
+    await message.answer("⌛ Считаю баланс за 30 дней...", reply_markup=MAIN_MENU)
     try:
-        rows, _, _ = await _load_today_finance_flexible(client, shop_id)
+        date_from, date_to = _days_range_ms(30)
+        rows, _, _ = await _load_finance_range_flexible(client, shop_id, date_from, date_to)
         stats = _build_noorza_today_stats(rows)
         await message.answer(
-            "💰 <b>Баланс за сегодня</b>\n"
-            f"Магазин: <code>{shop_id}</code>\n\n"
-            f"К выплате всего: <b>{_format_money(float(stats['payout_total']))}</b>\n"
-            f"Уже выведено: <b>{_format_money(float(stats['withdrawn']))}</b>\n"
-            f"Остаток к выплате: <b>{_format_money(float(stats['left_to_withdraw']))}</b>\n\n"
-            f"Выручка: {_format_money(float(stats['revenue']))}\n"
-            f"Комиссия Uzum: {_format_money(float(stats['commission']))}\n"
-            f"Логистика: {_format_money(float(stats['logistics']))}\n\n"
-            "<i>Пока это расчёт по сегодняшним строкам Finance API.</i>",
+            _format_noorza_period("Баланс Uzum FBO за 30 дней", shop_id, stats, rows),
             reply_markup=MAIN_MENU,
         )
     except Exception as e:
@@ -3584,22 +3594,103 @@ def sale_key(item: dict[str, Any]) -> str:
     return "hash:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
+def _deep_pick_value(obj: Any, names: tuple[str, ...]) -> Any:
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if k in names and v not in (None, ""):
+                return v
+        for v in obj.values():
+            found = _deep_pick_value(v, names)
+            if found not in (None, ""):
+                return found
+    elif isinstance(obj, list):
+        for v in obj:
+            found = _deep_pick_value(v, names)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def _finance_sku_title(item: dict[str, Any]) -> str:
+    value = _deep_pick_value(item, ("skuTitle", "skuName", "skuFullTitle", "offerName", "barcode", "skuId"))
+    if isinstance(value, dict):
+        value = pick(value, "title", "name", "value", "id")
+    return str(value or "-")
+
+
+def _finance_order_id(item: dict[str, Any]) -> str:
+    return str(_deep_pick_value(item, ("orderId", "order_id", "orderNumber", "postingNumber")) or "-")
+
+
+def _finance_sale_id(item: dict[str, Any]) -> str:
+    return str(_deep_pick_value(item, ("id", "saleId", "operationId", "orderItemId", "orderItem_id")) or "-")
+
+
+def _finance_date_value(item: dict[str, Any]) -> Any:
+    return _deep_pick_value(item, ("date", "saleDate", "operationDate", "createdAt", "orderDate", "createdDate"))
+
+
+def _format_finance_date(value: Any) -> str:
+    if value in (None, ""):
+        return "-"
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000
+        try:
+            return datetime.fromtimestamp(ts, UZT).strftime("%d.%m.%Y %H:%M")
+        except Exception:
+            return str(value)
+    text_value = str(value).strip()
+    try:
+        iso = text_value.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UZT)
+        return dt.astimezone(UZT).strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return text_value[:16]
+
+
 def format_sale_line(item: dict[str, Any]) -> str:
     title = escape(_finance_title(item))
     qty = _finance_qty(item)
     amount = _finance_revenue(item)
     status = escape(_finance_status(item))
-    extra = []
-    for k in ("orderId", "order_id", "skuId", "sku_id", "barcode"):
-        v = item.get(k)
-        if v not in (None, ""):
-            extra.append(f"{k}: <code>{escape(str(v))}</code>")
-            break
-    extra_text = "\n" + " | ".join(extra) if extra else ""
     return (
         f"• <b>{title}</b>\n"
         f"  Штук: <b>{qty:g}</b> | Сумма: <b>{_format_money(amount)}</b> | Статус: <code>{status}</code>"
-        f"{extra_text}"
+    )
+
+
+def build_new_sale_message(item: dict[str, Any]) -> str:
+    title = escape(_finance_title(item))
+    sku = escape(_finance_sku_title(item))
+    qty = _finance_qty(item)
+
+    # Для уведомления показываем цену за штуку, как в Noorza Bot.
+    unit_price = _deep_pick_number(item, ("sellPrice", "soldPrice", "price", "skuPrice", "productPrice"))
+    if unit_price is None:
+        unit_price = _finance_gross_revenue(item) / max(1.0, qty)
+
+    commission = _finance_commission(item)
+    logistics = _finance_logistics(item)
+    payout_direct = _finance_payout_direct(item)
+    payout = payout_direct if payout_direct is not None else max(0.0, _finance_gross_revenue(item) - commission - logistics)
+
+    return (
+        "🛒 <b>Новая продажа Uzum FBO</b>\n\n"
+        f"<b>Товар:</b> {title}\n"
+        f"<b>SKU:</b> {sku}\n"
+        f"<b>Кол-во:</b> {qty:g} шт.\n\n"
+        f"<b>Цена продажи:</b> {_format_money(float(unit_price or 0))}\n"
+        f"<b>Комиссия:</b> {_format_money(float(commission))}\n"
+        f"<b>Логистика:</b> {_format_money(float(logistics))}\n"
+        f"<b>К выплате:</b> {_format_money(float(payout))}\n\n"
+        f"<b>ID заказа:</b> {escape(_finance_order_id(item))}\n"
+        f"<b>ID продажи:</b> {escape(_finance_sale_id(item))}\n"
+        f"<b>Статус:</b> {escape(_finance_status(item))}\n"
+        f"<b>Дата:</b> {escape(_format_finance_date(_finance_date_value(item)))}"
     )
 
 
@@ -3651,24 +3742,27 @@ async def check_new_sales_once() -> None:
         if not new_rows:
             continue
 
-        stats = _build_sales_stats(new_rows)
-        lines = [format_sale_line(item) for item in new_rows[:8]]
-        more = "" if len(new_rows) <= 8 else f"\n\nЕщё новых строк продаж: {len(new_rows) - 8}"
-        text = (
-            f"💸 <b>Новая продажа</b>\n"
-            f"Магазин: <code>{shop_id}</code>\n"
-            f"Новых строк: <b>{len(new_rows)}</b>\n"
-            f"Сумма: <b>{_format_money(float(stats['revenue']))}</b>\n"
-            f"Штук: <b>{float(stats['units']):g}</b>\n\n"
-            + "\n\n".join(lines)
-            + more
-            + "\n\nПодробно: <code>/sales_today</code>"
-        )
+        # Отправляем каждую новую продажу отдельным сообщением в стиле Noorza Bot.
+        for item in new_rows[:10]:
+            try:
+                await bot.send_message(
+                    telegram_id,
+                    build_new_sale_message(item),
+                    reply_markup=MAIN_MENU,
+                )
+                await asyncio.sleep(0.15)
+            except Exception:
+                logging.exception("Sales watcher: failed to send sale notification to %s", telegram_id)
 
-        try:
-            await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
-        except Exception:
-            logging.exception("Sales watcher: failed to send notification to %s", telegram_id)
+        if len(new_rows) > 10:
+            try:
+                await bot.send_message(
+                    telegram_id,
+                    f"➕ Ещё новых строк продаж: <b>{len(new_rows) - 10}</b>\nПодробно: <code>/balance</code>",
+                    reply_markup=MAIN_MENU,
+                )
+            except Exception:
+                logging.exception("Sales watcher: failed to send summary notification to %s", telegram_id)
 
 
 async def sales_watch_loop() -> None:
@@ -4076,8 +4170,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
 
