@@ -42,6 +42,7 @@ from uzum_client import UzumClient
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 TELEGRAM_BOT_TOKEN = (
     os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -79,7 +80,7 @@ SALE_NOTIFICATIONS = (
 )
 SALE_CHECK_INTERVAL_SECONDS = int(os.getenv("SALE_CHECK_INTERVAL_SECONDS", "300") or "300")
 STOCK_CHANGE_NOTIFICATIONS = (
-    os.getenv("STOCK_CHANGE_NOTIFICATIONS", "1").strip().lower()
+    os.getenv("STOCK_CHANGE_NOTIFICATIONS", "0").strip().lower()
     not in {"0", "false", "no", "off"}
 )
 STOCK_CHANGE_CHECK_INTERVAL_SECONDS = int(
@@ -269,7 +270,10 @@ def subscription_full_text(telegram_id: int) -> str:
             "• <code>/users</code> — пользователи\n"
             "• <code>/extend ID 30</code> — продлить доступ\n"
             "• <code>/block ID</code> — заблокировать\n"
-            "• <code>/unblock ID</code> — разблокировать"
+            "• <code>/unblock ID</code> — разблокировать\n"
+            "• <code>/paid ID сумма дни</code> — записать оплату\n"
+            "• <code>/payments</code> — история оплат\n"
+            "• <code>/backup_db</code> — скачать базу"
         )
 
     return (
@@ -280,7 +284,11 @@ def subscription_full_text(telegram_id: int) -> str:
         f"Оплачено до: <b>{_fmt_dt(row.get('subscription_until'))}</b>\n\n"
         "Тарифы:\n"
         f"<b>{escape(SUBSCRIPTION_PLANS_TEXT)}</b>\n\n"
-        f"{escape(PAYMENT_TEXT)}"
+        f"{escape(PAYMENT_TEXT)}\n\n"
+        "История оплат: <code>/my_payments</code>\n"
+        "Поддержка: <code>/support</code>\n"
+        "Заменить API-ключ: <code>/reconnect</code>\n"
+        "Удалить API-ключ: <code>/disconnect</code>"
     )
 
 
@@ -370,6 +378,76 @@ def set_blocked(telegram_id: int, blocked: bool) -> None:
         conn.commit()
 
 
+
+
+def init_business_tables() -> None:
+    with db.connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS payment_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                amount INTEGER NOT NULL DEFAULT 0,
+                days INTEGER NOT NULL DEFAULT 0,
+                admin_id INTEGER,
+                comment TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def record_payment(telegram_id: int, amount: int, days: int, admin_id: int | None = None, comment: str = "") -> int:
+    init_business_tables()
+    with db.connect() as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO payment_history (telegram_id, amount, days, admin_id, comment, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (int(telegram_id), int(amount), int(days), int(admin_id) if admin_id else None, comment.strip(), _dt_to_db(_utc_now())),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def list_payments(telegram_id: int | None = None, limit: int = 20) -> list[dict[str, Any]]:
+    init_business_tables()
+    with db.connect() as conn:
+        if telegram_id is None:
+            rows = conn.execute(
+                """
+                SELECT id, telegram_id, amount, days, admin_id, comment, created_at
+                FROM payment_history
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT id, telegram_id, amount, days, admin_id, comment, created_at
+                FROM payment_history
+                WHERE telegram_id = ?
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (int(telegram_id), int(limit)),
+            ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def payment_line(row: dict[str, Any]) -> str:
+    comment = (row.get("comment") or "").strip()
+    comment_part = f" | {escape(comment)}" if comment else ""
+    amount_text = f"{int(row.get('amount') or 0):,}".replace(",", " ")
+    return (
+        f"#{row.get('id')} | <code>{int(row.get('telegram_id') or 0)}</code> | "
+        f"{amount_text} сум | {int(row.get('days') or 0)} дней | {_fmt_dt(row.get('created_at'))}{comment_part}"
+    )
+
 def list_subscription_users(limit: int = 30) -> list[dict[str, Any]]:
     with db.connect() as conn:
         rows = conn.execute(
@@ -403,6 +481,7 @@ def subscription_compact_line(row: dict[str, Any]) -> str:
 
 
 init_subscription_tables()
+init_business_tables()
 
 # Минималистичное меню в стиле Noorza Bot.
 # Главное меню оставляем коротким: только самые важные разделы.
@@ -600,6 +679,9 @@ async def start(message: Message) -> None:
             "• <code>/users</code> — список пользователей\n"
             "• <code>/extend ID 30</code> — продлить доступ\n"
             "• <code>/block ID</code> / <code>/unblock ID</code> — блокировка\n"
+            "• <code>/paid ID сумма дни</code> — записать оплату и продлить\n"
+            "• <code>/payments</code> — история оплат\n"
+            "• <code>/backup_db</code> — резервная копия базы\n"
             "• <code>/broadcast текст</code> — рассылка\n"
         )
 
@@ -621,6 +703,8 @@ async def start(message: Message) -> None:
         "3. Нажмите <b>📊 Сегодня</b> или <b>📦 Остатки</b>\n\n"
         "Не знаете, где взять токен? Напишите <code>/api_token</code>.\n"
         "Подписка и оплата: <code>/subscribe</code>.\n"
+        "Поддержка: <code>/support</code>.\n"
+        "Заменить API-ключ: <code>/reconnect</code>. Удалить API-ключ: <code>/disconnect</code>.\n"
         "Подробный Excel-отчёт: <code>/report_excel</code>."
         + admin_part,
         reply_markup=MAIN_MENU,
@@ -656,7 +740,7 @@ async def status(message: Message) -> None:
         reply_markup=MAIN_MENU,
     )
 
-@dp.message(Command("connect"))
+@dp.message(Command("connect", "reconnect"))
 async def connect(message: Message, state: FSMContext) -> None:
     token = parse_args(message.text or "")
     if token:
@@ -682,10 +766,26 @@ async def connect_waiting_token(message: Message, state: FSMContext) -> None:
     await connect_token(message, message.text or "", state)
 
 
+def disconnect_uzum_for_user(telegram_id: int) -> None:
+    if hasattr(db, "disconnect_uzum"):
+        db.disconnect_uzum(telegram_id)
+        return
+    with db.connect() as conn:
+        conn.execute(
+            "UPDATE users SET uzum_token_encrypted = NULL, default_shop_id = NULL, updated_at = ? WHERE telegram_id = ?",
+            (_dt_to_db(_utc_now()), int(telegram_id)),
+        )
+        try:
+            conn.execute("DELETE FROM shops WHERE telegram_id = ?", (int(telegram_id),))
+        except Exception:
+            pass
+        conn.commit()
+
+
 @dp.message(Command("disconnect"))
 async def disconnect(message: Message) -> None:
     telegram_id = upsert_from_message(message)
-    db.disconnect_uzum(telegram_id)
+    disconnect_uzum_for_user(telegram_id)
     await message.answer(
         "✅ Подключение к Uzum API удалено. Можно подключить заново через <code>/connect</code>.",
         reply_markup=MAIN_MENU,
@@ -2632,6 +2732,56 @@ async def api_token_help(message: Message) -> None:
     )
 
 
+
+
+@dp.message(Command("security", "privacy"))
+async def security(message: Message) -> None:
+    upsert_from_message(message)
+    await message.answer(
+        "🔐 <b>Безопасность API-ключа</b>\n\n"
+        "Ваш Uzum API-ключ не показывается в боте и не отправляется обратно сообщением.\n"
+        "После подключения бот старается удалить сообщение, где был отправлен ключ.\n"
+        "В базе хранится только защищённая версия ключа.\n\n"
+        "Вы можете в любой момент удалить подключение командой <code>/disconnect</code>.\n"
+        "Чтобы заменить ключ, используйте <code>/reconnect</code>.",
+        reply_markup=MAIN_MENU,
+    )
+
+
+@dp.message(Command("support"))
+async def support(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    user = db.get_user(telegram_id)
+    shops = db.list_shops(telegram_id)
+    connected = bool(user and user["uzum_token_encrypted"])
+    await message.answer(
+        "🛟 <b>Поддержка Uzum Seller Assistant</b>\n\n"
+        f"Ваш Telegram ID: <code>{telegram_id}</code>\n"
+        f"Uzum API: {'✅ подключён' if connected else '❌ не подключён'}\n"
+        f"Магазинов найдено: <b>{len(shops)}</b>\n"
+        f"Подписка: {subscription_status_text(telegram_id)}\n\n"
+        "Если бот не показывает данные, проверьте:\n"
+        "1. API-ключ активен в кабинете Uzum Seller.\n"
+        "2. У ключа есть доступ к нужному магазину.\n"
+        "3. В кабинете Uzum есть продажи за выбранный период.\n"
+        "4. Если меняли API-ключ — нажмите <code>/reconnect</code>.\n\n"
+        f"Связаться с администратором: <b>{admin_contact_text()}</b>",
+        reply_markup=admin_contact_markup() or MAIN_MENU,
+    )
+
+
+@dp.message(Command("my_payments"))
+async def my_payments(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    rows = list_payments(telegram_id, 10)
+    if not rows:
+        await message.answer("💳 История оплат пока пустая.", reply_markup=MAIN_MENU)
+        return
+    await message.answer(
+        "💳 <b>Мои оплаты</b>\n\n" + "\n".join(payment_line(row) for row in rows),
+        reply_markup=MAIN_MENU,
+    )
+
 @dp.message(Command("my_subscription", "subscription"))
 async def my_subscription(message: Message) -> None:
     telegram_id = upsert_from_message(message)
@@ -2651,7 +2801,7 @@ async def admin_users(message: Message) -> None:
     await message.answer(
         "👥 <b>Пользователи</b>\n\n"
         + "\n".join(lines)
-        + "\n\nКоманды: <code>/extend ID 30</code>, <code>/block ID</code>, <code>/unblock ID</code>",
+        + "\n\nКоманды: <code>/extend ID 30</code>, <code>/paid ID сумма дни</code>, <code>/payments</code>",
         reply_markup=MAIN_MENU,
     )
 
@@ -2670,6 +2820,8 @@ async def admin_user_info(message: Message) -> None:
     user = db.get_user(target)
     username_text = f"@{escape(str(user['username']))}" if user and user['username'] else "—"
     shop_text = f"<code>{user['default_shop_id']}</code>" if user and user['default_shop_id'] else "—"
+    payments = list_payments(target, 5)
+    payments_text = "\n".join(payment_line(p) for p in payments) if payments else "—"
     await message.answer(
         "👤 <b>Пользователь</b>\n\n"
         f"ID: <code>{target}</code>\n"
@@ -2678,7 +2830,8 @@ async def admin_user_info(message: Message) -> None:
         f"Магазин: {shop_text}\n"
         f"Статус: {subscription_status_text(target)}\n"
         f"Trial до: <b>{_fmt_dt(row.get('trial_until'))}</b>\n"
-        f"Оплачено до: <b>{_fmt_dt(row.get('subscription_until'))}</b>",
+        f"Оплачено до: <b>{_fmt_dt(row.get('subscription_until'))}</b>\n\n"
+        f"💳 Последние оплаты:\n{payments_text}",
         reply_markup=MAIN_MENU,
     )
 
@@ -2709,6 +2862,136 @@ async def admin_extend(message: Message) -> None:
     except Exception:
         pass
 
+
+
+
+@dp.message(Command("paid"))
+async def admin_paid(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    parts = parse_args(message.text or "").split(maxsplit=3)
+    if len(parts) < 3 or not parts[0].isdigit() or not parts[1].replace("_", "").isdigit() or not parts[2].isdigit():
+        await message.answer(
+            "Напишите так: <code>/paid TELEGRAM_ID СУММА ДНИ комментарий</code>\n"
+            "Пример: <code>/paid 123456789 250000 30 чек Click</code>",
+            reply_markup=MAIN_MENU,
+        )
+        return
+    target = int(parts[0])
+    amount = int(parts[1].replace("_", ""))
+    days = int(parts[2])
+    comment = parts[3] if len(parts) > 3 else "ручная оплата"
+    new_until = extend_subscription_days(target, days)
+    payment_id = record_payment(target, amount, days, admin_id, comment)
+    amount_text = f"{amount:,}".replace(",", " ")
+    await message.answer(
+        f"✅ Оплата записана #{payment_id}\n"
+        f"Пользователь: <code>{target}</code>\n"
+        f"Сумма: <b>{amount_text}</b> сум\n"
+        f"Продление: <b>{days}</b> дней\n"
+        f"Доступ до: <b>{_fmt_dt(new_until)}</b>",
+        reply_markup=MAIN_MENU,
+    )
+    try:
+        await bot.send_message(
+            target,
+            "✅ <b>Оплата подтверждена</b>\n\n"
+            f"Подписка продлена на <b>{days}</b> дней.\n"
+            f"Доступ активен до: <b>{_fmt_dt(new_until)}</b>\n\n"
+            "Спасибо за оплату!",
+            reply_markup=MAIN_MENU,
+        )
+    except Exception:
+        pass
+
+
+@dp.message(Command("paid1"))
+async def admin_paid_1_month(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    arg = parse_args(message.text or "").split(maxsplit=1)
+    if not arg or not arg[0].isdigit():
+        await message.answer("Напишите так: <code>/paid1 TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        return
+    target = int(arg[0])
+    new_until = extend_subscription_days(target, 30)
+    payment_id = record_payment(target, 250000, 30, admin_id, "1 месяц")
+    await message.answer(f"✅ Оплата #{payment_id}: 250 000 сум. Доступ для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+    try:
+        await bot.send_message(target, f"✅ Оплата подтверждена. Подписка продлена на 1 месяц. Доступ до: <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+    except Exception:
+        pass
+
+
+@dp.message(Command("paid3"))
+async def admin_paid_3_months(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    arg = parse_args(message.text or "").split(maxsplit=1)
+    if not arg or not arg[0].isdigit():
+        await message.answer("Напишите так: <code>/paid3 TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        return
+    target = int(arg[0])
+    new_until = extend_subscription_days(target, 90)
+    payment_id = record_payment(target, 650000, 90, admin_id, "3 месяца")
+    await message.answer(f"✅ Оплата #{payment_id}: 650 000 сум. Доступ для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+    try:
+        await bot.send_message(target, f"✅ Оплата подтверждена. Подписка продлена на 3 месяца. Доступ до: <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+    except Exception:
+        pass
+
+
+@dp.message(Command("paid6"))
+async def admin_paid_6_months(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    arg = parse_args(message.text or "").split(maxsplit=1)
+    if not arg or not arg[0].isdigit():
+        await message.answer("Напишите так: <code>/paid6 TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        return
+    target = int(arg[0])
+    new_until = extend_subscription_days(target, 180)
+    payment_id = record_payment(target, 1200000, 180, admin_id, "6 месяцев")
+    await message.answer(f"✅ Оплата #{payment_id}: 1 200 000 сум. Доступ для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+    try:
+        await bot.send_message(target, f"✅ Оплата подтверждена. Подписка продлена на 6 месяцев. Доступ до: <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+    except Exception:
+        pass
+
+
+@dp.message(Command("payments"))
+async def admin_payments(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    args = parse_args(message.text or "").split()
+    target = int(args[0]) if args and args[0].isdigit() else None
+    rows = list_payments(target, 20)
+    if not rows:
+        await message.answer("💳 История оплат пока пустая.", reply_markup=MAIN_MENU)
+        return
+    title = f"💳 <b>Оплаты пользователя <code>{target}</code></b>" if target else "💳 <b>Последние оплаты</b>"
+    await message.answer(title + "\n\n" + "\n".join(payment_line(row) for row in rows), reply_markup=MAIN_MENU)
+
+
+@dp.message(Command("backup_db"))
+async def admin_backup_db(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    path = Path(DB_PATH)
+    if not path.exists():
+        await message.answer(f"❌ База не найдена: <code>{escape(str(path))}</code>", reply_markup=MAIN_MENU)
+        return
+    await message.answer("📦 Отправляю резервную копию базы. Храните файл аккуратно — там данные пользователей.", reply_markup=MAIN_MENU)
+    try:
+        await message.answer_document(FSInputFile(str(path), filename=f"bot_backup_{datetime.now(UZT).strftime('%Y%m%d_%H%M')}.db"))
+    except Exception as e:
+        await send_api_error(message, e)
 
 @dp.message(Command("trial"))
 async def admin_trial(message: Message) -> None:
