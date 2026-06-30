@@ -21,6 +21,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, PatternFill
 
 from db import Database, TokenCipher
 from formatters import (
@@ -85,17 +86,18 @@ STOCK_CHANGE_CHECK_INTERVAL_SECONDS = int(
     os.getenv("STOCK_CHANGE_CHECK_INTERVAL_SECONDS", "300") or "300"
 )
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "3") or "3")
-SUBSCRIPTION_PRICE_TEXT = os.getenv("SUBSCRIPTION_PRICE_TEXT", "99 000 сум / 1 месяц").strip()
+SUBSCRIPTION_PRICE_TEXT = os.getenv("SUBSCRIPTION_PRICE_TEXT", "250 000 сум / 1 месяц").strip()
 PAYMENT_TEXT = os.getenv(
     "PAYMENT_TEXT",
     "Нажмите кнопку ниже, напишите администратору и отправьте чек. После проверки доступ будет продлён."
 ).strip()
 SUBSCRIPTION_PLANS_TEXT = os.getenv(
     "SUBSCRIPTION_PLANS_TEXT",
-    "1 месяц — 99 000 сум\n3 месяца — 249 000 сум\n6 месяцев — 449 000 сум"
+    "1 месяц — 250 000 сум\n3 месяца — 650 000 сум\n6 месяцев — 1 200 000 сум\n\nБез ограничений по количеству магазинов продавца"
 ).strip()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "azmt_one").strip().lstrip("@")
 ADMIN_CONTACT_URL = os.getenv("ADMIN_CONTACT_URL", "").strip()
+REPORT_INVOICE_PRODUCT_LIMIT = int(os.getenv("REPORT_INVOICE_PRODUCT_LIMIT", "10") or "10")
 
 def _parse_admin_ids() -> set[int]:
     values: list[str] = []
@@ -397,7 +399,8 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton(text="📊 Сегодня"), KeyboardButton(text="📆 Вчера")],
         [KeyboardButton(text="🗓 7 дней"), KeyboardButton(text="📅 30 дней")],
         [KeyboardButton(text="📦 Остатки"), KeyboardButton(text="⚠️ Заканчивается")],
-        [KeyboardButton(text="🧭 Потерянные"), KeyboardButton(text="💎 Подписка")],
+        [KeyboardButton(text="🧭 Потерянные"), KeyboardButton(text="📄 Накладные FBO")],
+        [KeyboardButton(text="📊 Excel отчёт"), KeyboardButton(text="💎 Подписка")],
         [KeyboardButton(text="⚙️ Статус"), KeyboardButton(text="ℹ️ Помощь")],
     ],
     resize_keyboard=True,
@@ -591,6 +594,8 @@ async def start(message: Message) -> None:
         "📦 остатки FBO/FBS/DBS\n"
         "⚠️ товары, которые заканчиваются\n"
         "🧭 потерянные товары по данным Uzum\n"
+        "📄 FBO-накладные и состав поставки\n"
+        "📊 подробный Excel-отчёт по продажам, остаткам и накладным\n"
         "🔔 уведомления о продажах и изменении остатков\n\n"
         f"Uzum API: {connected}\n"
         f"Доступ: {sub_line}\n\n"
@@ -599,7 +604,8 @@ async def start(message: Message) -> None:
         "2. Отправьте свой Uzum Seller OpenAPI token\n"
         "3. Нажмите <b>📊 Сегодня</b> или <b>📦 Остатки</b>\n\n"
         "Не знаете, где взять токен? Напишите <code>/api_token</code>.\n"
-        "Подписка и оплата: <code>/subscribe</code>."
+        "Подписка и оплата: <code>/subscribe</code>.\n"
+        "Подробный Excel-отчёт: <code>/report_excel</code>."
         + admin_part,
         reply_markup=MAIN_MENU,
     )
@@ -1727,6 +1733,327 @@ async def lost_goods(message: Message) -> None:
         await send_api_error(message, e)
 
 
+# --- FBO Invoice / накладные поставки ---
+def _extract_list_any(data: Any) -> list[Any]:
+    """Достаём список из разных форматов ответа Uzum API."""
+    if isinstance(data, list):
+        return data
+    try:
+        items = extract_items(data)
+        if isinstance(items, list) and items:
+            return items
+    except Exception:
+        pass
+    if isinstance(data, dict):
+        for key in (
+            "content", "items", "data", "result", "results", "list", "records",
+            "invoices", "invoiceList", "productList", "products",
+        ):
+            value = data.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                nested = _extract_list_any(value)
+                if nested:
+                    return nested
+    return []
+
+
+def _value_by_path(item: Any, *paths: str) -> Any:
+    if not isinstance(item, dict):
+        return None
+    for path in paths:
+        cur: Any = item
+        ok = True
+        for part in path.split("."):
+            if isinstance(cur, dict) and part in cur:
+                cur = cur.get(part)
+            else:
+                ok = False
+                break
+        if ok and cur not in (None, ""):
+            return cur
+    return None
+
+
+def _status_text_any(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(
+            value.get("text")
+            or value.get("title")
+            or value.get("name")
+            or value.get("value")
+            or "—"
+        )
+    if value in (None, ""):
+        return "—"
+    return str(value)
+
+
+def _date_text_any(value: Any) -> str:
+    if not value:
+        return "—"
+    text = str(value).strip()
+    parsed = _dt_from_db(text)
+    if parsed:
+        return _fmt_dt(parsed)
+    return text[:19].replace("T", " ")
+
+
+def _num_any(value: Any) -> float:
+    n = _num_from_value(value)
+    return float(n or 0)
+
+
+def _fmt_qty(value: Any) -> str:
+    n = _num_any(value)
+    if abs(n - int(n)) < 0.00001:
+        return str(int(n))
+    return str(round(n, 2)).rstrip("0").rstrip(".")
+
+
+async def _request_fbo_invoices(
+    client: UzumClient,
+    shop_id: int,
+    *,
+    page: int = 0,
+    size: int = 20,
+) -> Any:
+    params = [("size", int(size)), ("page", int(page))]
+    path = f"/v1/shop/{int(shop_id)}/invoice?" + urlencode(params)
+    return await client._request("GET", path)
+
+
+async def _load_fbo_invoices(
+    client: UzumClient,
+    shop_id: int,
+    *,
+    max_pages: int = 3,
+    page_size: int = 20,
+) -> tuple[list[dict[str, Any]], Any | None]:
+    rows: list[dict[str, Any]] = []
+    first_response: Any | None = None
+    for page in range(max_pages):
+        data = await _request_fbo_invoices(client, shop_id, page=page, size=page_size)
+        if first_response is None:
+            first_response = data
+        items = _extract_list_any(data)
+        if not items:
+            break
+        rows.extend([x for x in items if isinstance(x, dict)])
+        if len(items) < page_size:
+            break
+    return rows, first_response
+
+
+async def _request_fbo_invoice_products(
+    client: UzumClient,
+    shop_id: int,
+    invoice_id: int,
+) -> Any:
+    params = [("invoiceId", int(invoice_id))]
+    path = f"/v1/shop/{int(shop_id)}/invoice/products?" + urlencode(params)
+    return await client._request("GET", path)
+
+
+def _invoice_id(item: dict[str, Any]) -> Any:
+    return _value_by_path(item, "id", "invoiceId", "invoice.id")
+
+
+def _invoice_number(item: dict[str, Any]) -> str:
+    return str(
+        _value_by_path(item, "invoiceNumber", "number", "invoice.number", "deliveryCertificate")
+        or _invoice_id(item)
+        or "—"
+    )
+
+
+def _invoice_status(item: dict[str, Any]) -> str:
+    return _status_text_any(
+        _value_by_path(item, "invoiceStatus", "status", "state", "invoiceStatus.value")
+    )
+
+
+def _format_invoice_line(item: dict[str, Any], idx: int) -> str:
+    invoice_id = _invoice_id(item)
+    number = escape(_short_text(_invoice_number(item), 80))
+    status = escape(_short_text(_invoice_status(item), 60))
+    created = _date_text_any(_value_by_path(item, "dateCreated", "createdAt", "creationDate"))
+    accepted_date = _date_text_any(_value_by_path(item, "dateAccepted", "acceptedAt", "acceptanceDate"))
+    time_from = _date_text_any(_value_by_path(item, "timeSlotReservation.timeFrom", "timeFrom"))
+    time_to = _date_text_any(_value_by_path(item, "timeSlotReservation.timeTo", "timeTo"))
+    total_to_stock = _value_by_path(item, "totalToStock", "quantityToStock", "totalQuantity")
+    total_accepted = _value_by_path(item, "totalAccepted", "quantityAccepted", "acceptedQuantity")
+    full_price = _value_by_path(item, "fullPrice", "totalPrice", "price")
+
+    lines = [f"{idx}. <b>Накладная №{number}</b>"]
+    if invoice_id not in (None, ""):
+        lines.append(f"ID: <code>{escape(str(invoice_id))}</code>")
+    lines.append(f"Статус: <b>{status}</b>")
+    if created != "—":
+        lines.append(f"Создана: {escape(created)}")
+    if time_from != "—" or time_to != "—":
+        lines.append(f"Окно поставки: {escape(time_from)} — {escape(time_to)}")
+    if accepted_date != "—":
+        lines.append(f"Принята: {escape(accepted_date)}")
+    if total_to_stock not in (None, "") or total_accepted not in (None, ""):
+        lines.append(f"К поставке: <b>{_fmt_qty(total_to_stock)}</b> шт. | Принято: <b>{_fmt_qty(total_accepted)}</b> шт.")
+    if _num_any(full_price):
+        lines.append(f"Сумма: <b>{_format_money(_num_any(full_price))}</b>")
+    if invoice_id not in (None, ""):
+        lines.append(f"Состав: <code>/invoice {escape(str(invoice_id))}</code>")
+    return "\n".join(lines)
+
+
+@dp.message(Command("invoices"))
+@dp.message(Command("fbo_invoices"))
+async def fbo_invoices(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+
+    await message.answer("⌛ Загружаю FBO-накладные поставки...", reply_markup=MAIN_MENU)
+    try:
+        invoices, first_response = await _load_fbo_invoices(client, shop_id, max_pages=3, page_size=20)
+        title = "📄 <b>FBO-накладные поставки</b>"
+        if not invoices:
+            text = (
+                f"{title}\n"
+                f"Магазин: <code>{shop_id}</code>\n\n"
+                "Накладные не найдены или Uzum API вернул пустой список."
+            )
+            if first_response is not None:
+                text += "\n\nПервые данные API:\n<code>" + escape(compact_json_preview(first_response)) + "</code>"
+            await message.answer(text, reply_markup=MAIN_MENU)
+            return
+
+        lines = [
+            title,
+            f"Магазин: <code>{shop_id}</code>",
+            f"Найдено: <b>{len(invoices)}</b>",
+            "Чтобы посмотреть состав, отправьте <code>/invoice ID</code>. Например: <code>/invoice 123456</code>",
+        ]
+        for idx, item in enumerate(invoices[:50], start=1):
+            lines.append(_format_invoice_line(item, idx))
+        if len(invoices) > 50:
+            lines.append(f"Показаны первые 50 накладных из {len(invoices)}.")
+
+        for part in _split_long_message("\n\n".join(lines)):
+            await message.answer(part, reply_markup=MAIN_MENU)
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+def _format_invoice_product_line(item: dict[str, Any], idx: int) -> str:
+    product_title = _value_by_path(item, "productTitle", "title", "product.name")
+    sku_title = _value_by_path(item, "skuTitle", "sku.title", "skuName")
+    title = escape(_short_text(product_title or sku_title or "Без названия", 90))
+    sku_text = escape(_short_text(sku_title or "—", 90))
+    item_id = _value_by_path(item, "id", "skuId", "productId")
+    to_stock = _value_by_path(item, "quantityToStock", "toStock", "quantity")
+    accepted = _value_by_path(item, "quantityAccepted", "accepted", "acceptedQuantity")
+    purchase_price = _value_by_path(item, "purchasePrice", "price", "buyPrice")
+    diff = _num_any(to_stock) - _num_any(accepted)
+
+    lines = [f"{idx}. <b>{title}</b>"]
+    if item_id not in (None, ""):
+        lines.append(f"ID/SKU: <code>{escape(str(item_id))}</code>")
+    if sku_text != "—":
+        lines.append(f"SKU: {sku_text}")
+    lines.append(f"По накладной: <b>{_fmt_qty(to_stock)}</b> шт. | Принято: <b>{_fmt_qty(accepted)}</b> шт.")
+    if abs(diff) > 0.00001:
+        sign = "−" if diff > 0 else "+"
+        lines.append(f"Расхождение: <b>{sign}{_fmt_qty(abs(diff))}</b> шт.")
+    if _num_any(purchase_price):
+        lines.append(f"Закупочная цена: <b>{_format_money(_num_any(purchase_price))}</b>")
+
+    sku_list = _value_by_path(item, "skuForInvoiceDtoList", "skuList", "skus")
+    if isinstance(sku_list, list) and sku_list:
+        sku_lines: list[str] = []
+        for sku in sku_list[:3]:
+            if not isinstance(sku, dict):
+                continue
+            sku_name = escape(_short_text(_value_by_path(sku, "skuTitle", "title", "name") or "SKU", 60))
+            sku_to = _value_by_path(sku, "quantityToStock", "quantity", "toStock")
+            sku_acc = _value_by_path(sku, "quantityAccepted", "accepted", "acceptedQuantity")
+            sku_lines.append(f"• {sku_name}: {_fmt_qty(sku_to)} / принято {_fmt_qty(sku_acc)}")
+        if sku_lines:
+            if len(sku_list) > 3:
+                sku_lines.append(f"• ещё {len(sku_list) - 3} SKU")
+            lines.append("Внутри:\n" + "\n".join(sku_lines))
+    return "\n".join(lines)
+
+
+@dp.message(Command("invoice"))
+@dp.message(Command("invoice_products"))
+async def fbo_invoice_products(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+    arg = parse_args(message.text or "")
+    if not arg or not arg.split()[0].isdigit():
+        await message.answer(
+            "📄 <b>Состав FBO-накладной</b>\n\n"
+            "Сначала откройте список накладных: <code>/invoices</code>\n"
+            "Потом отправьте команду с ID накладной. Например:\n"
+            "<code>/invoice 123456</code>",
+            reply_markup=MAIN_MENU,
+        )
+        return
+    invoice_id = int(arg.split()[0])
+
+    await message.answer(f"⌛ Загружаю состав накладной <code>{invoice_id}</code>...", reply_markup=MAIN_MENU)
+    try:
+        data = await _request_fbo_invoice_products(client, shop_id, invoice_id)
+        products = [x for x in _extract_list_any(data) if isinstance(x, dict)]
+        title = "📦 <b>Состав FBO-накладной</b>"
+        if not products:
+            await message.answer(
+                f"{title}\n"
+                f"Магазин: <code>{shop_id}</code>\n"
+                f"Накладная ID: <code>{invoice_id}</code>\n\n"
+                "Товары не найдены или API вернул пустой состав.\n\n"
+                "Ответ API:\n<code>" + escape(compact_json_preview(data)) + "</code>",
+                reply_markup=MAIN_MENU,
+            )
+            return
+
+        total_to_stock = sum(_num_any(_value_by_path(x, "quantityToStock", "toStock", "quantity")) for x in products)
+        total_accepted = sum(_num_any(_value_by_path(x, "quantityAccepted", "accepted", "acceptedQuantity")) for x in products)
+        diff = total_to_stock - total_accepted
+        total_purchase = sum(
+            _num_any(_value_by_path(x, "purchasePrice", "price", "buyPrice"))
+            * _num_any(_value_by_path(x, "quantityToStock", "toStock", "quantity"))
+            for x in products
+        )
+
+        lines = [
+            title,
+            f"Магазин: <code>{shop_id}</code>",
+            f"Накладная ID: <code>{invoice_id}</code>",
+            f"Позиций: <b>{len(products)}</b>",
+            f"По накладной: <b>{_fmt_qty(total_to_stock)}</b> шт.",
+            f"Принято: <b>{_fmt_qty(total_accepted)}</b> шт.",
+        ]
+        if abs(diff) > 0.00001:
+            sign = "−" if diff > 0 else "+"
+            lines.append(f"Расхождение: <b>{sign}{_fmt_qty(abs(diff))}</b> шт.")
+        if total_purchase:
+            lines.append(f"Сумма по закупочной цене: <b>{_format_money(total_purchase)}</b>")
+
+        for idx, item in enumerate(products[:80], start=1):
+            lines.append(_format_invoice_product_line(item, idx))
+        if len(products) > 80:
+            lines.append(f"Показаны первые 80 позиций из {len(products)}.")
+
+        for part in _split_long_message("\n\n".join(lines)):
+            await message.answer(part, reply_markup=MAIN_MENU)
+    except Exception as e:
+        await send_api_error(message, e)
+
+
 @dp.message(Command("sales"))
 async def sales(message: Message) -> None:
     req = await require_connection(message)
@@ -2263,14 +2590,18 @@ async def subscribe(message: Message) -> None:
 async def api_token_help(message: Message) -> None:
     upsert_from_message(message)
     await message.answer(
-        "🔑 <b>Где взять Uzum Seller OpenAPI token</b>\n\n"
-        "Обычно это делается так:\n"
-        "1. Откройте кабинет продавца Uzum Seller.\n"
-        "2. Найдите раздел настроек или интеграций OpenAPI.\n"
-        "3. Создайте или скопируйте API-токен.\n"
-        "4. Вернитесь в этот бот и нажмите <code>/connect</code>.\n"
-        "5. Отправьте токен одним сообщением.\n\n"
-        "Важно: не отправляйте токен посторонним. Бот сохранит его в зашифрованном виде и постарается удалить сообщение с токеном после проверки.",
+        "🔑 <b>Где взять Uzum Seller API-ключ</b>\n\n"
+        "Инструкция:\n"
+        "1. Зайдите в кабинет продавца <b>Uzum Seller</b>.\n"
+        "2. Нажмите на свой профиль / аватарку в правом верхнем углу.\n"
+        "3. Откройте раздел <b>Мой профиль</b>.\n"
+        "4. Нажмите <b>Ключи API</b>.\n"
+        "5. Нажмите <b>Создать ключ</b>.\n"
+        "6. Скопируйте созданный API-ключ.\n"
+        "7. Вернитесь в этот бот и нажмите <code>/connect</code>.\n"
+        "8. Отправьте API-ключ одним сообщением.\n\n"
+        "⚠️ <b>Важно:</b> не отправляйте API-ключ посторонним. "
+        "Бот сохранит его в зашифрованном виде и постарается удалить сообщение с ключом после проверки.",
         reply_markup=MAIN_MENU,
     )
 
@@ -2515,6 +2846,334 @@ async def export_products(message: Message) -> None:
         wb.save(filename)
         await message.answer(f"✅ Экспортировано SKU-остатков: {len(rows)}", reply_markup=MAIN_MENU)
         await message.answer_document(FSInputFile(filename))
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+# --- Подробный Excel-отчёт ---
+def _excel_style_sheet(ws, *, freeze: str = "A2") -> None:
+    header_fill = PatternFill("solid", fgColor="D9EAF7")
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.fill = header_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    if freeze:
+        ws.freeze_panes = freeze
+    try:
+        ws.auto_filter.ref = ws.dimensions
+    except Exception:
+        pass
+    for row in ws.iter_rows():
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+
+
+def _excel_autowidth(ws, *, min_width: int = 10, max_width: int = 45) -> None:
+    for column in ws.columns:
+        letter = column[0].column_letter
+        max_len = 0
+        for cell in column:
+            value = cell.value
+            if value is None:
+                continue
+            text = str(value)
+            max_len = max(max_len, max(len(line) for line in text.splitlines() or [text]))
+        ws.column_dimensions[letter].width = min(max(max_len + 2, min_width), max_width)
+
+
+def _excel_money_format(ws, columns: tuple[str, ...], start_row: int = 2) -> None:
+    for col in columns:
+        for cell in ws[col][start_row - 1:]:
+            cell.number_format = '#,##0'
+
+
+def _finance_date_for_excel(item: dict[str, Any]) -> str:
+    value = pick(
+        item,
+        "createdAt",
+        "dateCreated",
+        "orderDate",
+        "date",
+        "created",
+        "paymentDate",
+        "updatedAt",
+    )
+    if isinstance(value, dict):
+        value = pick(value, "date", "value", "createdAt")
+    return _date_text_any(value)
+
+
+def _finance_order_id_for_excel(item: dict[str, Any]) -> str:
+    value = pick(
+        item,
+        "id",
+        "orderId",
+        "order_id",
+        "postingNumber",
+        "operationId",
+        "financeOrderId",
+        "number",
+    )
+    if value in (None, ""):
+        return "—"
+    return str(value)
+
+
+def _finance_sku_for_excel(item: dict[str, Any]) -> str:
+    value = pick(
+        item,
+        "skuTitle",
+        "skuName",
+        "skuId",
+        "barcode",
+        "productId",
+        "sellerSku",
+        "offerId",
+    )
+    if isinstance(value, dict):
+        value = pick(value, "title", "name", "id", "value")
+    return str(value or "—")
+
+
+def _report_periods_ms() -> list[tuple[str, tuple[int, int]]]:
+    return [
+        ("Сегодня", _today_range_ms()),
+        ("Вчера", _yesterday_range_ms()),
+        ("7 дней", _last_7_days_range_ms()),
+        ("30 дней", _days_range_ms(30)),
+    ]
+
+
+async def _build_full_excel_report(client: UzumClient, shop_id: int) -> Path:
+    generated_at = datetime.now(UZT).strftime("%Y-%m-%d_%H-%M")
+
+    # 1) Продажи по периодам
+    finance_by_period: dict[str, list[dict[str, Any]]] = {}
+    stats_by_period: dict[str, dict[str, Any]] = {}
+    for label, (date_from, date_to) in _report_periods_ms():
+        rows, _, _ = await _load_finance_range_flexible(client, shop_id, date_from, date_to)
+        finance_by_period[label] = rows
+        stats_by_period[label] = _build_noorza_today_stats(rows)
+        await asyncio.sleep(0.1)
+
+    # 2) Остатки / потерянные
+    stock_rows = await load_sku_rows(client, shop_id, max_pages=50)
+    low_stock_rows = []
+    missing_rows = []
+    for r in stock_rows:
+        total = _num_any(r.get("total"))
+        fbo = _num_any(r.get("fbo"))
+        fbs = _num_any(r.get("fbs"))
+        missing = _num_any(r.get("missing"))
+        active = r.get("active")
+        if missing > 0:
+            missing_rows.append(r)
+        if active is not False and total <= LOW_STOCK_THRESHOLD and (fbo + fbs + total) >= 0:
+            low_stock_rows.append(r)
+
+    # 3) FBO накладные и состав первых накладных
+    invoices, _ = await _load_fbo_invoices(client, shop_id, max_pages=3, page_size=20)
+    invoice_product_rows: list[tuple[Any, dict[str, Any]]] = []
+    for item in invoices[:max(0, REPORT_INVOICE_PRODUCT_LIMIT)]:
+        invoice_id = _invoice_id(item)
+        if invoice_id in (None, ""):
+            continue
+        try:
+            data = await _request_fbo_invoice_products(client, shop_id, int(invoice_id))
+            products = [x for x in _extract_list_any(data) if isinstance(x, dict)]
+            for p in products:
+                invoice_product_rows.append((invoice_id, p))
+            await asyncio.sleep(0.1)
+        except Exception:
+            logging.exception("Excel report: failed to load invoice products for %s", invoice_id)
+            continue
+
+    wb = Workbook()
+
+    # Лист 1: Сводка
+    ws = wb.active
+    ws.title = "Сводка"
+    ws.append(["Показатель", "Значение"])
+    ws.append(["Магазин", shop_id])
+    ws.append(["Дата создания отчёта", datetime.now(UZT).strftime("%d.%m.%Y %H:%M")])
+    ws.append(["Период продаж в деталях", "30 дней"])
+    ws.append(["SKU в остатках", len(stock_rows)])
+    ws.append(["SKU заканчиваются", len(low_stock_rows)])
+    ws.append(["SKU с потерями", len(missing_rows)])
+    ws.append(["FBO накладных найдено", len(invoices)])
+    ws.append(["Состав накладных загружен", f"для первых {min(len(invoices), max(0, REPORT_INVOICE_PRODUCT_LIMIT))} накладных"])
+    ws.append([])
+    ws.append(["Период", "Позиций", "Товаров, шт", "Возвраты, шт", "Выручка", "Комиссия Uzum", "Логистика", "К выплате", "Уже выведено", "Остаток к выплате", "Статусы"])
+    for label in ("Сегодня", "Вчера", "7 дней", "30 дней"):
+        st = stats_by_period.get(label, {})
+        statuses = st.get("statuses") or {}
+        status_text = "; ".join(f"{k}: {v}" for k, v in sorted(statuses.items()))
+        ws.append([
+            label,
+            int(st.get("rows") or 0),
+            float(st.get("units") or 0),
+            float(st.get("returns") or 0),
+            float(st.get("revenue") or 0),
+            float(st.get("commission") or 0),
+            float(st.get("logistics") or 0),
+            float(st.get("payout_total") or 0),
+            float(st.get("withdrawn") or 0),
+            float(st.get("left_to_withdraw") or 0),
+            status_text,
+        ])
+    _excel_style_sheet(ws)
+    _excel_money_format(ws, ("E", "F", "G", "H", "I", "J"), start_row=12)
+    _excel_autowidth(ws, max_width=55)
+
+    # Лист 2: Продажи 30 дней
+    ws = wb.create_sheet("Продажи 30 дней")
+    ws.append(["Дата", "Статус", "ID заказа/операции", "Товар", "SKU/код", "Кол-во", "Выручка", "Комиссия", "Логистика", "К выплате", "Выведено", "Сырой фрагмент"])
+    for item in finance_by_period.get("30 дней", []):
+        gross = _finance_gross_revenue(item)
+        comm = _finance_commission(item)
+        logi = _finance_logistics(item)
+        direct = _finance_payout_direct(item)
+        payout = direct if direct is not None else max(0.0, gross - comm - logi)
+        ws.append([
+            _finance_date_for_excel(item),
+            _finance_status(item),
+            _finance_order_id_for_excel(item),
+            _finance_title(item),
+            _finance_sku_for_excel(item),
+            _finance_qty(item),
+            gross,
+            comm,
+            logi,
+            max(0.0, payout),
+            _finance_withdrawn(item),
+            compact_json_preview(item, limit=700),
+        ])
+    _excel_style_sheet(ws)
+    _excel_money_format(ws, ("G", "H", "I", "J", "K"))
+    _excel_autowidth(ws, max_width=60)
+
+    # Лист 3: Остатки
+    ws = wb.create_sheet("Остатки")
+    ws.append(["Product ID", "SKU ID", "Barcode", "Код продавца", "Категория", "Товар", "SKU", "Цена", "FBO", "FBS/DBS", "Итого", "Активно", "Продано", "Возвраты", "Потеряно", "Брак", "Ожидает", "Статус"])
+    for r in stock_rows:
+        ws.append([
+            excel_value(r.get("product_id")), excel_value(r.get("sku_id")), excel_value(r.get("barcode")),
+            excel_value(r.get("seller_item_code")), excel_value(r.get("category")), excel_value(r.get("product_title")),
+            excel_value(r.get("sku_full_title") or r.get("sku_title")), excel_value(r.get("price")), excel_value(r.get("fbo")),
+            excel_value(r.get("fbs")), excel_value(r.get("total")), excel_value(r.get("active")), excel_value(r.get("sold")),
+            excel_value(r.get("returned")), excel_value(r.get("missing")), excel_value(r.get("defected")), excel_value(r.get("pending")),
+            excel_value(status_display(r.get("status")) if r.get("status") else ""),
+        ])
+    _excel_style_sheet(ws)
+    _excel_money_format(ws, ("H",))
+    _excel_autowidth(ws, max_width=55)
+
+    # Лист 4: Заканчивается
+    ws = wb.create_sheet("Заканчивается")
+    ws.append(["Product ID", "SKU ID", "Товар", "SKU", "Цена", "FBO", "FBS/DBS", "Итого", "Порог", "Статус"])
+    for r in sorted(low_stock_rows, key=lambda x: _num_any(x.get("total"))):
+        ws.append([
+            excel_value(r.get("product_id")), excel_value(r.get("sku_id")), excel_value(r.get("product_title")),
+            excel_value(r.get("sku_full_title") or r.get("sku_title")), excel_value(r.get("price")), excel_value(r.get("fbo")),
+            excel_value(r.get("fbs")), excel_value(r.get("total")), LOW_STOCK_THRESHOLD,
+            excel_value(status_display(r.get("status")) if r.get("status") else ""),
+        ])
+    _excel_style_sheet(ws)
+    _excel_money_format(ws, ("E",))
+    _excel_autowidth(ws, max_width=55)
+
+    # Лист 5: Потерянные
+    ws = wb.create_sheet("Потерянные")
+    ws.append(["Product ID", "SKU ID", "Товар", "SKU", "Цена", "Потеряно", "Примерная сумма", "FBO", "FBS/DBS", "Итого", "Статус"])
+    for r in sorted(missing_rows, key=lambda x: _num_any(x.get("missing")), reverse=True):
+        price = _num_any(r.get("price"))
+        missing = _num_any(r.get("missing"))
+        ws.append([
+            excel_value(r.get("product_id")), excel_value(r.get("sku_id")), excel_value(r.get("product_title")),
+            excel_value(r.get("sku_full_title") or r.get("sku_title")), price, missing, price * missing,
+            excel_value(r.get("fbo")), excel_value(r.get("fbs")), excel_value(r.get("total")),
+            excel_value(status_display(r.get("status")) if r.get("status") else ""),
+        ])
+    _excel_style_sheet(ws)
+    _excel_money_format(ws, ("E", "G"))
+    _excel_autowidth(ws, max_width=55)
+
+    # Лист 6: FBO накладные
+    ws = wb.create_sheet("FBO накладные")
+    ws.append(["ID", "Номер", "Статус", "Создана", "Окно от", "Окно до", "Принята", "К поставке", "Принято", "Расхождение", "Сумма"])
+    for item in invoices:
+        to_stock = _num_any(_value_by_path(item, "totalToStock", "quantityToStock", "totalQuantity"))
+        accepted = _num_any(_value_by_path(item, "totalAccepted", "quantityAccepted", "acceptedQuantity"))
+        ws.append([
+            excel_value(_invoice_id(item)),
+            excel_value(_invoice_number(item)),
+            excel_value(_invoice_status(item)),
+            excel_value(_date_text_any(_value_by_path(item, "dateCreated", "createdAt", "creationDate"))),
+            excel_value(_date_text_any(_value_by_path(item, "timeSlotReservation.timeFrom", "timeFrom"))),
+            excel_value(_date_text_any(_value_by_path(item, "timeSlotReservation.timeTo", "timeTo"))),
+            excel_value(_date_text_any(_value_by_path(item, "dateAccepted", "acceptedAt", "acceptanceDate"))),
+            to_stock,
+            accepted,
+            to_stock - accepted,
+            _num_any(_value_by_path(item, "fullPrice", "totalPrice", "price")),
+        ])
+    _excel_style_sheet(ws)
+    _excel_money_format(ws, ("K",))
+    _excel_autowidth(ws, max_width=55)
+
+    # Лист 7: Состав накладных
+    ws = wb.create_sheet("Состав накладных")
+    ws.append(["Invoice ID", "Product/SKU ID", "Товар", "SKU", "По накладной", "Принято", "Расхождение", "Закупочная цена", "Сумма по накладной"])
+    for invoice_id, item in invoice_product_rows:
+        to_stock = _num_any(_value_by_path(item, "quantityToStock", "toStock", "quantity"))
+        accepted = _num_any(_value_by_path(item, "quantityAccepted", "accepted", "acceptedQuantity"))
+        price = _num_any(_value_by_path(item, "purchasePrice", "price", "buyPrice"))
+        ws.append([
+            excel_value(invoice_id),
+            excel_value(_value_by_path(item, "id", "skuId", "productId")),
+            excel_value(_value_by_path(item, "productTitle", "title", "product.name")),
+            excel_value(_value_by_path(item, "skuTitle", "sku.title", "skuName")),
+            to_stock,
+            accepted,
+            to_stock - accepted,
+            price,
+            price * to_stock,
+        ])
+    _excel_style_sheet(ws)
+    _excel_money_format(ws, ("H", "I"))
+    _excel_autowidth(ws, max_width=55)
+
+    tmp_dir = Path(tempfile.gettempdir())
+    filename = tmp_dir / f"uzum_full_report_{shop_id}_{generated_at}.xlsx"
+    wb.save(filename)
+    return filename
+
+
+@dp.message(Command("report_excel"))
+@dp.message(Command("report"))
+@dp.message(Command("full_report"))
+async def report_excel(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+
+    await message.answer(
+        "⌛ Готовлю подробный Excel-отчёт...\n"
+        "Это может занять 20–60 секунд: собираю продажи, остатки и FBO-накладные.",
+        reply_markup=MAIN_MENU,
+    )
+    try:
+        filename = await _build_full_excel_report(client, shop_id)
+        await message.answer_document(
+            FSInputFile(filename),
+            caption=(
+                "✅ <b>Подробный Excel-отчёт готов</b>\n\n"
+                "Внутри листы: Сводка, Продажи 30 дней, Остатки, Заканчивается, "
+                "Потерянные, FBO накладные, Состав накладных."
+            ),
+            reply_markup=MAIN_MENU,
+        )
     except Exception as e:
         await send_api_error(message, e)
 
@@ -3261,6 +3920,11 @@ async def button_lost(message: Message) -> None:
     await lost_goods(message)
 
 
+@dp.message(F.text == "📄 Накладные FBO")
+async def button_fbo_invoices(message: Message) -> None:
+    await fbo_invoices(message)
+
+
 @dp.message(F.text == "💎 Подписка")
 async def button_subscription(message: Message) -> None:
     await subscribe(message)
@@ -3347,9 +4011,10 @@ async def button_orders(message: Message) -> None:
     await orders(message)
 
 
+@dp.message(F.text == "📊 Excel отчёт")
 @dp.message(F.text == "📄 Excel-отчёт")
-async def button_export_products(message: Message) -> None:
-    await export_products(message)
+async def button_excel_report(message: Message) -> None:
+    await report_excel(message)
 
 
 @dp.message(F.text == "⚙️ Статус")
