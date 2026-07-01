@@ -480,6 +480,97 @@ def subscription_compact_line(row: dict[str, Any]) -> str:
     return f"{status_label} <code>{telegram_id}</code> — {escape(str(label))} | до: {_fmt_dt(until_value)}"
 
 
+def _subscription_until_for_row(row: dict[str, Any]) -> datetime | None:
+    return subscription_active_until(row)
+
+
+def get_admin_stats() -> dict[str, int]:
+    now = _utc_now()
+    with db.connect() as conn:
+        total_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        connected = conn.execute("SELECT COUNT(*) FROM users WHERE uzum_token_encrypted IS NOT NULL").fetchone()[0]
+        rows = conn.execute("SELECT telegram_id, trial_until, subscription_until, blocked FROM subscriptions").fetchall()
+        payments_today = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM payment_history WHERE created_at >= ?",
+            (_dt_to_db(now.replace(hour=0, minute=0, second=0, microsecond=0)),),
+        ).fetchone()[0]
+        payments_30 = conn.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM payment_history WHERE created_at >= ?",
+            (_dt_to_db(now - timedelta(days=30)),),
+        ).fetchone()[0]
+    active = paid = trial = expired = blocked = 0
+    for r in rows:
+        row = dict(r)
+        if int(row.get("blocked") or 0) == 1:
+            blocked += 1
+            continue
+        until = subscription_active_until(row)
+        if until and until > now:
+            active += 1
+            paid_until = _dt_from_db(row.get("subscription_until"))
+            if paid_until and paid_until == until:
+                paid += 1
+            else:
+                trial += 1
+        else:
+            expired += 1
+    return {
+        "total_users": int(total_users or 0),
+        "connected": int(connected or 0),
+        "active": active,
+        "paid": paid,
+        "trial": trial,
+        "expired": expired,
+        "blocked": blocked,
+        "payments_today": int(payments_today or 0),
+        "payments_30": int(payments_30 or 0),
+    }
+
+
+def list_expiring_users(days: int = 3, limit: int = 50) -> list[dict[str, Any]]:
+    now = _utc_now()
+    until_limit = now + timedelta(days=max(1, int(days)))
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT u.telegram_id, u.username, u.first_name, u.default_shop_id,
+                   s.trial_until, s.subscription_until, s.blocked
+            FROM subscriptions s
+            LEFT JOIN users u ON u.telegram_id = s.telegram_id
+            WHERE s.blocked = 0
+            ORDER BY COALESCE(s.subscription_until, s.trial_until) ASC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    result: list[dict[str, Any]] = []
+    for r in rows:
+        row = dict(r)
+        if is_admin(int(row.get("telegram_id") or 0)):
+            continue
+        until = subscription_active_until(row)
+        if until and now < until <= until_limit:
+            result.append(row)
+    return result
+
+
+def list_blocked_users(limit: int = 50) -> list[dict[str, Any]]:
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT u.telegram_id, u.username, u.first_name, u.default_shop_id,
+                   s.trial_until, s.subscription_until, s.blocked
+            FROM subscriptions s
+            LEFT JOIN users u ON u.telegram_id = s.telegram_id
+            WHERE s.blocked = 1
+            ORDER BY s.updated_at DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 init_subscription_tables()
 init_business_tables()
 
@@ -496,10 +587,22 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="🧭 Потерянные")],
         [KeyboardButton(text="📄 Накладные FBO"), KeyboardButton(text="📊 Excel отчёт")],
         [KeyboardButton(text="🌙 Утренний отчёт"), KeyboardButton(text="💎 Подписка")],
-        [KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="👑 Админ"), KeyboardButton(text="ℹ️ Помощь")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите действие",
+)
+
+
+ADMIN_PANEL_MENU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="💳 Оплаты")],
+        [KeyboardButton(text="⏳ Скоро заканчиваются"), KeyboardButton(text="⛔ Заблокированные")],
+        [KeyboardButton(text="✅ Проверить подключение"), KeyboardButton(text="📦 Бэкап базы")],
+        [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="⬅️ Главное меню")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Админ-панель",
 )
 
 # Для совместимости: старые обработчики разделов могут ссылаться на эти переменные.
@@ -562,10 +665,36 @@ async def require_connection(message: Message) -> tuple[int, UzumClient, int] | 
 
 
 async def send_api_error(message: Message, error: Exception) -> None:
-    text = escape(str(error))
-    if len(text) > 3500:
-        text = text[:3500] + "\n..."
-    await message.answer(f"⚠️ Ошибка API:\n<code>{text}</code>", reply_markup=MAIN_MENU)
+    raw = str(error)
+    low = raw.lower()
+    if "401" in raw or "unauthorized" in low:
+        user_text = (
+            "🔐 <b>Uzum API-ключ не принят</b>\n\n"
+            "Возможно, ключ неверный, удалён или истёк.\n"
+            "Создайте новый ключ в кабинете Uzum Seller и подключите его через <code>/reconnect</code>."
+        )
+    elif "403" in raw or "rbac" in low or "forbidden" in low:
+        user_text = (
+            "⛔ <b>Нет доступа к этому методу Uzum API</b>\n\n"
+            "Проверьте права API-ключа в кабинете Uzum Seller.\n"
+            "Иногда отдельные методы недоступны со стороны Uzum для конкретного магазина."
+        )
+    elif "429" in raw or "too many" in low:
+        user_text = (
+            "⏳ <b>Uzum временно ограничил запросы</b>\n\n"
+            "Слишком много запросов к Uzum API. Подождите несколько минут и попробуйте снова."
+        )
+    elif "500" in raw or "502" in raw or "503" in raw or "504" in raw:
+        user_text = (
+            "⚠️ <b>Uzum API временно недоступен</b>\n\n"
+            "Это похоже на ошибку на стороне Uzum. Попробуйте позже."
+        )
+    else:
+        text = escape(raw)
+        if len(text) > 1200:
+            text = text[:1200] + "\n..."
+        user_text = f"⚠️ <b>Ошибка API</b>\n<code>{text}</code>"
+    await message.answer(user_text, reply_markup=MAIN_MENU)
 
 
 def parse_args(text: str) -> str:
@@ -2788,6 +2917,115 @@ async def my_subscription(message: Message) -> None:
     await message.answer(subscription_full_text(telegram_id), reply_markup=MAIN_MENU)
 
 
+@dp.message(Command("admin"))
+async def admin_panel(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        await message.answer("⛔ Админ-панель доступна только владельцу бота.", reply_markup=MAIN_MENU)
+        return
+    init_business_tables()
+    stats = get_admin_stats()
+    money_today = f"{stats['payments_today']:,}".replace(",", " ")
+    money_30 = f"{stats['payments_30']:,}".replace(",", " ")
+    await message.answer(
+        "👑 <b>Админ-панель</b>\n\n"
+        f"👥 Пользователей всего: <b>{stats['total_users']}</b>\n"
+        f"🔑 Подключили Uzum API: <b>{stats['connected']}</b>\n"
+        f"✅ Активных доступов: <b>{stats['active']}</b>\n"
+        f"💳 Платных: <b>{stats['paid']}</b>\n"
+        f"🎁 Trial: <b>{stats['trial']}</b>\n"
+        f"⛔ Истекли: <b>{stats['expired']}</b>\n"
+        f"🚫 Заблокированы: <b>{stats['blocked']}</b>\n\n"
+        f"💰 Оплаты сегодня: <b>{money_today}</b> сум\n"
+        f"💰 Оплаты за 30 дней: <b>{money_30}</b> сум\n\n"
+        "Быстрые команды:\n"
+        "• <code>/paid1 ID</code> — 1 месяц / 250 000 сум\n"
+        "• <code>/paid3 ID</code> — 3 месяца / 650 000 сум\n"
+        "• <code>/paid6 ID</code> — 6 месяцев / 1 200 000 сум\n"
+        "• <code>/expiring</code> — кто скоро заканчивается\n"
+        "• <code>/backup_db</code> — скачать базу",
+        reply_markup=ADMIN_PANEL_MENU,
+    )
+
+
+@dp.message(Command("check"))
+async def check_connection(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    ensure_subscription(telegram_id)
+    user = db.get_user(telegram_id)
+    client = get_uzum_for_user(telegram_id)
+    shop_id = db.get_default_shop_id(telegram_id)
+    lines = [
+        "✅ <b>Проверка подключения</b>",
+        f"Telegram ID: <code>{telegram_id}</code>",
+        f"Подписка: {subscription_status_text(telegram_id)}",
+        f"Uzum API: {'✅ подключён' if client else '❌ не подключён'}",
+        f"Активный магазин: {f'<code>{shop_id}</code>' if shop_id else '—'}",
+    ]
+    if client is None:
+        lines.append("\nЧто делать: нажмите <code>/connect</code> и отправьте Uzum API-ключ.")
+        await message.answer("\n".join(lines), reply_markup=MAIN_MENU)
+        return
+    try:
+        data = await client.get_shops()
+        shops = extract_items(data)
+        encrypted = db.get_encrypted_token(telegram_id)
+        if encrypted and shops:
+            db.save_connection(telegram_id, encrypted, shops)
+        lines.append(f"Магазинов найдено: <b>{len(shops)}</b>")
+    except Exception as e:
+        lines.append("Магазины: ❌ ошибка")
+        lines.append(f"Причина: <code>{escape(str(e))[:500]}</code>")
+        await message.answer("\n".join(lines), reply_markup=MAIN_MENU)
+        return
+    if shop_id:
+        try:
+            rows = await load_sku_rows(client, int(shop_id), max_pages=1)
+            lines.append(f"Остатки/товары: ✅ доступно, SKU строк: <b>{len(rows)}</b>")
+        except Exception as e:
+            lines.append("Остатки/товары: ❌ ошибка")
+            lines.append(f"Причина: <code>{escape(str(e))[:500]}</code>")
+        try:
+            date_from, date_to = _today_range_ms()
+            sales_rows, _ = await _load_finance_orders(client, int(shop_id), date_from_ms=date_from, date_to_ms=date_to, max_pages=1, page_size=20)
+            lines.append(f"Finance API: ✅ доступно, продаж сегодня: <b>{len(sales_rows)}</b>")
+        except Exception as e:
+            lines.append("Finance API: ❌ ошибка")
+            lines.append(f"Причина: <code>{escape(str(e))[:500]}</code>")
+    lines.append("\nЕсли здесь всё ✅ — бот готов к работе.")
+    await message.answer("\n".join(lines), reply_markup=MAIN_MENU)
+
+
+@dp.message(Command("expiring"))
+async def admin_expiring(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    rows = list_expiring_users(3, 50)
+    if not rows:
+        await message.answer("⏳ В ближайшие 3 дня подписки не заканчиваются.", reply_markup=ADMIN_PANEL_MENU)
+        return
+    await message.answer(
+        "⏳ <b>Заканчиваются в ближайшие 3 дня</b>\n\n" + "\n".join(subscription_compact_line(r) for r in rows),
+        reply_markup=ADMIN_PANEL_MENU,
+    )
+
+
+@dp.message(Command("blocked"))
+async def admin_blocked_users(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    rows = list_blocked_users(50)
+    if not rows:
+        await message.answer("⛔ Заблокированных пользователей нет.", reply_markup=ADMIN_PANEL_MENU)
+        return
+    await message.answer(
+        "⛔ <b>Заблокированные пользователи</b>\n\n" + "\n".join(subscription_compact_line(r) for r in rows),
+        reply_markup=ADMIN_PANEL_MENU,
+    )
+
+
 @dp.message(Command("users"))
 async def admin_users(message: Message) -> None:
     telegram_id = upsert_from_message(message)
@@ -4268,6 +4506,56 @@ async def stock_change_notify_status(message: Message) -> None:
 
 
 # --- Главное меню в стиле Noorza Bot ---
+@dp.message(F.text == "👑 Админ")
+async def button_admin_panel(message: Message) -> None:
+    await admin_panel(message)
+
+
+@dp.message(F.text == "👥 Пользователи")
+async def button_admin_users(message: Message) -> None:
+    await admin_users(message)
+
+
+@dp.message(F.text == "💳 Оплаты")
+async def button_admin_payments(message: Message) -> None:
+    await admin_payments(message)
+
+
+@dp.message(F.text == "⏳ Скоро заканчиваются")
+async def button_admin_expiring(message: Message) -> None:
+    await admin_expiring(message)
+
+
+@dp.message(F.text == "⛔ Заблокированные")
+async def button_admin_blocked(message: Message) -> None:
+    await admin_blocked_users(message)
+
+
+@dp.message(F.text == "📦 Бэкап базы")
+async def button_admin_backup(message: Message) -> None:
+    await admin_backup_db(message)
+
+
+@dp.message(F.text == "📢 Рассылка")
+async def button_admin_broadcast_help(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    await message.answer(
+        "📢 <b>Рассылка</b>\n\n"
+        "Чтобы отправить сообщение всем пользователям, напишите:\n"
+        "<code>/broadcast ваш текст</code>\n\n"
+        "Пример:\n"
+        "<code>/broadcast Завтра в 09:00 будет обновление бота.</code>",
+        reply_markup=ADMIN_PANEL_MENU,
+    )
+
+
+@dp.message(F.text == "✅ Проверить подключение")
+async def button_check_connection(message: Message) -> None:
+    await check_connection(message)
+
+
 @dp.message(F.text == "⬅️ Главное меню")
 @dp.message(F.text == "Меню")
 async def button_main_menu(message: Message) -> None:
