@@ -18,7 +18,7 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
+from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -299,12 +299,8 @@ async def require_active_subscription(message: Message, telegram_id: int | None 
     if has_active_subscription(int(telegram_id)):
         return True
     await message.answer(
-        "⛔ <b>Доступ ограничен</b>\n\n"
-        "Trial или подписка закончились.\n"
-        "Ваш Uzum-токен и настройки сохранены — после продления всё снова заработает.\n\n"
-        "Проверить подписку: <code>/my_subscription</code>\n"
-        "Оплата: <code>/subscribe</code>",
-        reply_markup=MAIN_MENU,
+        tr_user(int(telegram_id), "access_limited"),
+        reply_markup=menu_for_message(message),
     )
     return False
 
@@ -573,11 +569,130 @@ def list_blocked_users(limit: int = 50) -> list[dict[str, Any]]:
 
 init_subscription_tables()
 init_business_tables()
+init_language_tables()
 
-# Минималистичное меню в стиле Noorza Bot.
-# Главное меню оставляем коротким: только самые важные разделы.
-# Все старые команды остаются рабочими: /products, /stock, /orders, /reviews и т.д.
-MAIN_MENU = ReplyKeyboardMarkup(
+# --- Языки интерфейса ---
+# Основной код отчётов остаётся совместимым с русскими командами, но клиент может выбрать язык меню и основных экранов.
+SUPPORTED_LANGUAGES = {"ru", "uz"}
+
+
+def init_language_tables() -> None:
+    with db.connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_language (
+                telegram_id INTEGER PRIMARY KEY,
+                lang TEXT NOT NULL DEFAULT 'ru',
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def normalize_lang(value: Any) -> str:
+    lang = str(value or "ru").strip().lower()
+    if lang.startswith("uz"):
+        return "uz"
+    return "ru"
+
+
+def get_user_language(telegram_id: int | None) -> str:
+    if telegram_id is None:
+        return "ru"
+    try:
+        with db.connect() as conn:
+            row = conn.execute(
+                "SELECT lang FROM user_language WHERE telegram_id = ?",
+                (int(telegram_id),),
+            ).fetchone()
+        if row:
+            return normalize_lang(row[0] if not isinstance(row, dict) else row.get("lang"))
+    except Exception:
+        logging.exception("Failed to read user language")
+    return "ru"
+
+
+def set_user_language(telegram_id: int, lang: str) -> None:
+    lang = normalize_lang(lang)
+    now = _dt_to_db(_utc_now()) or ""
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO user_language (telegram_id, lang, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET lang = excluded.lang, updated_at = excluded.updated_at
+            """,
+            (int(telegram_id), lang, now),
+        )
+        conn.commit()
+
+
+def language_title(lang: str) -> str:
+    return "O‘zbekcha" if normalize_lang(lang) == "uz" else "Русский"
+
+
+I18N: dict[str, dict[str, str]] = {
+    "ru": {
+        "choose_action": "Выберите действие",
+        "choose_section": "Выберите раздел 👇",
+        "main_menu": "Главное меню 👇",
+        "cancelled": "Действие отменено.",
+        "language_title": "🌐 <b>Язык интерфейса</b>",
+        "language_body": "Выберите язык, на котором бот будет показывать меню и основные подсказки.",
+        "language_set": "✅ Язык изменён: <b>Русский</b>",
+        "language_button_ru": "🇷🇺 Русский",
+        "language_button_uz": "🇺🇿 O‘zbekcha",
+        "admin_only": "⛔ Админ-панель доступна только владельцу бота.",
+        "access_limited": "⛔ <b>Доступ ограничен</b>\n\nTrial или подписка закончились.\nВаш Uzum-токен и настройки сохранены — после продления всё снова заработает.\n\nПроверить подписку: <code>/my_subscription</code>\nОплата: <code>/subscribe</code>",
+        "connect_first": "Сначала подключите Uzum API-токен: <code>/connect</code>",
+        "connection_deleted": "✅ Подключение к Uzum API удалено. Можно подключить заново через <code>/connect</code>.",
+        "token_instruction_title": "🔑 <b>Где взять Uzum Seller API-ключ</b>",
+        "support_title": "🆘 <b>Поддержка</b>",
+        "security_title": "🔐 <b>Безопасность API-ключа</b>",
+    },
+    "uz": {
+        "choose_action": "Amalni tanlang",
+        "choose_section": "Bo‘limni tanlang 👇",
+        "main_menu": "Asosiy menyu 👇",
+        "cancelled": "Amal bekor qilindi.",
+        "language_title": "🌐 <b>Interfeys tili</b>",
+        "language_body": "Bot menyu va asosiy ko‘rsatmalarni qaysi tilda ko‘rsatishini tanlang.",
+        "language_set": "✅ Til o‘zgartirildi: <b>O‘zbekcha</b>",
+        "language_button_ru": "🇷🇺 Русский",
+        "language_button_uz": "🇺🇿 O‘zbekcha",
+        "admin_only": "⛔ Admin panel faqat bot egasi uchun.",
+        "access_limited": "⛔ <b>Kirish cheklangan</b>\n\nTrial yoki obuna muddati tugagan.\nUzum tokeningiz va sozlamalaringiz saqlanadi — obuna uzaytirilgach hammasi yana ishlaydi.\n\nObunani tekshirish: <code>/my_subscription</code>\nTo‘lov: <code>/subscribe</code>",
+        "connect_first": "Avval Uzum API-kalitini ulang: <code>/connect</code>",
+        "connection_deleted": "✅ Uzum API ulanishi o‘chirildi. Qayta ulash uchun <code>/connect</code> buyrug‘idan foydalaning.",
+        "token_instruction_title": "🔑 <b>Uzum Seller API-kalitini qayerdan olish mumkin</b>",
+        "support_title": "🆘 <b>Yordam</b>",
+        "security_title": "🔐 <b>API-kalit xavfsizligi</b>",
+    },
+}
+
+
+def tr(lang: str, key: str) -> str:
+    lang = normalize_lang(lang)
+    return I18N.get(lang, I18N["ru"]).get(key, I18N["ru"].get(key, key))
+
+
+def tr_user(telegram_id: int | None, key: str) -> str:
+    return tr(get_user_language(telegram_id), key)
+
+
+def language_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🇷🇺 Русский", callback_data="set_lang:ru"),
+                InlineKeyboardButton(text="🇺🇿 O‘zbekcha", callback_data="set_lang:uz"),
+            ]
+        ]
+    )
+
+
+MAIN_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="🌐 Все магазины")],
         [KeyboardButton(text="📊 Сегодня"), KeyboardButton(text="📆 Вчера")],
@@ -587,14 +702,29 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="🧭 Потерянные")],
         [KeyboardButton(text="📄 Накладные FBO"), KeyboardButton(text="📊 Excel отчёт")],
         [KeyboardButton(text="🌙 Утренний отчёт"), KeyboardButton(text="💎 Подписка")],
-        [KeyboardButton(text="👑 Админ"), KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="🌐 Язык"), KeyboardButton(text="👑 Админ"), KeyboardButton(text="ℹ️ Помощь")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите действие",
 )
 
+MAIN_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="💰 Balans"), KeyboardButton(text="🌐 Barcha do‘konlar")],
+        [KeyboardButton(text="📊 Bugun"), KeyboardButton(text="📆 Kecha")],
+        [KeyboardButton(text="🗓 7 kun"), KeyboardButton(text="📅 30 kun")],
+        [KeyboardButton(text="📦 Qoldiq"), KeyboardButton(text="⚠️ Qoldiq prognozi")],
+        [KeyboardButton(text="🏆 Top tovarlar"), KeyboardButton(text="🐢 Sotilmayapti")],
+        [KeyboardButton(text="🏪 Do‘konlar"), KeyboardButton(text="🧭 Yo‘qolganlar")],
+        [KeyboardButton(text="📄 FBO yuk xatlari"), KeyboardButton(text="📊 Excel hisobot")],
+        [KeyboardButton(text="🌙 Ertalabki hisobot"), KeyboardButton(text="💎 Obuna")],
+        [KeyboardButton(text="🌐 Til"), KeyboardButton(text="👑 Admin"), KeyboardButton(text="ℹ️ Yordam")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Amalni tanlang",
+)
 
-ADMIN_PANEL_MENU = ReplyKeyboardMarkup(
+ADMIN_PANEL_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="💳 Оплаты")],
         [KeyboardButton(text="⏳ Скоро заканчиваются"), KeyboardButton(text="⛔ Заблокированные")],
@@ -605,12 +735,137 @@ ADMIN_PANEL_MENU = ReplyKeyboardMarkup(
     input_field_placeholder="Админ-панель",
 )
 
-# Для совместимости: старые обработчики разделов могут ссылаться на эти переменные.
-ANALYTICS_MENU = MAIN_MENU
-PRODUCTS_MENU = MAIN_MENU
-ORDERS_MENU = MAIN_MENU
-NOTIFICATIONS_MENU = MAIN_MENU
-SETTINGS_MENU = MAIN_MENU
+ADMIN_PANEL_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="👥 Foydalanuvchilar"), KeyboardButton(text="💳 To‘lovlar")],
+        [KeyboardButton(text="⏳ Tugayotganlar"), KeyboardButton(text="⛔ Bloklanganlar")],
+        [KeyboardButton(text="✅ Ulanishni tekshirish"), KeyboardButton(text="📦 Baza zaxirasi")],
+        [KeyboardButton(text="📢 Xabar yuborish"), KeyboardButton(text="⬅️ Asosiy menyu")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Admin panel",
+)
+
+# Для совместимости: если где-то осталась статичная разметка, будет русский вариант.
+MAIN_MENU = MAIN_MENU_RU
+ADMIN_PANEL_MENU = ADMIN_PANEL_MENU_RU
+ANALYTICS_MENU = MAIN_MENU_RU
+PRODUCTS_MENU = MAIN_MENU_RU
+ORDERS_MENU = MAIN_MENU_RU
+NOTIFICATIONS_MENU = MAIN_MENU_RU
+SETTINGS_MENU = MAIN_MENU_RU
+
+
+def main_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
+    return MAIN_MENU_UZ if get_user_language(telegram_id) == "uz" else MAIN_MENU_RU
+
+
+def menu_for_message(message: Message) -> ReplyKeyboardMarkup:
+    try:
+        telegram_id = message.from_user.id if message.from_user else None
+    except Exception:
+        telegram_id = None
+    return main_menu_for_user(telegram_id)
+
+
+def admin_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
+    return ADMIN_PANEL_MENU_UZ if get_user_language(telegram_id) == "uz" else ADMIN_PANEL_MENU_RU
+
+
+def admin_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
+    try:
+        telegram_id = message.from_user.id if message.from_user else None
+    except Exception:
+        telegram_id = None
+    return admin_menu_for_user(telegram_id)
+
+
+# Переопределяем тексты подписки после инициализации языка, чтобы /my_subscription был на выбранном языке.
+def subscription_status_text(telegram_id: int) -> str:
+    row = ensure_subscription(telegram_id)
+    lang = get_user_language(telegram_id)
+    if is_admin(telegram_id):
+        return "👑 Admin kirish: cheklovsiz" if lang == "uz" else "👑 Админ-доступ: без ограничений"
+    if int(row.get("blocked") or 0) == 1:
+        return "⛔ Foydalanuvchi bloklangan" if lang == "uz" else "⛔ Пользователь заблокирован"
+    now = _utc_now()
+    trial_until = _dt_from_db(row.get("trial_until"))
+    paid_until = _dt_from_db(row.get("subscription_until"))
+    until = subscription_active_until(row)
+    if until and until > now:
+        if paid_until and paid_until == until:
+            return (f"✅ Obuna {_fmt_dt(paid_until)} gacha faol" if lang == "uz" else f"✅ Подписка активна до {_fmt_dt(paid_until)}")
+        return (f"🎁 Trial {_fmt_dt(trial_until)} gacha faol" if lang == "uz" else f"🎁 Trial активен до {_fmt_dt(trial_until)}")
+    return "⛔ Obuna muddati tugagan" if lang == "uz" else "⛔ Подписка закончилась"
+
+
+def subscription_full_text(telegram_id: int) -> str:
+    row = ensure_subscription(telegram_id)
+    status = subscription_status_text(telegram_id)
+    lang = get_user_language(telegram_id)
+
+    if is_admin(telegram_id):
+        if lang == "uz":
+            return (
+                "💎 <b>Mening obunam</b>\n\n"
+                f"Telegram ID: <code>{telegram_id}</code>\n"
+                f"Holat: {status}\n\n"
+                "Admin uchun trial va to‘lov sanasi muhim emas — kirish doim ochiq.\n\n"
+                "Admin buyruqlari:\n"
+                "• <code>/admin</code> — admin panel\n"
+                "• <code>/users</code> — foydalanuvchilar\n"
+                "• <code>/extend ID 30</code> — kirishni uzaytirish\n"
+                "• <code>/block ID</code> — bloklash\n"
+                "• <code>/unblock ID</code> — blokdan chiqarish\n"
+                "• <code>/paid ID summa kun</code> — to‘lovni yozish\n"
+                "• <code>/payments</code> — to‘lovlar tarixi\n"
+                "• <code>/backup_db</code> — baza zaxirasi"
+            )
+        return (
+            "💎 <b>Моя подписка</b>\n\n"
+            f"Telegram ID: <code>{telegram_id}</code>\n"
+            f"Статус: {status}\n\n"
+            "Trial и дата оплаты для администратора не важны — доступ всегда открыт.\n\n"
+            "Команды администратора:\n"
+            "• <code>/admin</code> — админ-панель\n"
+            "• <code>/users</code> — пользователи\n"
+            "• <code>/extend ID 30</code> — продлить доступ\n"
+            "• <code>/block ID</code> — заблокировать\n"
+            "• <code>/unblock ID</code> — разблокировать\n"
+            "• <code>/paid ID сумма дни</code> — записать оплату\n"
+            "• <code>/payments</code> — история оплат\n"
+            "• <code>/backup_db</code> — скачать базу"
+        )
+
+    if lang == "uz":
+        return (
+            "💎 <b>Mening obunam</b>\n\n"
+            f"Telegram ID: <code>{telegram_id}</code>\n"
+            f"Holat: {status}\n"
+            f"Trial tugash vaqti: <b>{_fmt_dt(row.get('trial_until'))}</b>\n"
+            f"To‘langan muddat: <b>{_fmt_dt(row.get('subscription_until'))}</b>\n\n"
+            "Tariflar:\n"
+            f"<b>{escape(SUBSCRIPTION_PLANS_TEXT)}</b>\n\n"
+            f"{escape(PAYMENT_TEXT)}\n\n"
+            "To‘lovlar tarixi: <code>/my_payments</code>\n"
+            "Yordam: <code>/support</code>\n"
+            "API-kalitni almashtirish: <code>/reconnect</code>\n"
+            "API-kalitni o‘chirish: <code>/disconnect</code>"
+        )
+    return (
+        "💎 <b>Моя подписка</b>\n\n"
+        f"Telegram ID: <code>{telegram_id}</code>\n"
+        f"Статус: {status}\n"
+        f"Trial до: <b>{_fmt_dt(row.get('trial_until'))}</b>\n"
+        f"Оплачено до: <b>{_fmt_dt(row.get('subscription_until'))}</b>\n\n"
+        "Тарифы:\n"
+        f"<b>{escape(SUBSCRIPTION_PLANS_TEXT)}</b>\n\n"
+        f"{escape(PAYMENT_TEXT)}\n\n"
+        "История оплат: <code>/my_payments</code>\n"
+        "Поддержка: <code>/support</code>\n"
+        "Заменить API-ключ: <code>/reconnect</code>\n"
+        "Удалить API-ключ: <code>/disconnect</code>"
+    )
 
 class ConnectStates(StatesGroup):
     waiting_for_token = State()
@@ -649,7 +904,7 @@ async def require_connection(message: Message) -> tuple[int, UzumClient, int] | 
         await message.answer(
             "Сначала подключите ваш Uzum Seller API-токен.\n\n"
             "Команда: <code>/connect</code>",
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
         return None
 
@@ -657,7 +912,7 @@ async def require_connection(message: Message) -> tuple[int, UzumClient, int] | 
         await message.answer(
             "Токен подключён, но основной магазин не выбран.\n"
             "Напишите <code>/shops</code>, потом <code>/setshop SHOP_ID</code>.",
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
         return None
 
@@ -694,7 +949,7 @@ async def send_api_error(message: Message, error: Exception) -> None:
         if len(text) > 1200:
             text = text[:1200] + "\n..."
         user_text = f"⚠️ <b>Ошибка API</b>\n<code>{text}</code>"
-    await message.answer(user_text, reply_markup=MAIN_MENU)
+    await message.answer(user_text, reply_markup=menu_for_message(message))
 
 
 def parse_args(text: str) -> str:
@@ -752,7 +1007,7 @@ async def connect_token(
         await message.answer(
             "Похоже, это не Uzum API-токен.\n"
             "Отправьте полный токен или нажмите /cancel.",
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
         return
 
@@ -766,7 +1021,7 @@ async def connect_token(
                 "Ответ API:\n<code>"
                 + escape(compact_json_preview(data))
                 + "</code>",
-                reply_markup=MAIN_MENU,
+                reply_markup=menu_for_message(message),
             )
             return
 
@@ -786,7 +1041,7 @@ async def connect_token(
             + "\n\nОсновной магазин: "
             + (f"<code>{default_shop_id}</code>" if default_shop_id else "не выбран")
             + "\n\nПроверка остатков: <code>/stock</code> или <code>/lowstock</code>",
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
         if state:
             await state.clear()
@@ -794,62 +1049,135 @@ async def connect_token(
         await send_api_error(message, e)
 
 
+@dp.message(Command("language", "lang", "til"))
+async def language_command(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    await message.answer(
+        f"{tr(lang, 'language_title')}\n\n{tr(lang, 'language_body')}",
+        reply_markup=language_markup(),
+    )
+
+
+@dp.message(F.text == "🌐 Язык")
+@dp.message(F.text == "🌐 Til")
+async def language_button(message: Message) -> None:
+    await language_command(message)
+
+
+@dp.callback_query(F.data.startswith("set_lang:"))
+async def set_language_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user:
+        return
+    telegram_id = callback.from_user.id
+    db.upsert_user(telegram_id, callback.from_user.username, callback.from_user.first_name)
+    lang = normalize_lang((callback.data or "").split(":", 1)[-1])
+    set_user_language(telegram_id, lang)
+    await callback.answer("OK")
+    if callback.message:
+        await callback.message.answer(tr(lang, "language_set"), reply_markup=main_menu_for_user(telegram_id))
+
+
 @dp.message(Command("start", "help"))
 async def start(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     ensure_subscription(telegram_id)
+    lang = get_user_language(telegram_id)
     connected = "✅ подключён" if db.has_uzum_connection(telegram_id) else "❌ не подключён"
+    if lang == "uz":
+        connected = "✅ ulangan" if db.has_uzum_connection(telegram_id) else "❌ ulanmagan"
     sub_line = subscription_status_text(telegram_id)
 
     admin_part = ""
     if is_admin(telegram_id):
-        admin_part = (
-            "\n👑 <b>Админ-команды</b>\n"
-            "• <code>/users</code> — список пользователей\n"
-            "• <code>/extend ID 30</code> — продлить доступ\n"
-            "• <code>/block ID</code> / <code>/unblock ID</code> — блокировка\n"
-            "• <code>/paid ID сумма дни</code> — записать оплату и продлить\n"
-            "• <code>/payments</code> — история оплат\n"
-            "• <code>/backup_db</code> — резервная копия базы\n"
-            "• <code>/broadcast текст</code> — рассылка\n"
-        )
+        if lang == "uz":
+            admin_part = (
+                "\n👑 <b>Admin buyruqlari</b>\n"
+                "• <code>/admin</code> — admin panel\n"
+                "• <code>/users</code> — foydalanuvchilar\n"
+                "• <code>/extend ID 30</code> — kirishni uzaytirish\n"
+                "• <code>/block ID</code> / <code>/unblock ID</code> — bloklash\n"
+                "• <code>/paid ID summa kun</code> — to‘lovni yozish va uzaytirish\n"
+                "• <code>/payments</code> — to‘lovlar tarixi\n"
+                "• <code>/backup_db</code> — baza zaxirasi\n"
+                "• <code>/broadcast matn</code> — hammaga xabar yuborish\n"
+            )
+        else:
+            admin_part = (
+                "\n👑 <b>Админ-команды</b>\n"
+                "• <code>/admin</code> — админ-панель\n"
+                "• <code>/users</code> — список пользователей\n"
+                "• <code>/extend ID 30</code> — продлить доступ\n"
+                "• <code>/block ID</code> / <code>/unblock ID</code> — блокировка\n"
+                "• <code>/paid ID сумма дни</code> — записать оплату и продлить\n"
+                "• <code>/payments</code> — история оплат\n"
+                "• <code>/backup_db</code> — резервная копия базы\n"
+                "• <code>/broadcast текст</code> — рассылка\n"
+            )
 
-    await message.answer(
-        "👋 <b>Добро пожаловать в Uzum Seller Assistant</b>\n\n"
-        "Бот помогает селлерам Uzum быстро смотреть важные данные прямо в Telegram:\n"
-        "📊 продажи за сегодня, вчера, 7 и 30 дней\n"
-        "📦 остатки FBO/FBS/DBS\n"
-        "⚠️ товары, которые заканчиваются\n"
-        "🧭 потерянные товары по данным Uzum\n"
-        "📄 FBO-накладные и состав поставки\n"
-        "📊 подробный Excel-отчёт по продажам, остаткам и накладным\n"
-        "🔔 уведомления о продажах и изменении остатков\n\n"
-        f"Uzum API: {connected}\n"
-        f"Доступ: {sub_line}\n\n"
-        "🚀 <b>Как начать</b>\n"
-        "1. Нажмите <code>/connect</code>\n"
-        "2. Отправьте свой Uzum Seller OpenAPI token\n"
-        "3. Нажмите <b>📊 Сегодня</b> или <b>📦 Остатки</b>\n\n"
-        "Не знаете, где взять токен? Напишите <code>/api_token</code>.\n"
-        "Подписка и оплата: <code>/subscribe</code>.\n"
-        "Поддержка: <code>/support</code>.\n"
-        "Заменить API-ключ: <code>/reconnect</code>. Удалить API-ключ: <code>/disconnect</code>.\n"
-        "Подробный Excel-отчёт: <code>/report_excel</code>."
-        + admin_part,
-        reply_markup=MAIN_MENU,
-    )
+    if lang == "uz":
+        text = (
+            "👋 <b>Uzum Seller Assistant botiga xush kelibsiz</b>\n\n"
+            "Bot Uzum sellerlariga muhim ma’lumotlarni Telegramda tez ko‘rishga yordam beradi:\n"
+            "📊 bugun, kecha, 7 va 30 kunlik savdolar\n"
+            "📦 FBO/FBS/DBS qoldiqlari\n"
+            "⚠️ tugab borayotgan tovarlar va qoldiq prognozi\n"
+            "🧭 Uzum ma’lumotidagi yo‘qolgan tovarlar\n"
+            "📄 FBO yuk xatlari va tarkibi\n"
+            "📊 Excel hisobot\n"
+            "🔔 yangi savdolar haqida xabarlar\n\n"
+            f"Uzum API: {connected}\n"
+            f"Kirish: {sub_line}\n"
+            f"Til: <b>{language_title(lang)}</b> — o‘zgartirish: <code>/language</code>\n\n"
+            "🚀 <b>Boshlash</b>\n"
+            "1. <code>/connect</code> ni bosing\n"
+            "2. Uzum Seller OpenAPI tokeningizni yuboring\n"
+            "3. <b>📊 Bugun</b> yoki <b>📦 Qoldiq</b> ni bosing\n\n"
+            "Tokenni qayerdan olishni bilmasangiz: <code>/api_token</code>.\n"
+            "Obuna va to‘lov: <code>/subscribe</code>.\n"
+            "Yordam: <code>/support</code>.\n"
+            "API-kalitni almashtirish: <code>/reconnect</code>. O‘chirish: <code>/disconnect</code>.\n"
+            "Excel hisobot: <code>/report_excel</code>."
+            + admin_part
+        )
+    else:
+        text = (
+            "👋 <b>Добро пожаловать в Uzum Seller Assistant</b>\n\n"
+            "Бот помогает селлерам Uzum быстро смотреть важные данные прямо в Telegram:\n"
+            "📊 продажи за сегодня, вчера, 7 и 30 дней\n"
+            "📦 остатки FBO/FBS/DBS\n"
+            "⚠️ товары, которые заканчиваются, и прогноз остатков\n"
+            "🧭 потерянные товары по данным Uzum\n"
+            "📄 FBO-накладные и состав поставки\n"
+            "📊 подробный Excel-отчёт\n"
+            "🔔 уведомления о новых продажах\n\n"
+            f"Uzum API: {connected}\n"
+            f"Доступ: {sub_line}\n"
+            f"Язык: <b>{language_title(lang)}</b> — изменить: <code>/language</code>\n\n"
+            "🚀 <b>Как начать</b>\n"
+            "1. Нажмите <code>/connect</code>\n"
+            "2. Отправьте свой Uzum Seller OpenAPI token\n"
+            "3. Нажмите <b>📊 Сегодня</b> или <b>📦 Остатки</b>\n\n"
+            "Не знаете, где взять токен? Напишите <code>/api_token</code>.\n"
+            "Подписка и оплата: <code>/subscribe</code>.\n"
+            "Поддержка: <code>/support</code>.\n"
+            "Заменить API-ключ: <code>/reconnect</code>. Удалить API-ключ: <code>/disconnect</code>.\n"
+            "Подробный Excel-отчёт: <code>/report_excel</code>."
+            + admin_part
+        )
+    await message.answer(text, reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("menu"))
 async def menu(message: Message) -> None:
     upsert_from_message(message)
-    await message.answer("Выберите раздел 👇", reply_markup=MAIN_MENU)
+    await message.answer(tr_user(upsert_from_message(message), "choose_section"), reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer("Действие отменено.", reply_markup=MAIN_MENU)
+    await message.answer(tr_user(upsert_from_message(message), "cancelled"), reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("status"))
@@ -866,7 +1194,7 @@ async def status(message: Message) -> None:
         f"Магазинов: {len(shops)}\n"
         f"Основной магазин: {f'<code>{default_shop_id}</code>' if default_shop_id else 'не выбран'}\n"
         f"Подписка: {subscription_status_text(telegram_id)}\n",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
 
 @dp.message(Command("connect", "reconnect"))
@@ -886,7 +1214,7 @@ async def connect(message: Message, state: FSMContext) -> None:
         "• токен будет сохранён в зашифрованном виде;\n"
         "• после проверки я постараюсь удалить сообщение с токеном;\n"
         "• отменить: <code>/cancel</code>.",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
 
 
@@ -917,7 +1245,7 @@ async def disconnect(message: Message) -> None:
     disconnect_uzum_for_user(telegram_id)
     await message.answer(
         "✅ Подключение к Uzum API удалено. Можно подключить заново через <code>/connect</code>.",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
 
 
@@ -928,13 +1256,13 @@ async def ping_uzum(message: Message) -> None:
     if client is None:
         await message.answer(
             "Сначала подключите Uzum API-токен: <code>/connect</code>",
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
         return
     try:
         data = await client.get_shops()
         shops = extract_items(data)
-        await message.answer(f"✅ Uzum API отвечает. Найдено магазинов: {len(shops)}", reply_markup=MAIN_MENU)
+        await message.answer(f"✅ Uzum API отвечает. Найдено магазинов: {len(shops)}", reply_markup=menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -944,7 +1272,7 @@ async def shops(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     client = get_uzum_for_user(telegram_id)
     if client is None:
-        await message.answer("Сначала подключите Uzum API-токен: <code>/connect</code>", reply_markup=MAIN_MENU)
+        await message.answer("Сначала подключите Uzum API-токен: <code>/connect</code>", reply_markup=menu_for_message(message))
         return
 
     try:
@@ -955,7 +1283,7 @@ async def shops(message: Message) -> None:
                 "Ответ получен, но список магазинов не найден:\n<code>"
                 + escape(compact_json_preview(data))
                 + "</code>",
-                reply_markup=MAIN_MENU,
+                reply_markup=menu_for_message(message),
             )
             return
 
@@ -970,7 +1298,7 @@ async def shops(message: Message) -> None:
             + "\n\nТекущий основной магазин: "
             + (f"<code>{current}</code>" if current else "не выбран")
             + "\n\nЧтобы выбрать: <code>/setshop SHOP_ID</code>",
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
     except Exception as e:
         await send_api_error(message, e)
@@ -983,17 +1311,17 @@ async def setshop(message: Message) -> None:
     if not arg.isdigit():
         await message.answer(
             "Напишите так: <code>/setshop SHOP_ID</code>\nНапример: <code>/setshop 12345</code>",
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
         return
 
     shop_id = int(arg)
     ok = db.set_default_shop_id(telegram_id, shop_id)
     if not ok:
-        await message.answer("Этот магазин не найден среди подключённых. Сначала обновите список: <code>/shops</code>", reply_markup=MAIN_MENU)
+        await message.answer("Этот магазин не найден среди подключённых. Сначала обновите список: <code>/shops</code>", reply_markup=menu_for_message(message))
         return
 
-    await message.answer(f"✅ Основной магазин выбран: <code>{shop_id}</code>", reply_markup=MAIN_MENU)
+    await message.answer(f"✅ Основной магазин выбран: <code>{shop_id}</code>", reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("products"))
@@ -1012,7 +1340,7 @@ async def products(message: Message) -> None:
                 "Товары не найдены. Ответ API:\n<code>"
                 + escape(compact_json_preview(data))
                 + "</code>",
-                reply_markup=MAIN_MENU,
+                reply_markup=menu_for_message(message),
             )
             return
 
@@ -1020,7 +1348,7 @@ async def products(message: Message) -> None:
         if search_query:
             title += f" по запросу “{escape(search_query)}”"
         lines = [format_product_line(item) for item in items[:10]]
-        await message.answer(title + ":\n\n" + "\n\n".join(lines), reply_markup=MAIN_MENU)
+        await message.answer(title + ":\n\n" + "\n\n".join(lines), reply_markup=menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -1035,7 +1363,7 @@ async def send_stock_list(message: Message, mode: str = "all") -> None:
     try:
         rows = await load_sku_rows(client, shop_id, search_query=search_query, max_pages=10)
         if not rows:
-            await message.answer("SKU-остатки не найдены.", reply_markup=MAIN_MENU)
+            await message.answer("SKU-остатки не найдены.", reply_markup=menu_for_message(message))
             return
 
         if mode == "fbo":
@@ -1050,13 +1378,13 @@ async def send_stock_list(message: Message, mode: str = "all") -> None:
         if search_query:
             title += f"\nПоиск: {escape(search_query)}"
         if not rows:
-            await message.answer(title + "\n\nНичего не найдено.", reply_markup=MAIN_MENU)
+            await message.answer(title + "\n\nНичего не найдено.", reply_markup=menu_for_message(message))
             return
 
         lines = [format_sku_stock_line(row, mode=mode) for row in rows[:25]]
         await message.answer(
             title + f"\nПоказано: {min(len(rows), 25)} из {len(rows)}\n\n" + "\n\n".join(lines),
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
     except Exception as e:
         await send_api_error(message, e)
@@ -1089,12 +1417,12 @@ async def lowstock(message: Message) -> None:
     try:
         rows = await load_sku_rows(client, shop_id, max_pages=20)
         if not rows:
-            await message.answer("SKU-остатки не найдены.", reply_markup=MAIN_MENU)
+            await message.answer("SKU-остатки не найдены.", reply_markup=menu_for_message(message))
             return
 
         low = [r for r in rows if r.get("total") is not None and r["total"] <= threshold]
         if not low:
-            await message.answer(f"✅ В первых {len(rows)} SKU нет общего остатка ≤ {threshold}.", reply_markup=MAIN_MENU)
+            await message.answer(f"✅ В первых {len(rows)} SKU нет общего остатка ≤ {threshold}.", reply_markup=menu_for_message(message))
             return
 
         lines = [format_sku_stock_line(row, mode="all") for row in low[:30]]
@@ -1102,7 +1430,7 @@ async def lowstock(message: Message) -> None:
             f"⚠️ <b>Низкие остатки по общему количеству ≤ {threshold}:</b>\n"
             f"Показано: {min(len(low), 30)} из {len(low)}\n\n"
             + "\n\n".join(lines),
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
     except Exception as e:
         await send_api_error(message, e)
@@ -1120,14 +1448,14 @@ async def orders(message: Message) -> None:
         data = await client.get_fbs_orders(shop_id, status=status, page=0, size=10)
         items = extract_items(data)
         if not items:
-            await message.answer(f"Заказы со статусом <code>{escape(status)}</code> не найдены.", reply_markup=MAIN_MENU)
+            await message.answer(f"Заказы со статусом <code>{escape(status)}</code> не найдены.", reply_markup=menu_for_message(message))
             return
 
         lines = [format_order_line(item) for item in items[:10]]
         await message.answer(
             f"🛒 <b>Заказы {escape(status)} для магазина</b> <code>{shop_id}</code>:\n\n"
             + "\n".join(lines),
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
     except Exception as e:
         await send_api_error(message, e)
@@ -1754,11 +2082,11 @@ async def today_sales(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
-    await message.answer("⌛ Считаю продажи за сегодня...", reply_markup=MAIN_MENU)
+    await message.answer("⌛ Считаю продажи за сегодня...", reply_markup=menu_for_message(message))
     try:
         rows, _, _ = await _load_today_finance_flexible(client, shop_id)
         stats = _build_noorza_today_stats(rows)
-        await message.answer(_format_noorza_today(shop_id, stats, rows), reply_markup=MAIN_MENU)
+        await message.answer(_format_noorza_today(shop_id, stats, rows), reply_markup=menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -1777,12 +2105,12 @@ async def yesterday_sales(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
-    await message.answer("⌛ Считаю продажи за вчера...", reply_markup=MAIN_MENU)
+    await message.answer("⌛ Считаю продажи за вчера...", reply_markup=menu_for_message(message))
     try:
         date_from, date_to = _yesterday_range_ms()
         rows, _, _ = await _load_finance_range_flexible(client, shop_id, date_from, date_to)
         stats = _build_noorza_today_stats(rows)
-        await message.answer(_format_noorza_period("Продажи Uzum FBO/FBS за вчера", shop_id, stats, rows), reply_markup=MAIN_MENU)
+        await message.answer(_format_noorza_period("Продажи Uzum FBO/FBS за вчера", shop_id, stats, rows), reply_markup=menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -1794,12 +2122,12 @@ async def week_sales(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
-    await message.answer("⌛ Считаю продажи за 7 дней...", reply_markup=MAIN_MENU)
+    await message.answer("⌛ Считаю продажи за 7 дней...", reply_markup=menu_for_message(message))
     try:
         date_from, date_to = _last_7_days_range_ms()
         rows, _, _ = await _load_finance_range_flexible(client, shop_id, date_from, date_to)
         stats = _build_noorza_today_stats(rows)
-        await message.answer(_format_noorza_period("Продажи Uzum FBO/FBS за 7 дней", shop_id, stats, rows), reply_markup=MAIN_MENU)
+        await message.answer(_format_noorza_period("Продажи Uzum FBO/FBS за 7 дней", shop_id, stats, rows), reply_markup=menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -1810,14 +2138,14 @@ async def balance(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
-    await message.answer("⌛ Считаю баланс за 30 дней...", reply_markup=MAIN_MENU)
+    await message.answer("⌛ Считаю баланс за 30 дней...", reply_markup=menu_for_message(message))
     try:
         date_from, date_to = _days_range_ms(30)
         rows, _, _ = await _load_finance_range_flexible(client, shop_id, date_from, date_to)
         stats = _build_noorza_today_stats(rows)
         await message.answer(
             _format_noorza_period("Баланс Uzum FBO за 30 дней", shop_id, stats, rows),
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
     except Exception as e:
         await send_api_error(message, e)
@@ -1937,7 +2265,7 @@ async def lost_goods(message: Message) -> None:
         return
     _, client, shop_id = req
 
-    await message.answer("⌛ Проверяю потерянные товары...", reply_markup=MAIN_MENU)
+    await message.answer("⌛ Проверяю потерянные товары...", reply_markup=menu_for_message(message))
     try:
         products = await load_products(client, shop_id, max_pages=50, page_size=100)
         products = [
@@ -1955,7 +2283,7 @@ async def lost_goods(message: Message) -> None:
                 title
                 + "\n\nПотерянных товаров не найдено.\n"
                 + "Проверил поле <code>quantityMissing</code> в списке товаров Uzum.",
-                reply_markup=MAIN_MENU,
+                reply_markup=menu_for_message(message),
             )
             return
 
@@ -1983,7 +2311,7 @@ async def lost_goods(message: Message) -> None:
         lines.append("<i>Раздел использует поле quantityMissing из Products API. Если в кабинете Uzum потери считаются по актам иначе, сумма может отличаться.</i>")
 
         for part in _split_long_message("\n\n".join(lines)):
-            await message.answer(part, reply_markup=MAIN_MENU)
+            await message.answer(part, reply_markup=menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -2168,7 +2496,7 @@ async def fbo_invoices(message: Message) -> None:
         return
     _, client, shop_id = req
 
-    await message.answer("⌛ Загружаю FBO-накладные поставки...", reply_markup=MAIN_MENU)
+    await message.answer("⌛ Загружаю FBO-накладные поставки...", reply_markup=menu_for_message(message))
     try:
         invoices, first_response = await _load_fbo_invoices(client, shop_id, max_pages=3, page_size=20)
         title = "📄 <b>FBO-накладные поставки</b>"
@@ -2180,7 +2508,7 @@ async def fbo_invoices(message: Message) -> None:
             )
             if first_response is not None:
                 text += "\n\nПервые данные API:\n<code>" + escape(compact_json_preview(first_response)) + "</code>"
-            await message.answer(text, reply_markup=MAIN_MENU)
+            await message.answer(text, reply_markup=menu_for_message(message))
             return
 
         lines = [
@@ -2195,7 +2523,7 @@ async def fbo_invoices(message: Message) -> None:
             lines.append(f"Показаны первые 50 накладных из {len(invoices)}.")
 
         for part in _split_long_message("\n\n".join(lines)):
-            await message.answer(part, reply_markup=MAIN_MENU)
+            await message.answer(part, reply_markup=menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -2254,12 +2582,12 @@ async def fbo_invoice_products(message: Message) -> None:
             "Сначала откройте список накладных: <code>/invoices</code>\n"
             "Потом отправьте команду с ID накладной. Например:\n"
             "<code>/invoice 123456</code>",
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
         return
     invoice_id = int(arg.split()[0])
 
-    await message.answer(f"⌛ Загружаю состав накладной <code>{invoice_id}</code>...", reply_markup=MAIN_MENU)
+    await message.answer(f"⌛ Загружаю состав накладной <code>{invoice_id}</code>...", reply_markup=menu_for_message(message))
     try:
         data = await _request_fbo_invoice_products(client, shop_id, invoice_id)
         products = [x for x in _extract_list_any(data) if isinstance(x, dict)]
@@ -2271,7 +2599,7 @@ async def fbo_invoice_products(message: Message) -> None:
                 f"Накладная ID: <code>{invoice_id}</code>\n\n"
                 "Товары не найдены или API вернул пустой состав.\n\n"
                 "Ответ API:\n<code>" + escape(compact_json_preview(data)) + "</code>",
-                reply_markup=MAIN_MENU,
+                reply_markup=menu_for_message(message),
             )
             return
 
@@ -2304,7 +2632,7 @@ async def fbo_invoice_products(message: Message) -> None:
             lines.append(f"Показаны первые 80 позиций из {len(products)}.")
 
         for part in _split_long_message("\n\n".join(lines)):
-            await message.answer(part, reply_markup=MAIN_MENU)
+            await message.answer(part, reply_markup=menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -2315,7 +2643,7 @@ async def sales(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
-    await message.answer("⏳ Считаю продажи за сегодня, 7 и 30 дней...", reply_markup=MAIN_MENU)
+    await message.answer("⏳ Считаю продажи за сегодня, 7 и 30 дней...", reply_markup=menu_for_message(message))
     try:
         today, _ = await _sales_period_stats(client, shop_id, 1)
         week, _ = await _sales_period_stats(client, shop_id, 7)
@@ -2329,7 +2657,7 @@ async def sales(message: Message) -> None:
             + "\n\n"
             + _format_sales_summary_line("30 дней", month)
             + "\n\nПодробно: <code>/sales_today</code>, <code>/sales_7</code>, <code>/sales_30</code>",
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
     except Exception as e:
         await send_api_error(message, e)
@@ -2343,7 +2671,7 @@ async def _send_sales_details(message: Message, days: int) -> None:
     try:
         stats, first = await _sales_period_stats(client, shop_id, days)
         await message.answer(
-            _format_sales_details(days, shop_id, stats, first), reply_markup=MAIN_MENU
+            _format_sales_details(days, shop_id, stats, first), reply_markup=menu_for_message(message)
         )
     except Exception as e:
         await send_api_error(message, e)
@@ -2524,7 +2852,7 @@ async def orders_summary(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
-    await message.answer("⏳ Считаю заказы по статусам...", reply_markup=MAIN_MENU)
+    await message.answer("⏳ Считаю заказы по статусам...", reply_markup=menu_for_message(message))
     try:
         today = await _orders_counts_for_days(client, shop_id, 1)
         week = await _orders_counts_for_days(client, shop_id, 7)
@@ -2536,7 +2864,7 @@ async def orders_summary(message: Message) -> None:
             + _format_orders_counts("7 дней", week)
             + "\n\n"
             + _format_orders_counts("30 дней", month),
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
     except Exception as e:
         await send_api_error(message, e)
@@ -2548,7 +2876,7 @@ async def dashboard(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
-    await message.answer("⏳ Собираю общую сводку магазина...", reply_markup=MAIN_MENU)
+    await message.answer("⏳ Собираю общую сводку магазина...", reply_markup=menu_for_message(message))
     try:
         sales_7, _ = await _sales_period_stats(client, shop_id, 7)
         sales_30, _ = await _sales_period_stats(client, shop_id, 30)
@@ -2580,7 +2908,7 @@ async def dashboard(message: Message) -> None:
             f"• Нет в наличии: <b>{int(st['zero_count'])}</b>\n"
             f"• Примерная стоимость остатка: <b>{_format_money(float(st['stock_value']))}</b>\n\n"
             f"Подробно: <code>/sales</code>, <code>/orders_summary</code>, <code>/lowstock</code>",
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
     except Exception as e:
         await send_api_error(message, e)
@@ -2733,12 +3061,12 @@ async def reviews(message: Message) -> None:
             "2. Потом перезапустите бота.\n\n"
             f"Последний путь: <code>{escape(str(path))}</code>\n"
             f"Ошибка: <code>{escape(error[:1000])}</code>",
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
         return
 
     if not items:
-        await message.answer("⭐ Отзывы не найдены.", reply_markup=MAIN_MENU)
+        await message.answer("⭐ Отзывы не найдены.", reply_markup=menu_for_message(message))
         return
 
     lines = [format_review_line(item) for item in items[:10]]
@@ -2746,7 +3074,7 @@ async def reviews(message: Message) -> None:
         "⭐ <b>Последние отзывы</b>\n\n"
         + "\n\n".join(lines)
         + "\n\nЧтобы ответить: <code>/reply ID_ОТЗЫВА ваш ответ</code>",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
 
 
@@ -2763,7 +3091,7 @@ async def reply_review(message: Message) -> None:
             "Напишите так:\n"
             "<code>/reply ID_ОТЗЫВА Спасибо за отзыв!</code>\n\n"
             "ID отзыва можно посмотреть через <code>/reviews</code>.",
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
         return
 
@@ -2771,10 +3099,10 @@ async def reply_review(message: Message) -> None:
     review_id = review_id.strip()
     answer_text = answer_text.strip()
     if not review_id or not answer_text:
-        await message.answer("Не вижу ID отзыва или текст ответа.", reply_markup=MAIN_MENU)
+        await message.answer("Не вижу ID отзыва или текст ответа.", reply_markup=menu_for_message(message))
         return
     if len(answer_text) > 1000:
-        await message.answer("Ответ слишком длинный. Сделайте до 1000 символов.", reply_markup=MAIN_MENU)
+        await message.answer("Ответ слишком длинный. Сделайте до 1000 символов.", reply_markup=menu_for_message(message))
         return
 
     payloads = [
@@ -2799,7 +3127,7 @@ async def reply_review(message: Message) -> None:
                 await message.answer(
                     "✅ Ответ на отзыв отправлен.\n\n"
                     f"ID отзыва: <code>{escape(review_id)}</code>",
-                    reply_markup=MAIN_MENU,
+                    reply_markup=menu_for_message(message),
                 )
                 return
             except Exception as e:
@@ -2815,7 +3143,7 @@ async def reply_review(message: Message) -> None:
         "<code>REVIEWS_REPLY_BODY_FIELD=text</code>\n\n"
         f"Попыток: <b>{tried}</b>\n"
         f"Последняя ошибка:\n<code>{escape(errors[-1] if errors else '—')}</code>",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
 
 
@@ -2823,80 +3151,142 @@ async def reply_review(message: Message) -> None:
 async def subscribe(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     ensure_subscription(telegram_id)
-    await message.answer(
-        "💎 <b>Подписка Uzum Seller Assistant</b>\n\n"
-        "Что входит:\n"
-        "✅ продажи FBO/FBS за сегодня, вчера, 7 и 30 дней\n"
-        "✅ остатки и товары, которые заканчиваются\n"
-        "✅ потерянные товары, если Uzum отдаёт их в API\n"
-        "✅ уведомления о новых продажах и остатках\n\n"
-        f"🎁 Trial: <b>{TRIAL_DAYS} дня</b> для нового пользователя\n\n"
-        "💰 <b>Тарифы</b>\n"
-        f"{escape(SUBSCRIPTION_PLANS_TEXT)}\n\n"
-        f"Для оплаты напишите администратору: <b>{admin_contact_text()}</b>\n"
-        f"{escape(PAYMENT_TEXT)}\n\n"
-        "После проверки чекa администратор продлит доступ.\n"
-        "Проверить статус: <code>/my_subscription</code>",
-        reply_markup=admin_contact_markup(),
-    )
+    lang = get_user_language(telegram_id)
+    if lang == "uz":
+        text = (
+            "💎 <b>Uzum Seller Assistant obunasi</b>\n\n"
+            "Nimalar kiradi:\n"
+            "✅ bugun, kecha, 7 va 30 kunlik FBO/FBS savdolar\n"
+            "✅ qoldiqlar va tugab borayotgan tovarlar\n"
+            "✅ Uzum API bergan bo‘lsa, yo‘qolgan tovarlar\n"
+            "✅ yangi savdolar haqida xabarlar\n"
+            "✅ bir nechta do‘kon bilan ishlash\n"
+            "✅ Excel hisobot va ertalabki hisobot\n\n"
+            f"🎁 Trial: yangi foydalanuvchi uchun <b>{TRIAL_DAYS} kun</b>\n\n"
+            "💰 <b>Tariflar</b>\n"
+            f"{escape(SUBSCRIPTION_PLANS_TEXT)}\n\n"
+            f"To‘lov uchun administratorga yozing: <b>{admin_contact_text()}</b>\n"
+            f"{escape(PAYMENT_TEXT)}\n\n"
+            "Chek tekshirilgach, administrator kirishni uzaytiradi.\n"
+            "Holatni tekshirish: <code>/my_subscription</code>"
+        )
+    else:
+        text = (
+            "💎 <b>Подписка Uzum Seller Assistant</b>\n\n"
+            "Что входит:\n"
+            "✅ продажи FBO/FBS за сегодня, вчера, 7 и 30 дней\n"
+            "✅ остатки и товары, которые заканчиваются\n"
+            "✅ потерянные товары, если Uzum отдаёт их в API\n"
+            "✅ уведомления о новых продажах\n"
+            "✅ работа с несколькими магазинами\n"
+            "✅ Excel-отчёт и утренний отчёт\n\n"
+            f"🎁 Trial: <b>{TRIAL_DAYS} дня</b> для нового пользователя\n\n"
+            "💰 <b>Тарифы</b>\n"
+            f"{escape(SUBSCRIPTION_PLANS_TEXT)}\n\n"
+            f"Для оплаты напишите администратору: <b>{admin_contact_text()}</b>\n"
+            f"{escape(PAYMENT_TEXT)}\n\n"
+            "После проверки чекa администратор продлит доступ.\n"
+            "Проверить статус: <code>/my_subscription</code>"
+        )
+    await message.answer(text, reply_markup=admin_contact_markup() or menu_for_message(message))
 
 
 @dp.message(Command("api_token", "token_help", "how_token"))
 async def api_token_help(message: Message) -> None:
-    upsert_from_message(message)
-    await message.answer(
-        "🔑 <b>Где взять Uzum Seller API-ключ</b>\n\n"
-        "Инструкция:\n"
-        "1. Зайдите в кабинет продавца <b>Uzum Seller</b>.\n"
-        "2. Нажмите на свой профиль / аватарку в правом верхнем углу.\n"
-        "3. Откройте раздел <b>Мой профиль</b>.\n"
-        "4. Нажмите <b>Ключи API</b>.\n"
-        "5. Нажмите <b>Создать ключ</b>.\n"
-        "6. Скопируйте созданный API-ключ.\n"
-        "7. Вернитесь в этот бот и нажмите <code>/connect</code>.\n"
-        "8. Отправьте API-ключ одним сообщением.\n\n"
-        "⚠️ <b>Важно:</b> не отправляйте API-ключ посторонним. "
-        "Бот сохранит его в зашифрованном виде и постарается удалить сообщение с ключом после проверки.",
-        reply_markup=MAIN_MENU,
-    )
-
-
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    if lang == "uz":
+        text = (
+            "🔑 <b>Uzum Seller API-kalitini qayerdan olish mumkin</b>\n\n"
+            "Yo‘riqnoma:\n"
+            "1. <b>Uzum Seller</b> sotuvchi kabinetiga kiring.\n"
+            "2. Yuqori o‘ng burchakdagi profil / avatarka ustiga bosing.\n"
+            "3. <b>Mening profilim</b> bo‘limini oching.\n"
+            "4. <b>API kalitlari</b> ni bosing.\n"
+            "5. <b>Kalit yaratish</b> ni bosing.\n"
+            "6. Yaratilgan API-kalitni nusxa oling.\n"
+            "7. Botga qayting va <code>/connect</code> ni bosing.\n"
+            "8. API-kalitni bitta xabar qilib yuboring.\n\n"
+            "⚠️ <b>Muhim:</b> API-kalitni begonalarga yubormang. Bot uni himoyalangan ko‘rinishda saqlaydi va tekshiruvdan so‘ng kalit yuborilgan xabarni o‘chirishga harakat qiladi."
+        )
+    else:
+        text = (
+            "🔑 <b>Где взять Uzum Seller API-ключ</b>\n\n"
+            "Инструкция:\n"
+            "1. Зайдите в кабинет продавца <b>Uzum Seller</b>.\n"
+            "2. Нажмите на свой профиль / аватарку в правом верхнем углу.\n"
+            "3. Откройте раздел <b>Мой профиль</b>.\n"
+            "4. Нажмите <b>Ключи API</b>.\n"
+            "5. Нажмите <b>Создать ключ</b>.\n"
+            "6. Скопируйте созданный API-ключ.\n"
+            "7. Вернитесь в этот бот и нажмите <code>/connect</code>.\n"
+            "8. Отправьте API-ключ одним сообщением.\n\n"
+            "⚠️ <b>Важно:</b> не отправляйте API-ключ посторонним. Бот сохранит его в защищённом виде и постарается удалить сообщение с ключом после проверки."
+        )
+    await message.answer(text, reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("security", "privacy"))
 async def security(message: Message) -> None:
-    upsert_from_message(message)
-    await message.answer(
-        "🔐 <b>Безопасность API-ключа</b>\n\n"
-        "Ваш Uzum API-ключ не показывается в боте и не отправляется обратно сообщением.\n"
-        "После подключения бот старается удалить сообщение, где был отправлен ключ.\n"
-        "В базе хранится только защищённая версия ключа.\n\n"
-        "Вы можете в любой момент удалить подключение командой <code>/disconnect</code>.\n"
-        "Чтобы заменить ключ, используйте <code>/reconnect</code>.",
-        reply_markup=MAIN_MENU,
-    )
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    if lang == "uz":
+        text = (
+            "🔐 <b>API-kalit xavfsizligi</b>\n\n"
+            "Uzum API-kalitingiz botda ko‘rsatilmaydi va sizga qayta xabar qilib yuborilmaydi.\n"
+            "Ulangandan keyin bot kalit yuborilgan xabarni o‘chirishga harakat qiladi.\n"
+            "Bazaga faqat himoyalangan versiya saqlanadi.\n\n"
+            "Istalgan vaqtda ulanishni <code>/disconnect</code> orqali o‘chirishingiz mumkin.\n"
+            "Kalitni almashtirish uchun <code>/reconnect</code> dan foydalaning."
+        )
+    else:
+        text = (
+            "🔐 <b>Безопасность API-ключа</b>\n\n"
+            "Ваш Uzum API-ключ не показывается в боте и не отправляется обратно сообщением.\n"
+            "После подключения бот старается удалить сообщение, где был отправлен ключ.\n"
+            "В базе хранится только защищённая версия ключа.\n\n"
+            "Вы можете в любой момент удалить подключение командой <code>/disconnect</code>.\n"
+            "Чтобы заменить ключ, используйте <code>/reconnect</code>."
+        )
+    await message.answer(text, reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("support"))
 async def support(message: Message) -> None:
     telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
     user = db.get_user(telegram_id)
     shops = db.list_shops(telegram_id)
     connected = bool(user and user["uzum_token_encrypted"])
-    await message.answer(
-        "🛟 <b>Поддержка Uzum Seller Assistant</b>\n\n"
-        f"Ваш Telegram ID: <code>{telegram_id}</code>\n"
-        f"Uzum API: {'✅ подключён' if connected else '❌ не подключён'}\n"
-        f"Магазинов найдено: <b>{len(shops)}</b>\n"
-        f"Подписка: {subscription_status_text(telegram_id)}\n\n"
-        "Если бот не показывает данные, проверьте:\n"
-        "1. API-ключ активен в кабинете Uzum Seller.\n"
-        "2. У ключа есть доступ к нужному магазину.\n"
-        "3. В кабинете Uzum есть продажи за выбранный период.\n"
-        "4. Если меняли API-ключ — нажмите <code>/reconnect</code>.\n\n"
-        f"Связаться с администратором: <b>{admin_contact_text()}</b>",
-        reply_markup=admin_contact_markup() or MAIN_MENU,
-    )
+    if lang == "uz":
+        text = (
+            "🛟 <b>Uzum Seller Assistant yordami</b>\n\n"
+            f"Telegram ID: <code>{telegram_id}</code>\n"
+            f"Uzum API: {'✅ ulangan' if connected else '❌ ulanmagan'}\n"
+            f"Topilgan do‘konlar: <b>{len(shops)}</b>\n"
+            f"Obuna: {subscription_status_text(telegram_id)}\n\n"
+            "Agar bot ma’lumotlarni ko‘rsatmasa, tekshiring:\n"
+            "1. API-kalit Uzum Seller kabinetida faol.\n"
+            "2. Kalit kerakli do‘konga ruxsatga ega.\n"
+            "3. Tanlangan davr bo‘yicha Uzum kabinetida savdolar bor.\n"
+            "4. API-kalitni o‘zgartirgan bo‘lsangiz — <code>/reconnect</code> ni bosing.\n\n"
+            f"Administrator bilan bog‘lanish: <b>{admin_contact_text()}</b>"
+        )
+    else:
+        text = (
+            "🛟 <b>Поддержка Uzum Seller Assistant</b>\n\n"
+            f"Ваш Telegram ID: <code>{telegram_id}</code>\n"
+            f"Uzum API: {'✅ подключён' if connected else '❌ не подключён'}\n"
+            f"Магазинов найдено: <b>{len(shops)}</b>\n"
+            f"Подписка: {subscription_status_text(telegram_id)}\n\n"
+            "Если бот не показывает данные, проверьте:\n"
+            "1. API-ключ активен в кабинете Uzum Seller.\n"
+            "2. У ключа есть доступ к нужному магазину.\n"
+            "3. В кабинете Uzum есть продажи за выбранный период.\n"
+            "4. Если меняли API-ключ — нажмите <code>/reconnect</code>.\n\n"
+            f"Связаться с администратором: <b>{admin_contact_text()}</b>"
+        )
+    await message.answer(text, reply_markup=admin_contact_markup() or menu_for_message(message))
 
 
 @dp.message(Command("my_payments"))
@@ -2904,24 +3294,24 @@ async def my_payments(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     rows = list_payments(telegram_id, 10)
     if not rows:
-        await message.answer("💳 История оплат пока пустая.", reply_markup=MAIN_MENU)
+        await message.answer("💳 История оплат пока пустая.", reply_markup=menu_for_message(message))
         return
     await message.answer(
         "💳 <b>Мои оплаты</b>\n\n" + "\n".join(payment_line(row) for row in rows),
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
 
 @dp.message(Command("my_subscription", "subscription"))
 async def my_subscription(message: Message) -> None:
     telegram_id = upsert_from_message(message)
-    await message.answer(subscription_full_text(telegram_id), reply_markup=MAIN_MENU)
+    await message.answer(subscription_full_text(telegram_id), reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("admin"))
 async def admin_panel(message: Message) -> None:
     admin_id = upsert_from_message(message)
     if not admin_only(admin_id):
-        await message.answer("⛔ Админ-панель доступна только владельцу бота.", reply_markup=MAIN_MENU)
+        await message.answer("⛔ Админ-панель доступна только владельцу бота.", reply_markup=menu_for_message(message))
         return
     init_business_tables()
     stats = get_admin_stats()
@@ -2944,7 +3334,7 @@ async def admin_panel(message: Message) -> None:
         "• <code>/paid6 ID</code> — 6 месяцев / 1 200 000 сум\n"
         "• <code>/expiring</code> — кто скоро заканчивается\n"
         "• <code>/backup_db</code> — скачать базу",
-        reply_markup=ADMIN_PANEL_MENU,
+        reply_markup=admin_menu_for_message(message),
     )
 
 
@@ -2964,7 +3354,7 @@ async def check_connection(message: Message) -> None:
     ]
     if client is None:
         lines.append("\nЧто делать: нажмите <code>/connect</code> и отправьте Uzum API-ключ.")
-        await message.answer("\n".join(lines), reply_markup=MAIN_MENU)
+        await message.answer("\n".join(lines), reply_markup=menu_for_message(message))
         return
     try:
         data = await client.get_shops()
@@ -2976,7 +3366,7 @@ async def check_connection(message: Message) -> None:
     except Exception as e:
         lines.append("Магазины: ❌ ошибка")
         lines.append(f"Причина: <code>{escape(str(e))[:500]}</code>")
-        await message.answer("\n".join(lines), reply_markup=MAIN_MENU)
+        await message.answer("\n".join(lines), reply_markup=menu_for_message(message))
         return
     if shop_id:
         try:
@@ -2993,7 +3383,7 @@ async def check_connection(message: Message) -> None:
             lines.append("Finance API: ❌ ошибка")
             lines.append(f"Причина: <code>{escape(str(e))[:500]}</code>")
     lines.append("\nЕсли здесь всё ✅ — бот готов к работе.")
-    await message.answer("\n".join(lines), reply_markup=MAIN_MENU)
+    await message.answer("\n".join(lines), reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("expiring"))
@@ -3003,11 +3393,11 @@ async def admin_expiring(message: Message) -> None:
         return
     rows = list_expiring_users(3, 50)
     if not rows:
-        await message.answer("⏳ В ближайшие 3 дня подписки не заканчиваются.", reply_markup=ADMIN_PANEL_MENU)
+        await message.answer("⏳ В ближайшие 3 дня подписки не заканчиваются.", reply_markup=admin_menu_for_message(message))
         return
     await message.answer(
         "⏳ <b>Заканчиваются в ближайшие 3 дня</b>\n\n" + "\n".join(subscription_compact_line(r) for r in rows),
-        reply_markup=ADMIN_PANEL_MENU,
+        reply_markup=admin_menu_for_message(message),
     )
 
 
@@ -3018,11 +3408,11 @@ async def admin_blocked_users(message: Message) -> None:
         return
     rows = list_blocked_users(50)
     if not rows:
-        await message.answer("⛔ Заблокированных пользователей нет.", reply_markup=ADMIN_PANEL_MENU)
+        await message.answer("⛔ Заблокированных пользователей нет.", reply_markup=admin_menu_for_message(message))
         return
     await message.answer(
         "⛔ <b>Заблокированные пользователи</b>\n\n" + "\n".join(subscription_compact_line(r) for r in rows),
-        reply_markup=ADMIN_PANEL_MENU,
+        reply_markup=admin_menu_for_message(message),
     )
 
 
@@ -3033,14 +3423,14 @@ async def admin_users(message: Message) -> None:
         return
     rows = list_subscription_users(30)
     if not rows:
-        await message.answer("Пользователей пока нет.", reply_markup=MAIN_MENU)
+        await message.answer("Пользователей пока нет.", reply_markup=menu_for_message(message))
         return
     lines = [subscription_compact_line(row) for row in rows]
     await message.answer(
         "👥 <b>Пользователи</b>\n\n"
         + "\n".join(lines)
         + "\n\nКоманды: <code>/extend ID 30</code>, <code>/paid ID сумма дни</code>, <code>/payments</code>",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
 
 
@@ -3051,7 +3441,7 @@ async def admin_user_info(message: Message) -> None:
         return
     arg = parse_args(message.text or "")
     if not arg.split() or not arg.split()[0].isdigit():
-        await message.answer("Напишите так: <code>/user TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        await message.answer("Напишите так: <code>/user TELEGRAM_ID</code>", reply_markup=menu_for_message(message))
         return
     target = int(arg.split()[0])
     row = ensure_subscription(target)
@@ -3070,7 +3460,7 @@ async def admin_user_info(message: Message) -> None:
         f"Trial до: <b>{_fmt_dt(row.get('trial_until'))}</b>\n"
         f"Оплачено до: <b>{_fmt_dt(row.get('subscription_until'))}</b>\n\n"
         f"💳 Последние оплаты:\n{payments_text}",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
 
 
@@ -3081,7 +3471,7 @@ async def admin_extend(message: Message) -> None:
         return
     parts = parse_args(message.text or "").split()
     if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
-        await message.answer("Напишите так: <code>/extend TELEGRAM_ID 30</code>", reply_markup=MAIN_MENU)
+        await message.answer("Напишите так: <code>/extend TELEGRAM_ID 30</code>", reply_markup=menu_for_message(message))
         return
     target = int(parts[0])
     days = int(parts[1])
@@ -3089,13 +3479,13 @@ async def admin_extend(message: Message) -> None:
     await message.answer(
         f"✅ Доступ продлён для <code>{target}</code> на {days} дней.\n"
         f"Активен до: <b>{_fmt_dt(new_until)}</b>",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
     try:
         await bot.send_message(
             target,
             f"✅ Ваша подписка продлена на {days} дней.\nАктивна до: <b>{_fmt_dt(new_until)}</b>",
-            reply_markup=MAIN_MENU,
+            reply_markup=main_menu_for_user(target),
         )
     except Exception:
         pass
@@ -3113,7 +3503,7 @@ async def admin_paid(message: Message) -> None:
         await message.answer(
             "Напишите так: <code>/paid TELEGRAM_ID СУММА ДНИ комментарий</code>\n"
             "Пример: <code>/paid 123456789 250000 30 чек Click</code>",
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
         return
     target = int(parts[0])
@@ -3129,7 +3519,7 @@ async def admin_paid(message: Message) -> None:
         f"Сумма: <b>{amount_text}</b> сум\n"
         f"Продление: <b>{days}</b> дней\n"
         f"Доступ до: <b>{_fmt_dt(new_until)}</b>",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
     try:
         await bot.send_message(
@@ -3138,7 +3528,7 @@ async def admin_paid(message: Message) -> None:
             f"Подписка продлена на <b>{days}</b> дней.\n"
             f"Доступ активен до: <b>{_fmt_dt(new_until)}</b>\n\n"
             "Спасибо за оплату!",
-            reply_markup=MAIN_MENU,
+            reply_markup=main_menu_for_user(target),
         )
     except Exception:
         pass
@@ -3151,14 +3541,14 @@ async def admin_paid_1_month(message: Message) -> None:
         return
     arg = parse_args(message.text or "").split(maxsplit=1)
     if not arg or not arg[0].isdigit():
-        await message.answer("Напишите так: <code>/paid1 TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        await message.answer("Напишите так: <code>/paid1 TELEGRAM_ID</code>", reply_markup=menu_for_message(message))
         return
     target = int(arg[0])
     new_until = extend_subscription_days(target, 30)
     payment_id = record_payment(target, 250000, 30, admin_id, "1 месяц")
-    await message.answer(f"✅ Оплата #{payment_id}: 250 000 сум. Доступ для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+    await message.answer(f"✅ Оплата #{payment_id}: 250 000 сум. Доступ для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=menu_for_message(message))
     try:
-        await bot.send_message(target, f"✅ Оплата подтверждена. Подписка продлена на 1 месяц. Доступ до: <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+        await bot.send_message(target, f"✅ Оплата подтверждена. Подписка продлена на 1 месяц. Доступ до: <b>{_fmt_dt(new_until)}</b>", reply_markup=main_menu_for_user(target))
     except Exception:
         pass
 
@@ -3170,14 +3560,14 @@ async def admin_paid_3_months(message: Message) -> None:
         return
     arg = parse_args(message.text or "").split(maxsplit=1)
     if not arg or not arg[0].isdigit():
-        await message.answer("Напишите так: <code>/paid3 TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        await message.answer("Напишите так: <code>/paid3 TELEGRAM_ID</code>", reply_markup=menu_for_message(message))
         return
     target = int(arg[0])
     new_until = extend_subscription_days(target, 90)
     payment_id = record_payment(target, 650000, 90, admin_id, "3 месяца")
-    await message.answer(f"✅ Оплата #{payment_id}: 650 000 сум. Доступ для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+    await message.answer(f"✅ Оплата #{payment_id}: 650 000 сум. Доступ для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=menu_for_message(message))
     try:
-        await bot.send_message(target, f"✅ Оплата подтверждена. Подписка продлена на 3 месяца. Доступ до: <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+        await bot.send_message(target, f"✅ Оплата подтверждена. Подписка продлена на 3 месяца. Доступ до: <b>{_fmt_dt(new_until)}</b>", reply_markup=main_menu_for_user(target))
     except Exception:
         pass
 
@@ -3189,14 +3579,14 @@ async def admin_paid_6_months(message: Message) -> None:
         return
     arg = parse_args(message.text or "").split(maxsplit=1)
     if not arg or not arg[0].isdigit():
-        await message.answer("Напишите так: <code>/paid6 TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        await message.answer("Напишите так: <code>/paid6 TELEGRAM_ID</code>", reply_markup=menu_for_message(message))
         return
     target = int(arg[0])
     new_until = extend_subscription_days(target, 180)
     payment_id = record_payment(target, 1200000, 180, admin_id, "6 месяцев")
-    await message.answer(f"✅ Оплата #{payment_id}: 1 200 000 сум. Доступ для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+    await message.answer(f"✅ Оплата #{payment_id}: 1 200 000 сум. Доступ для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=menu_for_message(message))
     try:
-        await bot.send_message(target, f"✅ Оплата подтверждена. Подписка продлена на 6 месяцев. Доступ до: <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+        await bot.send_message(target, f"✅ Оплата подтверждена. Подписка продлена на 6 месяцев. Доступ до: <b>{_fmt_dt(new_until)}</b>", reply_markup=main_menu_for_user(target))
     except Exception:
         pass
 
@@ -3210,10 +3600,10 @@ async def admin_payments(message: Message) -> None:
     target = int(args[0]) if args and args[0].isdigit() else None
     rows = list_payments(target, 20)
     if not rows:
-        await message.answer("💳 История оплат пока пустая.", reply_markup=MAIN_MENU)
+        await message.answer("💳 История оплат пока пустая.", reply_markup=menu_for_message(message))
         return
     title = f"💳 <b>Оплаты пользователя <code>{target}</code></b>" if target else "💳 <b>Последние оплаты</b>"
-    await message.answer(title + "\n\n" + "\n".join(payment_line(row) for row in rows), reply_markup=MAIN_MENU)
+    await message.answer(title + "\n\n" + "\n".join(payment_line(row) for row in rows), reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("backup_db"))
@@ -3223,9 +3613,9 @@ async def admin_backup_db(message: Message) -> None:
         return
     path = Path(DB_PATH)
     if not path.exists():
-        await message.answer(f"❌ База не найдена: <code>{escape(str(path))}</code>", reply_markup=MAIN_MENU)
+        await message.answer(f"❌ База не найдена: <code>{escape(str(path))}</code>", reply_markup=menu_for_message(message))
         return
-    await message.answer("📦 Отправляю резервную копию базы. Храните файл аккуратно — там данные пользователей.", reply_markup=MAIN_MENU)
+    await message.answer("📦 Отправляю резервную копию базы. Храните файл аккуратно — там данные пользователей.", reply_markup=menu_for_message(message))
     try:
         await message.answer_document(FSInputFile(str(path), filename=f"bot_backup_{datetime.now(UZT).strftime('%Y%m%d_%H%M')}.db"))
     except Exception as e:
@@ -3238,12 +3628,12 @@ async def admin_trial(message: Message) -> None:
         return
     parts = parse_args(message.text or "").split()
     if len(parts) < 2 or not parts[0].isdigit() or not parts[1].isdigit():
-        await message.answer("Напишите так: <code>/trial TELEGRAM_ID 3</code>", reply_markup=MAIN_MENU)
+        await message.answer("Напишите так: <code>/trial TELEGRAM_ID 3</code>", reply_markup=menu_for_message(message))
         return
     target = int(parts[0])
     days = int(parts[1])
     new_until = set_trial_days(target, days)
-    await message.answer(f"🎁 Trial для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+    await message.answer(f"🎁 Trial для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("block"))
@@ -3253,11 +3643,11 @@ async def admin_block(message: Message) -> None:
         return
     arg = parse_args(message.text or "").split()
     if not arg or not arg[0].isdigit():
-        await message.answer("Напишите так: <code>/block TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        await message.answer("Напишите так: <code>/block TELEGRAM_ID</code>", reply_markup=menu_for_message(message))
         return
     target = int(arg[0])
     set_blocked(target, True)
-    await message.answer(f"⛔ Пользователь <code>{target}</code> заблокирован.", reply_markup=MAIN_MENU)
+    await message.answer(f"⛔ Пользователь <code>{target}</code> заблокирован.", reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("unblock"))
@@ -3267,11 +3657,11 @@ async def admin_unblock(message: Message) -> None:
         return
     arg = parse_args(message.text or "").split()
     if not arg or not arg[0].isdigit():
-        await message.answer("Напишите так: <code>/unblock TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        await message.answer("Напишите так: <code>/unblock TELEGRAM_ID</code>", reply_markup=menu_for_message(message))
         return
     target = int(arg[0])
     set_blocked(target, False)
-    await message.answer(f"✅ Пользователь <code>{target}</code> разблокирован.", reply_markup=MAIN_MENU)
+    await message.answer(f"✅ Пользователь <code>{target}</code> разблокирован.", reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("broadcast"))
@@ -3281,19 +3671,19 @@ async def admin_broadcast(message: Message) -> None:
         return
     text = parse_args(message.text or "")
     if not text:
-        await message.answer("Напишите так: <code>/broadcast текст рассылки</code>", reply_markup=MAIN_MENU)
+        await message.answer("Напишите так: <code>/broadcast текст рассылки</code>", reply_markup=menu_for_message(message))
         return
     rows = list_subscription_users(500)
     sent = 0
     for row in rows:
         target = int(row["telegram_id"])
         try:
-            await bot.send_message(target, "📢 <b>Сообщение от администратора</b>\n\n" + text, reply_markup=MAIN_MENU)
+            await bot.send_message(target, "📢 <b>Сообщение от администратора</b>\n\n" + text, reply_markup=main_menu_for_user(target))
             sent += 1
             await asyncio.sleep(0.05)
         except Exception:
             pass
-    await message.answer(f"✅ Рассылка завершена. Отправлено: {sent}", reply_markup=MAIN_MENU)
+    await message.answer(f"✅ Рассылка завершена. Отправлено: {sent}", reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("debug_product"))
@@ -3311,7 +3701,7 @@ async def debug_product(message: Message) -> None:
                 "Товар для debug не найден. Ответ API:\n<code>"
                 + escape(compact_json_preview(data, limit=3000))
                 + "</code>",
-                reply_markup=MAIN_MENU,
+                reply_markup=menu_for_message(message),
             )
             return
 
@@ -3319,7 +3709,7 @@ async def debug_product(message: Message) -> None:
             "🧪 <b>Первый товар — сырой JSON</b>\n\n<code>"
             + escape(compact_json_preview(items[0], limit=3200))
             + "</code>",
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
     except Exception as e:
         await send_api_error(message, e)
@@ -3335,7 +3725,7 @@ async def export_products(message: Message) -> None:
     try:
         rows = await load_sku_rows(client, shop_id, max_pages=50)
         if not rows:
-            await message.answer("SKU-остатки для экспорта не найдены.", reply_markup=MAIN_MENU)
+            await message.answer("SKU-остатки для экспорта не найдены.", reply_markup=menu_for_message(message))
             return
 
         wb = Workbook()
@@ -3391,7 +3781,7 @@ async def export_products(message: Message) -> None:
         tmp_dir = Path(tempfile.gettempdir())
         filename = tmp_dir / f"uzum_stocks_{shop_id}.xlsx"
         wb.save(filename)
-        await message.answer(f"✅ Экспортировано SKU-остатков: {len(rows)}", reply_markup=MAIN_MENU)
+        await message.answer(f"✅ Экспортировано SKU-остатков: {len(rows)}", reply_markup=menu_for_message(message))
         await message.answer_document(FSInputFile(filename))
     except Exception as e:
         await send_api_error(message, e)
@@ -3708,7 +4098,7 @@ async def report_excel(message: Message) -> None:
     await message.answer(
         "⌛ Готовлю подробный Excel-отчёт...\n"
         "Это может занять 20–60 секунд: собираю продажи, остатки и FBO-накладные.",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
     try:
         filename = await _build_full_excel_report(client, shop_id)
@@ -3719,7 +4109,7 @@ async def report_excel(message: Message) -> None:
                 "Внутри листы: Сводка, Продажи 30 дней, Остатки, Заканчивается, "
                 "Потерянные, FBO накладные, Состав накладных."
             ),
-            reply_markup=MAIN_MENU,
+            reply_markup=menu_for_message(message),
         )
     except Exception as e:
         await send_api_error(message, e)
@@ -3830,7 +4220,7 @@ async def check_new_orders_once() -> None:
         )
 
         try:
-            await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+            await bot.send_message(telegram_id, text, reply_markup=main_menu_for_user(telegram_id))
         except Exception:
             logging.exception("Order watcher: failed to send notification to %s", telegram_id)
 
@@ -3865,7 +4255,7 @@ async def notify_status(message: Message) -> None:
         f"Проверка каждые: <b>{max(60, ORDER_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
         f"Состояние: {'заказы уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
         "Бот уведомит, когда появится новый заказ со статусом <code>CREATED</code>.",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
 
 
@@ -3948,7 +4338,7 @@ async def check_low_stock_once() -> None:
         )
 
         try:
-            await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+            await bot.send_message(telegram_id, text, reply_markup=main_menu_for_user(telegram_id))
         except Exception:
             logging.exception("Low stock watcher: failed to send notification to %s", telegram_id)
 
@@ -3985,7 +4375,7 @@ async def lowstock_notify_status(message: Message) -> None:
         f"Проверка каждые: <b>{max(300, LOW_STOCK_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
         f"Состояние: {'остатки уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
         "Бот уведомит, когда товар впервые опустится до порога или ниже.",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
 
 
@@ -4055,7 +4445,7 @@ async def check_out_of_stock_once() -> None:
         )
 
         try:
-            await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+            await bot.send_message(telegram_id, text, reply_markup=main_menu_for_user(telegram_id))
         except Exception:
             logging.exception("Out of stock watcher: failed to send notification to %s", telegram_id)
 
@@ -4090,7 +4480,7 @@ async def outofstock_notify_status(message: Message) -> None:
         f"Проверка каждые: <b>{max(300, OUT_OF_STOCK_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
         f"Состояние: {'нулевые остатки уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
         "Бот уведомит, когда товар впервые опустится до остатка <b>0</b>.",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
 
 
@@ -4200,7 +4590,8 @@ def format_sale_line(item: dict[str, Any]) -> str:
     )
 
 
-def build_new_sale_message(item: dict[str, Any], shop_id: int | None = None) -> str:
+def build_new_sale_message(item: dict[str, Any], shop_id: int | None = None, lang: str = "ru") -> str:
+    lang = normalize_lang(lang)
     title = escape(_finance_title(item))
     sku = escape(_finance_sku_title(item))
     qty = _finance_qty(item)
@@ -4214,6 +4605,24 @@ def build_new_sale_message(item: dict[str, Any], shop_id: int | None = None) -> 
     logistics = _finance_logistics(item)
     payout_direct = _finance_payout_direct(item)
     payout = payout_direct if payout_direct is not None else max(0.0, _finance_gross_revenue(item) - commission - logistics)
+
+    if lang == "uz":
+        shop_line = f"Do‘kon: <code>{shop_id}</code>\n" if shop_id is not None else ""
+        return (
+            "🛒 <b>Yangi Uzum FBO savdosi</b>\n\n"
+            + shop_line +
+            f"<b>Tovar:</b> {title}\n"
+            f"<b>SKU:</b> {sku}\n"
+            f"<b>Soni:</b> {qty:g} dona\n\n"
+            f"<b>Sotuv narxi:</b> {_format_money(float(unit_price or 0))}\n"
+            f"<b>Komissiya:</b> {_format_money(float(commission))}\n"
+            f"<b>Logistika:</b> {_format_money(float(logistics))}\n"
+            f"<b>To‘lovga:</b> {_format_money(float(payout))}\n\n"
+            f"<b>Buyurtma ID:</b> {escape(_finance_order_id(item))}\n"
+            f"<b>Savdo ID:</b> {escape(_finance_sale_id(item))}\n"
+            f"<b>Status:</b> {escape(_finance_status(item))}\n"
+            f"<b>Sana:</b> {escape(_format_finance_date(_finance_date_value(item)))}"
+        )
 
     shop_line = f"Магазин: <code>{shop_id}</code>\n" if shop_id is not None else ""
     return (
@@ -4286,8 +4695,8 @@ async def check_new_sales_once() -> None:
             try:
                 await bot.send_message(
                     telegram_id,
-                    build_new_sale_message(item, shop_id=shop_id),
-                    reply_markup=MAIN_MENU,
+                    build_new_sale_message(item, shop_id=shop_id, lang=get_user_language(telegram_id)),
+                    reply_markup=main_menu_for_user(telegram_id),
                 )
                 await asyncio.sleep(0.15)
             except Exception:
@@ -4298,7 +4707,7 @@ async def check_new_sales_once() -> None:
                 await bot.send_message(
                     telegram_id,
                     f"➕ Ещё новых строк продаж: <b>{len(new_rows) - 10}</b>\nПодробно: <code>/balance</code>",
-                    reply_markup=MAIN_MENU,
+                    reply_markup=main_menu_for_user(telegram_id),
                 )
             except Exception:
                 logging.exception("Sales watcher: failed to send summary notification to %s", telegram_id)
@@ -4334,7 +4743,7 @@ async def sales_notify_status(message: Message) -> None:
         f"Проверка каждые: <b>{max(60, SALE_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
         f"Состояние: {'продажи уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
         "Бот смотрит Finance API за сегодня. Если Finance API отдаёт продажу с задержкой, уведомление тоже придёт с задержкой.",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
 
 
@@ -4465,7 +4874,7 @@ async def check_stock_change_once() -> None:
         )
 
         try:
-            await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+            await bot.send_message(telegram_id, text, reply_markup=main_menu_for_user(telegram_id))
         except Exception:
             logging.exception("Stock change watcher: failed to send notification to %s", telegram_id)
 
@@ -4501,41 +4910,48 @@ async def stock_change_notify_status(message: Message) -> None:
         f"Состояние: {'остатки уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
         "Бот сравнивает <b>FBO</b>, <b>FBS/DBS</b> и <b>общий остаток</b>. "
         "Так можно поймать FBO-продажи, даже если Finance API показывает нули.",
-        reply_markup=MAIN_MENU,
+        reply_markup=menu_for_message(message),
     )
 
 
 # --- Главное меню в стиле Noorza Bot ---
+@dp.message(F.text == "👑 Admin")
 @dp.message(F.text == "👑 Админ")
 async def button_admin_panel(message: Message) -> None:
     await admin_panel(message)
 
 
+@dp.message(F.text == "👥 Foydalanuvchilar")
 @dp.message(F.text == "👥 Пользователи")
 async def button_admin_users(message: Message) -> None:
     await admin_users(message)
 
 
+@dp.message(F.text == "💳 To‘lovlar")
 @dp.message(F.text == "💳 Оплаты")
 async def button_admin_payments(message: Message) -> None:
     await admin_payments(message)
 
 
+@dp.message(F.text == "⏳ Tugayotganlar")
 @dp.message(F.text == "⏳ Скоро заканчиваются")
 async def button_admin_expiring(message: Message) -> None:
     await admin_expiring(message)
 
 
+@dp.message(F.text == "⛔ Bloklanganlar")
 @dp.message(F.text == "⛔ Заблокированные")
 async def button_admin_blocked(message: Message) -> None:
     await admin_blocked_users(message)
 
 
+@dp.message(F.text == "📦 Baza zaxirasi")
 @dp.message(F.text == "📦 Бэкап базы")
 async def button_admin_backup(message: Message) -> None:
     await admin_backup_db(message)
 
 
+@dp.message(F.text == "📢 Xabar yuborish")
 @dp.message(F.text == "📢 Рассылка")
 async def button_admin_broadcast_help(message: Message) -> None:
     admin_id = upsert_from_message(message)
@@ -4547,46 +4963,55 @@ async def button_admin_broadcast_help(message: Message) -> None:
         "<code>/broadcast ваш текст</code>\n\n"
         "Пример:\n"
         "<code>/broadcast Завтра в 09:00 будет обновление бота.</code>",
-        reply_markup=ADMIN_PANEL_MENU,
+        reply_markup=admin_menu_for_message(message),
     )
 
 
+@dp.message(F.text == "✅ Ulanishni tekshirish")
 @dp.message(F.text == "✅ Проверить подключение")
 async def button_check_connection(message: Message) -> None:
     await check_connection(message)
 
 
+@dp.message(F.text == "⬅️ Asosiy menyu")
 @dp.message(F.text == "⬅️ Главное меню")
+@dp.message(F.text == "Menyu")
 @dp.message(F.text == "Меню")
 async def button_main_menu(message: Message) -> None:
-    await message.answer("Главное меню 👇", reply_markup=MAIN_MENU)
+    await message.answer(tr_user(upsert_from_message(message), "main_menu"), reply_markup=menu_for_message(message))
 
 
+@dp.message(F.text == "💰 Balans")
 @dp.message(F.text == "💰 Баланс")
 async def button_balance(message: Message) -> None:
     await balance(message)
 
 
+@dp.message(F.text == "📊 Bugun")
 @dp.message(F.text == "📊 Сегодня")
 async def button_today(message: Message) -> None:
     await today_sales(message)
 
 
+@dp.message(F.text == "📆 Kecha")
 @dp.message(F.text == "📆 Вчера")
 async def button_yesterday(message: Message) -> None:
     await yesterday_sales(message)
 
 
+@dp.message(F.text == "🗓 7 kun")
 @dp.message(F.text == "🗓 7 дней")
 async def button_week(message: Message) -> None:
     await week_sales(message)
 
 
+@dp.message(F.text == "📅 30 kun")
 @dp.message(F.text == "📅 30 дней")
 async def button_30_days(message: Message) -> None:
     await sales_30(message)
 
 
+@dp.message(F.text == "📦 Qoldiq")
 @dp.message(F.text == "📦 Остатки")
 async def button_stock_short(message: Message) -> None:
     await stock(message)
@@ -4598,21 +5023,25 @@ async def button_lowstock_short(message: Message) -> None:
     await lowstock(message)
 
 
+@dp.message(F.text == "🧭 Yo‘qolganlar")
 @dp.message(F.text == "🧭 Потерянные")
 async def button_lost(message: Message) -> None:
     await lost_goods(message)
 
 
+@dp.message(F.text == "📄 FBO yuk xatlari")
 @dp.message(F.text == "📄 Накладные FBO")
 async def button_fbo_invoices(message: Message) -> None:
     await fbo_invoices(message)
 
 
+@dp.message(F.text == "💎 Obuna")
 @dp.message(F.text == "💎 Подписка")
 async def button_subscription(message: Message) -> None:
     await subscribe(message)
 
 
+@dp.message(F.text == "ℹ️ Yordam")
 @dp.message(F.text == "ℹ️ Помощь")
 @dp.message(F.text == "❓ Помощь")
 async def button_help(message: Message) -> None:
@@ -4622,7 +5051,7 @@ async def button_help(message: Message) -> None:
 # Старые красивые кнопки оставлены для совместимости, если они остались у пользователя в Telegram.
 @dp.message(F.text == "📊 Аналитика")
 async def section_analytics(message: Message) -> None:
-    await message.answer("Главное меню 👇", reply_markup=MAIN_MENU)
+    await message.answer(tr_user(upsert_from_message(message), "main_menu"), reply_markup=menu_for_message(message))
 
 
 @dp.message(F.text == "📦 Товары")
@@ -4694,6 +5123,7 @@ async def button_orders(message: Message) -> None:
     await orders(message)
 
 
+@dp.message(F.text == "📊 Excel hisobot")
 @dp.message(F.text == "📊 Excel отчёт")
 @dp.message(F.text == "📄 Excel-отчёт")
 async def button_excel_report(message: Message) -> None:
@@ -4705,6 +5135,7 @@ async def button_status(message: Message) -> None:
     await status(message)
 
 
+@dp.message(F.text == "🏪 Do‘konlar")
 @dp.message(F.text == "🏪 Магазины")
 async def button_shops(message: Message) -> None:
     await shops(message)
@@ -4938,13 +5369,13 @@ async def balance_all_shops(message: Message) -> None:
         return
     client = get_uzum_for_user(telegram_id)
     if client is None:
-        await message.answer("Сначала подключите Uzum API-токен: <code>/connect</code>", reply_markup=MAIN_MENU)
+        await message.answer("Сначала подключите Uzum API-токен: <code>/connect</code>", reply_markup=menu_for_message(message))
         return
-    await message.answer("⌛ Считаю баланс по всем магазинам за 30 дней...", reply_markup=MAIN_MENU)
+    await message.answer("⌛ Считаю баланс по всем магазинам за 30 дней...", reply_markup=menu_for_message(message))
     try:
         date_from, date_to = _days_range_ms(30)
         stats, per_shop, shops_count = await _all_shops_finance_stats(telegram_id, client, date_from, date_to)
-        await message.answer(_format_all_shops_balance("за 30 дней", shops_count, stats, per_shop), reply_markup=MAIN_MENU)
+        await message.answer(_format_all_shops_balance("за 30 дней", shops_count, stats, per_shop), reply_markup=menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -4981,11 +5412,11 @@ async def top_products(message: Message) -> None:
         return
     _, client, shop_id = req
     days = TOP_PRODUCTS_DAYS
-    await message.answer(f"⌛ Считаю топ товаров за {days} дней...", reply_markup=MAIN_MENU)
+    await message.answer(f"⌛ Считаю топ товаров за {days} дней...", reply_markup=menu_for_message(message))
     try:
         top, stats = await _top_products_for_shop(client, shop_id, days)
         if not top:
-            await message.answer(f"🏆 <b>Топ товаров за {days} дней</b>\nМагазин: <code>{shop_id}</code>\n\nПродаж не найдено.", reply_markup=MAIN_MENU)
+            await message.answer(f"🏆 <b>Топ товаров за {days} дней</b>\nМагазин: <code>{shop_id}</code>\n\nПродаж не найдено.", reply_markup=menu_for_message(message))
             return
         lines = [
             f"🏆 <b>Топ товаров за {days} дней</b>",
@@ -5004,7 +5435,7 @@ async def top_products(message: Message) -> None:
                 f"К выплате: <b>{_format_money(float(item.get('payout') or 0))}</b>"
             )
         for part in _split_long_message("\n\n".join(lines)):
-            await message.answer(part, reply_markup=MAIN_MENU)
+            await message.answer(part, reply_markup=menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -5016,7 +5447,7 @@ async def dead_stock(message: Message) -> None:
         return
     _, client, shop_id = req
     days = DEAD_STOCK_DAYS
-    await message.answer(f"⌛ Ищу товары с остатком, но без продаж за {days} дней...", reply_markup=MAIN_MENU)
+    await message.answer(f"⌛ Ищу товары с остатком, но без продаж за {days} дней...", reply_markup=menu_for_message(message))
     try:
         date_from, date_to = _days_range_ms(days)
         sales_rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=5, page_size=100)
@@ -5036,7 +5467,7 @@ async def dead_stock(message: Message) -> None:
                 candidates.append({"row": row, "total": total, "price": price, "value": total * price})
         candidates.sort(key=lambda x: float(x.get("value") or 0), reverse=True)
         if not candidates:
-            await message.answer(f"🐢 <b>Товары без продаж за {days} дней</b>\nМагазин: <code>{shop_id}</code>\n\nНе нашёл товаров с остатком и нулевыми продажами.", reply_markup=MAIN_MENU)
+            await message.answer(f"🐢 <b>Товары без продаж за {days} дней</b>\nМагазин: <code>{shop_id}</code>\n\nНе нашёл товаров с остатком и нулевыми продажами.", reply_markup=menu_for_message(message))
             return
         total_value = sum(float(x.get("value") or 0) for x in candidates)
         lines = [
@@ -5058,7 +5489,7 @@ async def dead_stock(message: Message) -> None:
             )
         lines.append("<i>Расчёт примерный: бот сопоставляет продажи и остатки по SKU/названию.</i>")
         for part in _split_long_message("\n\n".join(lines)):
-            await message.answer(part, reply_markup=MAIN_MENU)
+            await message.answer(part, reply_markup=menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -5069,7 +5500,7 @@ async def smart_lowstock(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
-    await message.answer("⌛ Считаю, на сколько дней хватит остатков...", reply_markup=MAIN_MENU)
+    await message.answer("⌛ Считаю, на сколько дней хватит остатков...", reply_markup=menu_for_message(message))
     try:
         date_from, date_to = _days_range_ms(7)
         sales_rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=5, page_size=100)
@@ -5097,7 +5528,7 @@ async def smart_lowstock(message: Message) -> None:
             await message.answer(
                 f"⚠️ <b>Умное 'Заканчивается'</b>\nМагазин: <code>{shop_id}</code>\n\n"
                 f"Критичных товаров не нашёл. Порог: ≤ {LOW_STOCK_THRESHOLD} шт. или хватит меньше чем на {SMART_LOW_STOCK_DAYS} дня.",
-                reply_markup=MAIN_MENU,
+                reply_markup=menu_for_message(message),
             )
             return
         lines = [
@@ -5119,7 +5550,7 @@ async def smart_lowstock(message: Message) -> None:
                 f"Хватит: <b>{escape(days_text)}</b>"
             )
         for part in _split_long_message("\n\n".join(lines)):
-            await message.answer(part, reply_markup=MAIN_MENU)
+            await message.answer(part, reply_markup=menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -5146,11 +5577,11 @@ async def morning_report(message: Message) -> None:
         return
     client = get_uzum_for_user(telegram_id)
     if client is None:
-        await message.answer("Сначала подключите Uzum API-токен: <code>/connect</code>", reply_markup=MAIN_MENU)
+        await message.answer("Сначала подключите Uzum API-токен: <code>/connect</code>", reply_markup=menu_for_message(message))
         return
-    await message.answer("⌛ Готовлю утренний отчёт за вчера...", reply_markup=MAIN_MENU)
+    await message.answer("⌛ Готовлю утренний отчёт за вчера...", reply_markup=menu_for_message(message))
     try:
-        await message.answer(await _build_morning_report_text(telegram_id, client), reply_markup=MAIN_MENU)
+        await message.answer(await _build_morning_report_text(telegram_id, client), reply_markup=menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -5162,11 +5593,11 @@ async def admin_extend_1_month(message: Message) -> None:
         return
     arg = parse_args(message.text or "").split()
     if not arg or not arg[0].isdigit():
-        await message.answer("Напишите так: <code>/extend1 TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        await message.answer("Напишите так: <code>/extend1 TELEGRAM_ID</code>", reply_markup=menu_for_message(message))
         return
     target = int(arg[0])
     new_until = extend_subscription_days(target, 30)
-    await message.answer(f"✅ Продлено на 1 месяц для <code>{target}</code>. До: <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+    await message.answer(f"✅ Продлено на 1 месяц для <code>{target}</code>. До: <b>{_fmt_dt(new_until)}</b>", reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("extend3"))
@@ -5176,11 +5607,11 @@ async def admin_extend_3_months(message: Message) -> None:
         return
     arg = parse_args(message.text or "").split()
     if not arg or not arg[0].isdigit():
-        await message.answer("Напишите так: <code>/extend3 TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        await message.answer("Напишите так: <code>/extend3 TELEGRAM_ID</code>", reply_markup=menu_for_message(message))
         return
     target = int(arg[0])
     new_until = extend_subscription_days(target, 90)
-    await message.answer(f"✅ Продлено на 3 месяца для <code>{target}</code>. До: <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+    await message.answer(f"✅ Продлено на 3 месяца для <code>{target}</code>. До: <b>{_fmt_dt(new_until)}</b>", reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("extend6"))
@@ -5190,33 +5621,38 @@ async def admin_extend_6_months(message: Message) -> None:
         return
     arg = parse_args(message.text or "").split()
     if not arg or not arg[0].isdigit():
-        await message.answer("Напишите так: <code>/extend6 TELEGRAM_ID</code>", reply_markup=MAIN_MENU)
+        await message.answer("Напишите так: <code>/extend6 TELEGRAM_ID</code>", reply_markup=menu_for_message(message))
         return
     target = int(arg[0])
     new_until = extend_subscription_days(target, 180)
-    await message.answer(f"✅ Продлено на 6 месяцев для <code>{target}</code>. До: <b>{_fmt_dt(new_until)}</b>", reply_markup=MAIN_MENU)
+    await message.answer(f"✅ Продлено на 6 месяцев для <code>{target}</code>. До: <b>{_fmt_dt(new_until)}</b>", reply_markup=menu_for_message(message))
 
 
+@dp.message(F.text == "🌐 Barcha do‘konlar")
 @dp.message(F.text == "🌐 Все магазины")
 async def button_all_shops(message: Message) -> None:
     await balance_all_shops(message)
 
 
+@dp.message(F.text == "🏆 Top tovarlar")
 @dp.message(F.text == "🏆 Топ товаров")
 async def button_top_products(message: Message) -> None:
     await top_products(message)
 
 
+@dp.message(F.text == "🐢 Sotilmayapti")
 @dp.message(F.text == "🐢 Не продаётся")
 async def button_dead_stock(message: Message) -> None:
     await dead_stock(message)
 
 
+@dp.message(F.text == "🌙 Ertalabki hisobot")
 @dp.message(F.text == "🌙 Утренний отчёт")
 async def button_morning_report(message: Message) -> None:
     await morning_report(message)
 
 
+@dp.message(F.text == "⚠️ Qoldiq prognozi")
 @dp.message(F.text == "⚠️ Прогноз остатков")
 async def button_smart_lowstock(message: Message) -> None:
     await smart_lowstock(message)
@@ -5255,7 +5691,7 @@ async def daily_report_loop() -> None:
                         token = cipher.decrypt(row["uzum_token_encrypted"])
                         client = UzumClient(token, UZUM_API_BASE_URL)
                         text = await _build_morning_report_text(telegram_id, client)
-                        await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+                        await bot.send_message(telegram_id, text, reply_markup=main_menu_for_user(telegram_id))
                         _daily_report_sent.add(key)
                         await asyncio.sleep(0.5)
                     except Exception:
@@ -5303,7 +5739,7 @@ async def subscription_reminder_loop() -> None:
                                 f"Подписка/trial активны до: <b>{_fmt_dt(until)}</b>\n\n"
                                 "Чтобы бот продолжил работать без остановки, продлите подписку заранее.\n"
                                 "Оплата: <code>/subscribe</code>",
-                                reply_markup=MAIN_MENU,
+                                reply_markup=main_menu_for_user(telegram_id),
                             )
                             _subscription_reminder_sent.add(key)
                             await asyncio.sleep(0.2)
@@ -5382,7 +5818,7 @@ async def check_new_orders_once() -> None:
                 + "\n\nОткрыть список: <code>/orders</code>"
             )
             try:
-                await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+                await bot.send_message(telegram_id, text, reply_markup=main_menu_for_user(telegram_id))
                 await asyncio.sleep(0.15)
             except Exception:
                 logging.exception("Order watcher: failed to send notification to %s", telegram_id)
@@ -5436,7 +5872,7 @@ async def check_low_stock_once() -> None:
                 + f"\n\nПоказать все низкие остатки: <code>/lowstock {threshold}</code>"
             )
             try:
-                await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+                await bot.send_message(telegram_id, text, reply_markup=main_menu_for_user(telegram_id))
                 await asyncio.sleep(0.15)
             except Exception:
                 logging.exception("Low stock watcher: failed to send notification to %s", telegram_id)
@@ -5488,7 +5924,7 @@ async def check_out_of_stock_once() -> None:
                 + "\n\nПоказать остатки: <code>/stock</code>"
             )
             try:
-                await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+                await bot.send_message(telegram_id, text, reply_markup=main_menu_for_user(telegram_id))
                 await asyncio.sleep(0.15)
             except Exception:
                 logging.exception("Out of stock watcher: failed to send notification to %s", telegram_id)
@@ -5539,7 +5975,7 @@ async def check_new_sales_once() -> None:
 
             for item in new_rows[:10]:
                 try:
-                    await bot.send_message(telegram_id, build_new_sale_message(item, shop_id=shop_id), reply_markup=MAIN_MENU)
+                    await bot.send_message(telegram_id, build_new_sale_message(item, shop_id=shop_id, lang=get_user_language(telegram_id)), reply_markup=main_menu_for_user(telegram_id))
                     await asyncio.sleep(0.15)
                 except Exception:
                     logging.exception("Sales watcher: failed to send sale notification to %s", telegram_id)
@@ -5549,7 +5985,7 @@ async def check_new_sales_once() -> None:
                     await bot.send_message(
                         telegram_id,
                         f"➕ Ещё новых строк продаж: <b>{len(new_rows) - 10}</b>\nПодробно: <code>/balance</code>",
-                        reply_markup=MAIN_MENU,
+                        reply_markup=main_menu_for_user(telegram_id),
                     )
                 except Exception:
                     logging.exception("Sales watcher: failed to send summary notification to %s", telegram_id)
@@ -5612,7 +6048,7 @@ async def check_stock_change_once() -> None:
                 + "\n\nПроверить остатки: <code>/stock</code>"
             )
             try:
-                await bot.send_message(telegram_id, text, reply_markup=MAIN_MENU)
+                await bot.send_message(telegram_id, text, reply_markup=main_menu_for_user(telegram_id))
                 await asyncio.sleep(0.15)
             except Exception:
                 logging.exception("Stock change watcher: failed to send notification to %s", telegram_id)
@@ -5640,5 +6076,6 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
