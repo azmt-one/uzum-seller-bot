@@ -569,7 +569,6 @@ def list_blocked_users(limit: int = 50) -> list[dict[str, Any]]:
 
 init_subscription_tables()
 init_business_tables()
-init_language_tables()
 
 # --- Языки интерфейса ---
 # Основной код отчётов остаётся совместимым с русскими командами, но клиент может выбрать язык меню и основных экранов.
@@ -627,6 +626,10 @@ def set_user_language(telegram_id: int, lang: str) -> None:
         )
         conn.commit()
 
+
+
+# Создаём таблицу языков после определения функции, чтобы не было NameError при запуске.
+init_language_tables()
 
 def language_title(lang: str) -> str:
     return "O‘zbekcha" if normalize_lang(lang) == "uz" else "Русский"
@@ -6076,6 +6079,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
