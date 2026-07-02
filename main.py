@@ -856,7 +856,120 @@ async def _send_message_with_runtime_translation(self: Bot, chat_id: Any, text: 
 
 
 Message.answer = _answer_with_runtime_translation
+
 Bot.send_message = _send_message_with_runtime_translation
+
+# --- Чистка узбекского текста ---
+# Первый переводчик выше специально не трогает бизнес-логику, а делает замену текста на лету.
+# Здесь финальный слой: убирает смешанные русско-узбекские фразы вроде "Продажи за 30 kun".
+_LEGACY_TRANSLATE_RUNTIME_TEXT_TO_UZ = translate_runtime_text_to_uz
+
+
+def translate_runtime_text_to_uz(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+    text = _LEGACY_TRANSLATE_RUNTIME_TEXT_TO_UZ(text)
+
+    fixes = [
+        # Заголовки продаж — без смеси русского и узбекского
+        ("💰 <b>Продажи сегодня</b>", "💰 <b>Bugungi savdo</b>"),
+        ("💰 <b>Продажи bugun uchun</b>", "💰 <b>Bugungi savdo</b>"),
+        ("💰 <b>Продажи за 7 kun</b>", "💰 <b>7 kunlik savdo</b>"),
+        ("💰 <b>Продажи 7 kun uchun</b>", "💰 <b>7 kunlik savdo</b>"),
+        ("💰 <b>Продажи за 30 kun</b>", "💰 <b>30 kunlik savdo</b>"),
+        ("💰 <b>Продажи 30 kun uchun</b>", "💰 <b>30 kunlik savdo</b>"),
+        ("💰 <b>Продажи tanlangan davr uchun</b>", "💰 <b>Tanlangan davr savdosi</b>"),
+        ("💰 <b>Продажи kecha uchun</b>", "💰 <b>Kechagi savdo</b>"),
+        ("💰 <b>Продажи за выбранный период</b>", "💰 <b>Tanlangan davr savdosi</b>"),
+
+        # Частые поля в финансовых отчётах
+        ("Проданных строк/позиций:", "Sotuv pozitsiyalari:"),
+        ("Sotilgan строк/позitsiyalar:", "Sotuv pozitsiyalari:"),
+        ("Sotilgan qator/pozitsiyalar:", "Sotuv pozitsiyalari:"),
+        ("Позиций/строк:", "Sotuv pozitsiyalari:"),
+        ("строк:", "qatorlar:"),
+        ("Строк:", "Qatorlar:"),
+        ("Штук:", "Soni:"),
+        ("штук:", "soni:"),
+        ("Средняя строка:", "O‘rtacha savdo:"),
+        ("O‘rtacha строка:", "O‘rtacha savdo:"),
+        ("Отменённых строк:", "Bekor qilinganlar:"),
+        ("Отмененных строк:", "Bekor qilinganlar:"),
+        ("Bekor qilingan qatorlar:", "Bekor qilinganlar:"),
+        ("Топ товаров по so‘mme:", "Summa bo‘yicha top tovarlar:"),
+        ("Топ товаров по so‘mме:", "Summa bo‘yicha top tovarlar:"),
+        ("Топ товаров по сумме:", "Summa bo‘yicha top tovarlar:"),
+        ("Top товаров по so‘mme:", "Summa bo‘yicha top tovarlar:"),
+        ("Top товаров по сумме:", "Summa bo‘yicha top tovarlar:"),
+        ("Top tovarlar по so‘mme:", "Summa bo‘yicha top tovarlar:"),
+        ("Top tovarlar по сумме:", "Summa bo‘yicha top tovarlar:"),
+        ("по so‘mme", "summa bo‘yicha"),
+        ("по so‘mме", "summa bo‘yicha"),
+        ("по сумме", "summa bo‘yicha"),
+        ("Без названия", "Nomsiz"),
+
+        # Периоды и служебные фразы
+        ("за 30 kun", "30 kun uchun"),
+        ("за 7 kun", "7 kun uchun"),
+        ("за 1 kun", "1 kun uchun"),
+        ("Сегодня", "Bugun"),
+        ("Вчера", "Kecha"),
+        ("7 дней", "7 kun"),
+        ("30 дней", "30 kun"),
+        ("Ответ Finance API пришёл, но строки продаж не найдены.", "Finance API javob berdi, lekin savdo qatorlari topilmadi."),
+        ("Фрагмент ответа:", "Javobdan parcha:"),
+        ("Подробно:", "Batafsil:"),
+        ("Показаны первые", "Birinchi"),
+        ("позиций из", "pozitsiya ko‘rsatildi, jami"),
+
+        # Остатки, накладные, общие поля
+        ("Товары без продаж", "Sotilmayotgan tovarlar"),
+        ("Не продаётся", "Sotilmayapti"),
+        ("Прогноз остатков", "Qoldiq prognozi"),
+        ("Все магазины", "Barcha do‘konlar"),
+        ("Накладные FBO", "FBO yuk xatlari"),
+        ("Состав накладной", "Yuk xati tarkibi"),
+        ("Потерянные", "Yo‘qolganlar"),
+        ("Заканчивается", "Tugayapti"),
+        ("Заканчиваются", "Tugayapti"),
+        ("Остатки", "Qoldiq"),
+        ("Остаток", "Qoldiq"),
+        ("Продано", "Sotilgan"),
+        ("Возврат", "Qaytarilgan"),
+        ("Возвраты", "Qaytarilganlar"),
+        ("Комиссия Uzum", "Uzum komissiyasi"),
+        ("Комиссия", "Komissiya"),
+        ("Логистика", "Logistika"),
+        ("Выручка", "Tushum"),
+        ("К выплате всего", "Jami to‘lovga"),
+        ("К выплате", "To‘lovga"),
+        ("Уже выведено", "Chiqarilgan"),
+        ("Остаток к выплате", "To‘lovga qoldi"),
+        ("Статусы", "Statuslar"),
+        ("Статус", "Status"),
+        ("Магазин", "Do‘kon"),
+        ("Товар", "Tovar"),
+        ("Дата", "Sana"),
+        ("Цена продажи", "Sotuv narxi"),
+        ("ID заказа", "Buyurtma ID"),
+        ("ID продажи", "Sotuv ID"),
+        ("Кол-во", "Soni"),
+        ("Итого", "Jami"),
+        ("Сумма", "Summa"),
+        ("Разница", "Farq"),
+        ("Расхождение", "Farq"),
+        ("Принято", "Qabul qilingan"),
+        ("К поставке", "Yetkazishga"),
+        ("Накладная", "Yuk xati"),
+    ]
+    for old, new in fixes:
+        text = text.replace(old, new)
+
+    # Безопасная замена валюты/единиц: только как отдельные слова в суммах.
+    import re
+    text = re.sub(r"(?<=\d)\s*сум\b", " so‘m", text)
+    text = re.sub(r"(?<=\d)\s*шт\.?\b", " dona", text)
+    return text
 
 
 def language_markup() -> InlineKeyboardMarkup:
