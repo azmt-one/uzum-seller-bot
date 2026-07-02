@@ -629,7 +629,6 @@ def set_user_language(telegram_id: int, lang: str) -> None:
 
 
 # Создаём таблицу языков после определения функции, чтобы не было NameError при запуске.
-init_language_tables()
 
 def language_title(lang: str) -> str:
     return "O‘zbekcha" if normalize_lang(lang) == "uz" else "Русский"
@@ -682,6 +681,182 @@ def tr(lang: str, key: str) -> str:
 
 def tr_user(telegram_id: int | None, key: str) -> str:
     return tr(get_user_language(telegram_id), key)
+
+
+
+# --- Автоперевод сообщений с данными на узбекский ---
+def translate_runtime_text_to_uz(text: str) -> str:
+    """Лёгкий пост-процессор: переводит основные русские ответы и отчёты на узбекский.
+
+    Меню уже переключается отдельными клавиатурами. Этот слой нужен для старых
+    функций, где текст отчётов был собран на русском внутри бизнес-логики.
+    Числа, ID, SKU, статусы и суммы не меняются.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+
+    replacements = [
+        # waiting / service
+        ("⌛ Считаю баланс за 30 дней...", "⌛ 30 kunlik balans hisoblanmoqda..."),
+        ("⌛ Считаю баланс по всем магазинам за 30 дней...", "⌛ Barcha do‘konlar bo‘yicha 30 kunlik balans hisoblanmoqda..."),
+        ("⌛ Считаю продажи за сегодня...", "⌛ Bugungi sotuvlar hisoblanmoqda..."),
+        ("⌛ Считаю продажи за вчера...", "⌛ Kechagi sotuvlar hisoblanmoqda..."),
+        ("⌛ Считаю продажи за 7 дней...", "⌛ 7 kunlik sotuvlar hisoblanmoqda..."),
+        ("⏳ Считаю продажи за сегодня, 7 и 30 дней...", "⏳ Bugun, 7 kun va 30 kunlik sotuvlar hisoblanmoqda..."),
+        ("⏳ Считаю заказы по статусам...", "⏳ Buyurtmalar statuslar bo‘yicha hisoblanmoqda..."),
+        ("⌛ Считаю топ товаров", "⌛ Top tovarlar hisoblanmoqda"),
+        ("⌛ Считаю, на сколько дней хватит остатков...", "⌛ Qoldiq necha kunga yetishi hisoblanmoqda..."),
+        ("⏳ Готовлю Excel-отчёт...", "⏳ Excel hisobot tayyorlanmoqda..."),
+        ("⏳ Собираю утренний отчёт...", "⏳ Ertalabki hisobot tayyorlanmoqda..."),
+
+        # titles
+        ("💰 <b>Баланс Uzum FBO за 30 дней</b>", "💰 <b>Uzum FBO balansi 30 kun uchun</b>"),
+        ("💰 <b>Продажи Uzum FBO/FBS за сегодня</b>", "💰 <b>Bugungi Uzum FBO/FBS sotuvlari</b>"),
+        ("💰 <b>Продажи Uzum FBO/FBS за вчера</b>", "💰 <b>Kechagi Uzum FBO/FBS sotuvlari</b>"),
+        ("💰 <b>Продажи Uzum FBO/FBS за 7 дней</b>", "💰 <b>7 kunlik Uzum FBO/FBS sotuvlari</b>"),
+        ("💰 <b>Продажи Uzum FBO/FBS за 30 дней</b>", "💰 <b>30 kunlik Uzum FBO/FBS sotuvlari</b>"),
+        ("🌐 <b>Баланс по всем магазинам за 30 дней</b>", "🌐 <b>Barcha do‘konlar bo‘yicha 30 kunlik balans</b>"),
+        ("📊 <b>Сводка продаж</b>", "📊 <b>Sotuvlar xulosasi</b>"),
+        ("📊 <b>Сводка заказов</b>", "📊 <b>Buyurtmalar xulosasi</b>"),
+        ("📦 <b>Остатки</b>", "📦 <b>Qoldiq</b>"),
+        ("⚠️ <b>Умное 'Заканчивается'</b>", "⚠️ <b>Qoldiq prognozi</b>"),
+        ("🏆 <b>Топ товаров", "🏆 <b>Top tovarlar"),
+        ("🐢 <b>Товары без продаж", "🐢 <b>Sotilmayotgan tovarlar"),
+        ("🏪 <b>Ваши магазины</b>", "🏪 <b>Do‘konlaringiz</b>"),
+        ("📄 <b>FBO-накладные поставки</b>", "📄 <b>FBO yuk xatlari</b>"),
+        ("📦 <b>Состав FBO-накладной</b>", "📦 <b>FBO yuk xati tarkibi</b>"),
+        ("🌙 <b>Утренний отчёт Uzum</b>", "🌙 <b>Uzum ertalabki hisoboti</b>"),
+        ("🛒 <b>Новая продажа Uzum FBO</b>", "🛒 <b>Yangi Uzum FBO sotuvi</b>"),
+        ("⚠️ <b>Заканчиваются товары</b>", "⚠️ <b>Tovarlar tugayapti</b>"),
+        ("❌ <b>Товары закончились</b>", "❌ <b>Tovarlar tugagan</b>"),
+        ("💎 <b>Моя подписка</b>", "💎 <b>Mening obunam</b>"),
+        ("👑 <b>Админ-панель</b>", "👑 <b>Admin panel</b>"),
+
+        # labels, finance
+        ("Магазинов найдено:", "Topilgan do‘konlar:"),
+        ("Магазинов:", "Do‘konlar soni:"),
+        ("Магазин:", "Do‘kon:"),
+        ("Текущий магазин:", "Joriy do‘kon:"),
+        ("Активный магазин:", "Faol do‘kon:"),
+        ("Позиции продаж:", "Sotuv pozitsiyalari:"),
+        ("Кол-во товаров:", "Tovarlar soni:"),
+        ("Возвраты:", "Qaytarishlar:"),
+        ("Выручка:", "Tushum:"),
+        ("Комиссия Uzum:", "Uzum komissiyasi:"),
+        ("Комиссия:", "Komissiya:"),
+        ("Логистика:", "Logistika:"),
+        ("К выплате всего:", "Jami to‘lovga:"),
+        ("К выплате:", "To‘lovga:"),
+        ("Уже выведено:", "Allaqachon chiqarilgan:"),
+        ("Остаток к выплате:", "To‘lovga qoldi:"),
+        ("Статусы:", "Statuslar:"),
+        ("Цена продажи:", "Sotuv narxi:"),
+        ("ID заказа:", "Buyurtma ID:"),
+        ("ID продажи:", "Sotuv ID:"),
+        ("Статус:", "Status:"),
+        ("Дата:", "Sana:"),
+        ("Товар:", "Tovar:"),
+        ("Кол-во:", "Soni:"),
+        ("Кол-во товаров", "Tovarlar soni"),
+        ("Позиции продаж", "Sotuv pozitsiyalari"),
+        ("Возвраты", "Qaytarishlar"),
+        ("Выручка", "Tushum"),
+        ("Логистика", "Logistika"),
+        ("Комиссия", "Komissiya"),
+        ("К выплате", "To‘lovga"),
+        ("Уже выведено", "Allaqachon chiqarilgan"),
+        ("Остаток к выплате", "To‘lovga qoldi"),
+        ("Позиций продаж", "Sotuv pozitsiyalari"),
+
+        # products / stock
+        ("Всего товаров:", "Jami tovarlar:"),
+        ("Всего:", "Jami:"),
+        ("Остаток:", "Qoldiq:"),
+        ("Итого:", "Jami:"),
+        ("Разница:", "Farq:"),
+        ("Проверить остатки:", "Qoldiqni tekshirish:"),
+        ("Уменьшился остаток по SKU", "SKU bo‘yicha qoldiq kamaydi"),
+        ("Это может быть продажа, резерв, списание или изменение склада.", "Bu sotuv, rezerv, hisobdan chiqarish yoki ombor o‘zgarishi bo‘lishi mumkin."),
+        ("Товары, которые заканчиваются", "Tugayotgan tovarlar"),
+        ("Остаток меньше или равен", "Qoldiq kam yoki teng"),
+        ("Товар закончился", "Tovar tugagan"),
+        ("Потерянные товары", "Yo‘qolgan tovarlar"),
+        ("Потеряно:", "Yo‘qolgan:"),
+        ("Примерная сумма:", "Taxminiy summa:"),
+        ("Продано:", "Sotilgan:"),
+        ("Продаж не найдено.", "Sotuvlar topilmadi."),
+        ("Не нашёл товаров с остатком и нулевыми продажами.", "Qoldig‘i bor, lekin sotuvi yo‘q tovarlar topilmadi."),
+        ("Расчёт примерный", "Hisob-kitob taxminiy"),
+        ("хватит примерно на", "taxminan yetadi"),
+        ("дней", "kun"),
+        ("дня", "kun"),
+        ("день", "kun"),
+        ("шт.", "dona"),
+        ("шт", "dona"),
+        ("сум", "so‘m"),
+
+        # invoices / excel
+        ("Накладная:", "Yuk xati:"),
+        ("Накладная №", "Yuk xati №"),
+        ("Создана:", "Yaratilgan:"),
+        ("Окно поставки:", "Yetkazib berish oynasi:"),
+        ("К поставке:", "Yetkazishga:"),
+        ("Принято:", "Qabul qilingan:"),
+        ("Сумма:", "Summa:"),
+        ("Состав:", "Tarkibi:"),
+        ("По накладной:", "Yuk xati bo‘yicha:"),
+        ("Расхождение:", "Farq:"),
+        ("Закупочная цена:", "Xarid narxi:"),
+        ("Excel-отчёт готов", "Excel hisobot tayyor"),
+        ("Отчёт готов", "Hisobot tayyor"),
+
+        # explanations / errors
+        ("Расчёт по данным /v1/finance/orders. Если в кабинете Uzum есть корректировки/расходы, итог может отличаться.",
+         "Hisob-kitob /v1/finance/orders ma’lumotlari bo‘yicha. Agar Uzum kabinetida tuzatishlar/xarajatlar bo‘lsa, yakun farq qilishi mumkin."),
+        ("Finance API пока не вернул строки продаж за сегодня. Если в кабинете продажа уже есть, она может появиться здесь позже.",
+         "Finance API bugungi sotuvlarni hali qaytarmadi. Agar kabinetda sotuv ko‘rinsa, bu yerda biroz keyin paydo bo‘lishi mumkin."),
+        ("за выбранный период", "tanlangan davr uchun"),
+        ("за сегодня", "bugun uchun"),
+        ("за вчера", "kecha uchun"),
+        ("за 7 дней", "7 kun uchun"),
+        ("за 30 дней", "30 kun uchun"),
+        ("за последние 30 дней", "oxirgi 30 kun uchun"),
+        ("Ничего не найдено", "Hech narsa topilmadi"),
+        ("Данных нет", "Ma’lumot yo‘q"),
+        ("ошибка", "xatolik"),
+        ("Ошибка", "Xatolik"),
+        ("Попробуйте позже", "Keyinroq urinib ko‘ring"),
+    ]
+    for old, new in replacements:
+        text = text.replace(old, new)
+    return text
+
+
+_ORIGINAL_MESSAGE_ANSWER = Message.answer
+_ORIGINAL_BOT_SEND_MESSAGE = Bot.send_message
+
+
+async def _answer_with_runtime_translation(self: Message, text: Any = None, *args: Any, **kwargs: Any) -> Any:
+    try:
+        telegram_id = self.from_user.id if self.from_user else None
+        if isinstance(text, str) and get_user_language(telegram_id) == "uz":
+            text = translate_runtime_text_to_uz(text)
+    except Exception:
+        pass
+    return await _ORIGINAL_MESSAGE_ANSWER(self, text, *args, **kwargs)
+
+
+async def _send_message_with_runtime_translation(self: Bot, chat_id: Any, text: Any, *args: Any, **kwargs: Any) -> Any:
+    try:
+        if isinstance(text, str) and get_user_language(int(chat_id)) == "uz":
+            text = translate_runtime_text_to_uz(text)
+    except Exception:
+        pass
+    return await _ORIGINAL_BOT_SEND_MESSAGE(self, chat_id, text, *args, **kwargs)
+
+
+Message.answer = _answer_with_runtime_translation
+Bot.send_message = _send_message_with_runtime_translation
 
 
 def language_markup() -> InlineKeyboardMarkup:
@@ -6059,6 +6234,7 @@ async def check_stock_change_once() -> None:
 
 async def main() -> None:
     logging.info("FINANCE_SECONDS_PATCH_LOADED: dateFrom for Finance = seconds, dateTo = milliseconds")
+    init_language_tables()
     await bot.delete_webhook(drop_pending_updates=True)
     if NEW_ORDER_NOTIFICATIONS:
         asyncio.create_task(order_watch_loop())
@@ -6079,3 +6255,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
