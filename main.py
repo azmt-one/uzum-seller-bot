@@ -98,6 +98,7 @@ SUBSCRIPTION_PLANS_TEXT = os.getenv(
 ).strip()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "azmt_one").strip().lstrip("@")
 ADMIN_CONTACT_URL = os.getenv("ADMIN_CONTACT_URL", "").strip()
+VIDEO_INSTRUCTION_URL = os.getenv("VIDEO_INSTRUCTION_URL", "https://t.me/uzum_assist_bot/2").strip()
 REPORT_INVOICE_PRODUCT_LIMIT = int(os.getenv("REPORT_INVOICE_PRODUCT_LIMIT", "10") or "10")
 SMART_LOW_STOCK_DAYS = int(os.getenv("SMART_LOW_STOCK_DAYS", "3") or "3")
 TOP_PRODUCTS_DAYS = int(os.getenv("TOP_PRODUCTS_DAYS", "30") or "30")
@@ -324,6 +325,33 @@ def admin_contact_markup() -> InlineKeyboardMarkup | None:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="✍️ Написать администратору", url=url)]]
     )
+
+
+def video_instruction_markup(lang: str = "ru") -> InlineKeyboardMarkup | None:
+    if not VIDEO_INSTRUCTION_URL:
+        return None
+    button_text = "▶️ Videoni ko‘rish" if normalize_lang(lang) == "uz" else "▶️ Смотреть видео"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=button_text, url=VIDEO_INSTRUCTION_URL)]]
+    )
+
+
+def help_links_markup(lang: str = "ru") -> InlineKeyboardMarkup | None:
+    rows = []
+    if VIDEO_INSTRUCTION_URL:
+        rows.append([InlineKeyboardButton(
+            text=("🎥 API ulash videosi" if normalize_lang(lang) == "uz" else "🎥 Видео подключения API"),
+            url=VIDEO_INSTRUCTION_URL,
+        )])
+    admin_url = admin_contact_link()
+    if admin_url:
+        rows.append([InlineKeyboardButton(
+            text=("✍️ Administratorga yozish" if normalize_lang(lang) == "uz" else "✍️ Написать администратору"),
+            url=admin_url,
+        )])
+    if not rows:
+        return None
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def admin_contact_text() -> str:
@@ -3632,6 +3660,31 @@ async def subscribe(message: Message) -> None:
     await message.answer(text, reply_markup=admin_contact_markup() or menu_for_message(message))
 
 
+@dp.message(Command("video", "api_video", "instruction"))
+async def video_instruction(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    if lang == "uz":
+        text = (
+            "🎥 <b>API-kalitni ulash bo‘yicha video</b>\n\n"
+            "Videoda qisqa ko‘rsatilgan:\n"
+            "1. Uzum Seller kabinetida API kalit qayerda joylashgan.\n"
+            "2. Yangi kalit qanday yaratiladi.\n"
+            "3. Kalit botga <code>/connect</code> orqali qanday ulanadi.\n\n"
+            "Videoni ko‘rish uchun pastdagi tugmani bosing 👇"
+        )
+    else:
+        text = (
+            "🎥 <b>Видеоинструкция по подключению API</b>\n\n"
+            "В видео коротко показано:\n"
+            "1. Где в кабинете Uzum Seller находятся ключи API.\n"
+            "2. Как создать новый ключ.\n"
+            "3. Как подключить ключ к боту через <code>/connect</code>.\n\n"
+            "Нажмите кнопку ниже, чтобы открыть видео 👇"
+        )
+    await message.answer(text, reply_markup=video_instruction_markup(lang) or menu_for_message(message))
+
+
 @dp.message(Command("api_token", "token_help", "how_token"))
 async def api_token_help(message: Message) -> None:
     telegram_id = upsert_from_message(message)
@@ -3639,6 +3692,7 @@ async def api_token_help(message: Message) -> None:
     if lang == "uz":
         text = (
             "🔑 <b>Uzum API-kalitini botga ulash</b>\n\n"
+            "🎥 Videoqo‘llanma: <code>/video</code>\n\n"
             "Xavfsiz variant:\n"
             "1. Uzum Seller kabinetida bot uchun alohida xodim yarating.\n"
             "2. Unga savdo, qoldiq va hisobotlarni ko‘rish huquqlarini bering.\n"
@@ -3656,6 +3710,7 @@ async def api_token_help(message: Message) -> None:
     else:
         text = (
             "🔑 <b>Как подключить Uzum API к боту</b>\n\n"
+            "🎥 Видеоинструкция: <code>/video</code>\n\n"
             "Рекомендуемый безопасный вариант:\n"
             "1. В кабинете Uzum Seller создайте отдельного сотрудника для бота.\n"
             "2. Выдайте ему нужные права для просмотра продаж, остатков и отчётов.\n"
@@ -3670,7 +3725,7 @@ async def api_token_help(message: Message) -> None:
             "7. Отправьте ключ одним сообщением.\n\n"
             "⚠️ Не отправляйте ключ посторонним. Бот хранит его защищённо и старается удалить сообщение с ключом после проверки."
         )
-    await message.answer(text, reply_markup=menu_for_message(message))
+    await message.answer(text, reply_markup=video_instruction_markup(lang) or menu_for_message(message))
 
 
 @dp.message(Command("security", "privacy"))
@@ -5554,7 +5609,39 @@ async def button_subscription(message: Message) -> None:
 @dp.message(F.text == "ℹ️ Помощь")
 @dp.message(F.text == "❓ Помощь")
 async def button_help(message: Message) -> None:
-    await start(message)
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    if lang == "uz":
+        text = (
+            "ℹ️ <b>Yordam</b>\n\n"
+            "Botni ulash uchun:\n"
+            "1. <code>/video</code> — videoqo‘llanmani ko‘ring.\n"
+            "2. <code>/connect</code> — API-kalitni yuboring.\n"
+            "3. <b>💰 Savdo</b> yoki <b>📦 Ombor</b> bo‘limidan foydalaning.\n\n"
+            "Foydali buyruqlar:\n"
+            "• <code>/api_token</code> — API-kalit bo‘yicha yozma yo‘riqnoma\n"
+            "• <code>/check</code> — ulanishni tekshirish\n"
+            "• <code>/support</code> — yordam va administrator bilan aloqa"
+        )
+    else:
+        text = (
+            "ℹ️ <b>Помощь</b>\n\n"
+            "Чтобы подключить бота:\n"
+            "1. <code>/video</code> — посмотрите видеоинструкцию.\n"
+            "2. <code>/connect</code> — отправьте API-ключ.\n"
+            "3. Пользуйтесь разделами <b>💰 Продажи</b> и <b>📦 Склад</b>.\n\n"
+            "Полезные команды:\n"
+            "• <code>/api_token</code> — текстовая инструкция по API-ключу\n"
+            "• <code>/check</code> — проверить подключение\n"
+            "• <code>/support</code> — поддержка и связь с администратором"
+        )
+    await message.answer(text, reply_markup=help_links_markup(lang) or menu_for_message(message))
+
+
+@dp.message(F.text == "🎥 Видеоинструкция")
+@dp.message(F.text == "🎥 API ulash videosi")
+async def button_video_instruction(message: Message) -> None:
+    await video_instruction(message)
 
 
 # Старые красивые кнопки оставлены для совместимости, если они остались у пользователя в Telegram.
@@ -6585,5 +6672,6 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
