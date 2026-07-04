@@ -6649,6 +6649,200 @@ async def check_stock_change_once() -> None:
                 logging.exception("Stock change watcher: failed to send notification to %s", telegram_id)
         await asyncio.sleep(0.5)
 
+
+# --- Уведомления об отменах через Finance API ---
+# Отмена в Uzum чаще всего не появляется как новый заказ, а меняет статус уже существующей
+# финансовой строки на CANCELED / PARTIALLY_CANCELED. Поэтому обычный watcher новых продаж
+# может её не прислать. Этот блок отслеживает именно изменение статуса.
+CANCEL_NOTIFICATIONS = os.getenv("CANCEL_NOTIFICATIONS", "1").strip().lower() in {"1", "true", "yes", "on", "да"}
+_sale_status_by_user: dict[int, dict[str, str]] = {}
+
+
+def finance_identity_key(item: dict[str, Any]) -> str:
+    """Стабильный ключ строки продажи без количества/суммы/статуса.
+
+    Нужен, чтобы увидеть изменение статуса PROCESSING -> CANCELED у той же продажи.
+    """
+    parts: list[str] = []
+    order_id = _finance_order_id(item)
+    sale_id = _finance_sale_id(item)
+    sku = str(_deep_pick_value(item, ("skuId", "sku_id", "skuTitle", "skuName", "barcode")) or "-")
+    title = _finance_title(item)
+    for label, value in (("order", order_id), ("sale", sale_id), ("sku", sku), ("title", title)):
+        if value not in (None, "", "-"):
+            parts.append(f"{label}:{value}")
+    if parts:
+        return "|".join(parts)
+    raw = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+    return "hash:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def build_cancel_message(item: dict[str, Any], shop_id: int | None = None, lang: str = "ru") -> str:
+    lang = normalize_lang(lang)
+    title = escape(_finance_title(item))
+    sku = escape(_finance_sku_title(item))
+    qty = _finance_qty(item)
+    unit_price = _deep_pick_number(item, ("sellPrice", "soldPrice", "price", "skuPrice", "productPrice"))
+    status = escape(_finance_status(item))
+    order_id = escape(_finance_order_id(item))
+    sale_id = escape(_finance_sale_id(item))
+    date_text = escape(_format_finance_date(_finance_date_value(item)))
+
+    if lang == "uz":
+        shop_line = f"Do‘kon: <code>{shop_id}</code>\n" if shop_id is not None else ""
+        price_line = f"<b>Sotuv narxi:</b> {_format_money(float(unit_price or 0))}\n" if unit_price is not None else ""
+        return (
+            "❌ <b>Uzum buyurtmasi bekor qilindi</b>\n\n"
+            + shop_line +
+            f"<b>Tovar:</b> {title}\n"
+            f"<b>SKU:</b> {sku}\n"
+            f"<b>Soni:</b> {qty:g} dona\n\n"
+            + price_line +
+            f"<b>Buyurtma ID:</b> {order_id}\n"
+            f"<b>Savdo ID:</b> {sale_id}\n"
+            f"<b>Status:</b> {status}\n"
+            f"<b>Sana:</b> {date_text}"
+        )
+
+    shop_line = f"Магазин: <code>{shop_id}</code>\n" if shop_id is not None else ""
+    price_line = f"<b>Цена продажи:</b> {_format_money(float(unit_price or 0))}\n" if unit_price is not None else ""
+    return (
+        "❌ <b>Отмена заказа Uzum FBO</b>\n\n"
+        + shop_line +
+        f"<b>Товар:</b> {title}\n"
+        f"<b>SKU:</b> {sku}\n"
+        f"<b>Кол-во:</b> {qty:g} шт.\n\n"
+        + price_line +
+        f"<b>ID заказа:</b> {order_id}\n"
+        f"<b>ID продажи:</b> {sale_id}\n"
+        f"<b>Статус:</b> {status}\n"
+        f"<b>Дата:</b> {date_text}"
+    )
+
+
+# Переопределяем watcher продаж: теперь он присылает и новые продажи, и новые отмены.
+async def check_new_sales_once() -> None:
+    date_from, date_to = _today_range_ms()
+    for group in connected_watch_groups():
+        shop_id = int(group["shop_id"])
+        encrypted_token = group["uzum_token_encrypted"]
+        telegram_ids = [int(x) for x in group["telegram_ids"]]
+
+        try:
+            token = cipher.decrypt(encrypted_token)
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            rows, first_response = await _load_finance_orders(
+                client,
+                shop_id,
+                date_from_ms=date_from,
+                date_to_ms=date_to,
+                max_pages=5,
+                page_size=100,
+            )
+        except Exception:
+            logging.exception("Sales watcher optimized: failed to check shop=%s users=%s", shop_id, telegram_ids)
+            await asyncio.sleep(3)
+            continue
+
+        keys_now = [sale_key(item) for item in rows]
+        identity_status_now = {finance_identity_key(item): _finance_status(item) for item in rows}
+
+        for telegram_id in telegram_ids:
+            known = _seen_sale_keys_by_user.setdefault(telegram_id, set())
+            status_memory = _sale_status_by_user.setdefault(telegram_id, {})
+
+            # Первый проход: запоминаем текущее состояние, чтобы не прислать старые продажи/отмены.
+            if telegram_id not in _sales_watch_initialized:
+                known.update(keys_now)
+                status_memory.update(identity_status_now)
+                _sales_watch_initialized.add(telegram_id)
+                logging.info(
+                    "Sales watcher initialized for user=%s shop=%s sales_rows=%s",
+                    telegram_id, shop_id, len(keys_now),
+                )
+                continue
+
+            cancel_rows: list[dict[str, Any]] = []
+            if CANCEL_NOTIFICATIONS:
+                for item in rows:
+                    ident = finance_identity_key(item)
+                    current_status = _finance_status(item)
+                    previous_status = status_memory.get(ident)
+                    # Уведомляем, если строка стала отменённой после предыдущей проверки.
+                    if _is_cancelled_status(current_status) and not _is_cancelled_status(str(previous_status or "")):
+                        cancel_rows.append(item)
+                status_memory.update(identity_status_now)
+
+            # Новые строки продаж. Отменённые строки не отправляем как "новая продажа".
+            new_rows = [
+                item for item, key in zip(rows, keys_now)
+                if key not in known and not _is_cancelled_status(_finance_status(item))
+            ]
+            known.update(keys_now)
+            if len(known) > 3000:
+                _seen_sale_keys_by_user[telegram_id] = set(keys_now)
+
+            for item in new_rows[:10]:
+                try:
+                    await bot.send_message(
+                        telegram_id,
+                        build_new_sale_message(item, shop_id=shop_id, lang=get_user_language(telegram_id)),
+                        reply_markup=main_menu_for_user(telegram_id),
+                    )
+                    await asyncio.sleep(0.15)
+                except Exception:
+                    logging.exception("Sales watcher: failed to send sale notification to %s", telegram_id)
+
+            for item in cancel_rows[:10]:
+                try:
+                    await bot.send_message(
+                        telegram_id,
+                        build_cancel_message(item, shop_id=shop_id, lang=get_user_language(telegram_id)),
+                        reply_markup=main_menu_for_user(telegram_id),
+                    )
+                    await asyncio.sleep(0.15)
+                except Exception:
+                    logging.exception("Sales watcher: failed to send cancel notification to %s", telegram_id)
+
+            total_extra = max(0, len(new_rows) - 10) + max(0, len(cancel_rows) - 10)
+            if total_extra:
+                try:
+                    await bot.send_message(
+                        telegram_id,
+                        f"➕ Ещё новых событий: <b>{total_extra}</b>\nПодробно: <code>/balance</code>",
+                        reply_markup=main_menu_for_user(telegram_id),
+                    )
+                except Exception:
+                    logging.exception("Sales watcher: failed to send summary notification to %s", telegram_id)
+        await asyncio.sleep(0.5)
+
+
+@dp.message(Command("cancel_notify_status", "cancellations_notify_status"))
+async def cancel_notify_status(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, _, shop_id = req
+    lang = get_user_language(telegram_id)
+    if normalize_lang(lang) == "uz":
+        text = (
+            "❌ <b>Bekor qilingan buyurtmalar xabarnomasi</b>\n\n"
+            f"Holat: {'✅ yoqilgan' if CANCEL_NOTIFICATIONS else '❌ o‘chirilgan'}\n"
+            f"Do‘kon: <code>{shop_id}</code>\n"
+            f"Tekshiruv: har <b>{max(60, SALE_CHECK_INTERVAL_SECONDS)}</b> soniyada\n\n"
+            "Bot yangi bekor qilingan buyurtmalarni Finance API orqali kuzatadi."
+        )
+    else:
+        text = (
+            "❌ <b>Уведомления об отменах</b>\n\n"
+            f"Статус: {'✅ включены' if CANCEL_NOTIFICATIONS else '❌ выключены'}\n"
+            f"Магазин: <code>{shop_id}</code>\n"
+            f"Проверка каждые: <b>{max(60, SALE_CHECK_INTERVAL_SECONDS)}</b> сек.\n\n"
+            "Бот отслеживает новые отмены через Finance API."
+        )
+    await message.answer(text, reply_markup=main_menu_for_user(telegram_id))
+
 async def main() -> None:
     logging.info("FINANCE_SECONDS_PATCH_LOADED: dateFrom for Finance = seconds, dateTo = milliseconds")
     init_language_tables()
@@ -6672,6 +6866,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
 
