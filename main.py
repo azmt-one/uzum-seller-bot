@@ -100,9 +100,8 @@ ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "azmt_one").strip().lstrip("@")
 ADMIN_CONTACT_URL = os.getenv("ADMIN_CONTACT_URL", "").strip()
 VIDEO_INSTRUCTION_URL = os.getenv("VIDEO_INSTRUCTION_URL", "https://t.me/uzum_assist_bot/2").strip()
 
-# Простой способ подключения: клиент добавляет нашего технического сотрудника
-# в Uzum Seller, а в боте отправляет только ID магазина. API-ключ сотрудника
-# хранится только в переменных окружения BotHost, не в GitHub.
+# Подключение через сотрудника было экспериментом и отключено.
+# Основной официальный способ: API-ключ продавца через /connect.
 STAFF_UZUM_TOKEN = (
     os.getenv("STAFF_UZUM_TOKEN", "").strip()
     or os.getenv("TECHNICAL_UZUM_TOKEN", "").strip()
@@ -113,10 +112,7 @@ STAFF_PHONE = (
     or os.getenv("BOT_STAFF_PHONE", "").strip()
     or os.getenv("TECHNICAL_STAFF_PHONE", "").strip()
 )
-STAFF_CONNECT_ENABLED = (
-    bool(STAFF_UZUM_TOKEN)
-    and os.getenv("STAFF_CONNECT_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
-)
+STAFF_CONNECT_ENABLED = False
 REPORT_INVOICE_PRODUCT_LIMIT = int(os.getenv("REPORT_INVOICE_PRODUCT_LIMIT", "10") or "10")
 SMART_LOW_STOCK_DAYS = int(os.getenv("SMART_LOW_STOCK_DAYS", "3") or "3")
 TOP_PRODUCTS_DAYS = int(os.getenv("TOP_PRODUCTS_DAYS", "30") or "30")
@@ -490,6 +486,103 @@ def payment_line(row: dict[str, Any]) -> str:
         f"{amount_text} сум | {int(row.get('days') or 0)} дней | {_fmt_dt(row.get('created_at'))}{comment_part}"
     )
 
+
+
+# --- Юнит-экономика / себестоимость SKU ---
+def init_unit_economy_tables() -> None:
+    with db.connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS unit_costs (
+                telegram_id INTEGER NOT NULL,
+                shop_id INTEGER NOT NULL,
+                sku_key TEXT NOT NULL,
+                title TEXT,
+                cost REAL NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (telegram_id, shop_id, sku_key)
+            )
+            """
+        )
+        conn.commit()
+
+
+def _unit_sku_key(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def save_unit_cost(telegram_id: int, shop_id: int, sku: str, cost: float, title: str = "") -> None:
+    init_unit_economy_tables()
+    sku_key = _unit_sku_key(sku)
+    if not sku_key:
+        return
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO unit_costs (telegram_id, shop_id, sku_key, title, cost, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_id, shop_id, sku_key) DO UPDATE SET
+                title = excluded.title,
+                cost = excluded.cost,
+                updated_at = excluded.updated_at
+            """,
+            (int(telegram_id), int(shop_id), sku_key, str(title or "").strip(), float(cost), _dt_to_db(_utc_now()) or ""),
+        )
+        conn.commit()
+
+
+def delete_unit_cost(telegram_id: int, shop_id: int, sku: str) -> bool:
+    init_unit_economy_tables()
+    sku_key = _unit_sku_key(sku)
+    with db.connect() as conn:
+        cur = conn.execute(
+            "DELETE FROM unit_costs WHERE telegram_id = ? AND shop_id = ? AND sku_key = ?",
+            (int(telegram_id), int(shop_id), sku_key),
+        )
+        conn.commit()
+        return bool(cur.rowcount)
+
+
+def get_unit_cost_map(telegram_id: int, shop_id: int) -> dict[str, dict[str, Any]]:
+    init_unit_economy_tables()
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT sku_key, title, cost, updated_at FROM unit_costs WHERE telegram_id = ? AND shop_id = ?",
+            (int(telegram_id), int(shop_id)),
+        ).fetchall()
+    return {str(r["sku_key"]): dict(r) for r in rows}
+
+
+def list_unit_costs(telegram_id: int, shop_id: int, limit: int = 50) -> list[dict[str, Any]]:
+    init_unit_economy_tables()
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT sku_key, title, cost, updated_at
+            FROM unit_costs
+            WHERE telegram_id = ? AND shop_id = ?
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (int(telegram_id), int(shop_id), int(limit)),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def _parse_cost_command_args(text: str) -> tuple[str, float] | None:
+    import re
+    raw = parse_args(text or "").strip()
+    # Формат: /cost SKU 60000 или /cost SKU 60 000
+    m = re.match(r"^(.+?)\s+([0-9][0-9\s.,]*)$", raw)
+    if not m:
+        return None
+    sku = m.group(1).strip()
+    money_raw = m.group(2)
+    digits = re.sub(r"[^0-9]", "", money_raw)
+    if not sku or not digits:
+        return None
+    return sku, float(digits)
+
 def list_subscription_users(limit: int = 30) -> list[dict[str, Any]]:
     with db.connect() as conn:
         rows = conn.execute(
@@ -667,6 +760,7 @@ def list_staff_shop_connections(limit: int = 30) -> list[dict[str, Any]]:
 
 init_subscription_tables()
 init_business_tables()
+init_unit_economy_tables()
 init_staff_connect_tables()
 
 # --- Языки интерфейса ---
@@ -996,6 +1090,10 @@ def translate_runtime_text_to_uz(text: str) -> str:
         ("Топ товаров по so‘mme:", "Summa bo‘yicha top tovarlar:"),
         ("Топ товаров по so‘mме:", "Summa bo‘yicha top tovarlar:"),
         ("Топ товаров по сумме:", "Summa bo‘yicha top tovarlar:"),
+        ("Юнит-экономика", "Unit iqtisodiyot"),
+        ("Себестоимость", "Tannarx"),
+        ("Прибыль", "Foyda"),
+        ("Маржа", "Marja"),
         ("Top товаров по so‘mme:", "Summa bo‘yicha top tovarlar:"),
         ("Top товаров по сумме:", "Summa bo‘yicha top tovarlar:"),
         ("Top tovarlar по so‘mme:", "Summa bo‘yicha top tovarlar:"),
@@ -1134,6 +1232,7 @@ SALES_MENU_RU = ReplyKeyboardMarkup(
         [KeyboardButton(text="🗓 7 дней"), KeyboardButton(text="📅 30 дней")],
         [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="🌐 Все магазины")],
         [KeyboardButton(text="🏆 Топ товаров"), KeyboardButton(text="🐢 Не продаётся")],
+        [KeyboardButton(text="🧾 Юнит-экономика")],
         [KeyboardButton(text="⬅️ Главное меню")],
     ],
     resize_keyboard=True,
@@ -1146,6 +1245,7 @@ SALES_MENU_UZ = ReplyKeyboardMarkup(
         [KeyboardButton(text="🗓 7 kun"), KeyboardButton(text="📅 30 kun")],
         [KeyboardButton(text="💰 Balans"), KeyboardButton(text="🌐 Barcha do‘konlar")],
         [KeyboardButton(text="🏆 Top tovarlar"), KeyboardButton(text="🐢 Sotilmayapti")],
+        [KeyboardButton(text="🧾 Unit iqtisodiyot")],
         [KeyboardButton(text="⬅️ Asosiy menyu")],
     ],
     resize_keyboard=True,
@@ -1216,7 +1316,7 @@ ADMIN_PANEL_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="💳 Оплаты")],
         [KeyboardButton(text="⏳ Скоро заканчиваются"), KeyboardButton(text="⛔ Заблокированные")],
-        [KeyboardButton(text="✅ Проверить подключение"), KeyboardButton(text="🔌 Через сотрудника")],
+        [KeyboardButton(text="✅ Проверить подключение"), KeyboardButton(text="🎥 Видеоинструкция")],
         [KeyboardButton(text="📦 Бэкап базы")],
         [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="⬅️ Главное меню")],
     ],
@@ -1228,7 +1328,7 @@ ADMIN_PANEL_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="👥 Foydalanuvchilar"), KeyboardButton(text="💳 To‘lovlar")],
         [KeyboardButton(text="⏳ Tugayotganlar"), KeyboardButton(text="⛔ Bloklanganlar")],
-        [KeyboardButton(text="✅ Ulanishni tekshirish"), KeyboardButton(text="🔌 Xodim orqali")],
+        [KeyboardButton(text="✅ Ulanishni tekshirish"), KeyboardButton(text="🎥 API ulash videosi")],
         [KeyboardButton(text="📦 Baza zaxirasi")],
         [KeyboardButton(text="📢 Xabar yuborish"), KeyboardButton(text="⬅️ Asosiy menyu")],
     ],
@@ -1840,9 +1940,9 @@ async def start(message: Message) -> None:
             f"Kirish: {sub_line}\n"
             f"Til: <b>{language_title(lang)}</b>\n\n"
             "🚀 <b>Boshlash uchun 3 qadam:</b>\n"
-            "1. <code>/connect_shop</code> — do‘konni oddiy usulda ulash\n"
-            "2. Xodimni Uzum Seller kabinetiga qo‘shib, Shop ID yuborish\n"
-            "3. <b>💰 Savdo</b> yoki <b>📦 Ombor</b> bo‘limini tanlash\n\n"
+            "1. <code>/video</code> — API ulash videosini ko‘ring\n"
+            "2. <code>/connect</code> — API-kalitni botga yuboring\n"
+            "3. <b>💰 Savdo</b> yoki <b>📦 Ombor</b> bo‘limini tanlang\n\n"
             "Asosiy menyuda faqat eng kerakli bo‘limlar qoldirildi.\n"
             "Yordam: <code>/support</code>"
             + admin_part
@@ -1855,9 +1955,9 @@ async def start(message: Message) -> None:
             f"Доступ: {sub_line}\n"
             f"Язык: <b>{language_title(lang)}</b>\n\n"
             "🚀 <b>Начать в 3 шага:</b>\n"
-            "1. <code>/connect_shop</code> — подключить магазин простым способом\n"
-            "2. Добавить сотрудника в Uzum Seller и отправить Shop ID\n"
-            "3. Выбрать раздел <b>💰 Продажи</b> или <b>📦 Склад</b>\n\n"
+            "1. <code>/video</code> — посмотрите видеоинструкцию\n"
+            "2. <code>/connect</code> — отправьте API-ключ боту\n"
+            "3. Выберите раздел <b>💰 Продажи</b> или <b>📦 Склад</b>\n\n"
             "В главном меню оставлены только самые нужные разделы, чтобы не путаться.\n"
             "Поддержка: <code>/support</code>"
             + admin_part
@@ -1896,38 +1996,26 @@ async def status(message: Message) -> None:
 
 @dp.message(Command("connect_shop", "staff_connect", "addshop"))
 async def connect_shop_command(message: Message, state: FSMContext) -> None:
+    # Совместимость со старой командой: теперь подключение только через API-ключ продавца.
     telegram_id = upsert_from_message(message)
+    await state.set_state(ConnectStates.waiting_for_token)
     lang = get_user_language(telegram_id)
-    arg = parse_args(message.text or "")
-    if arg:
-        await connect_shop_by_staff(message, arg, state)
-        return
-
-    await state.set_state(ConnectStates.waiting_for_shop_id)
-    phone_line = f"\n📞 Номер сотрудника: <code>{escape(STAFF_PHONE)}</code>" if STAFF_PHONE else ""
-    phone_line_uz = f"\n📞 Xodim raqami: <code>{escape(STAFF_PHONE)}</code>" if STAFF_PHONE else ""
     if lang == "uz":
         text = (
             "🔌 <b>Do‘konni ulash</b>\n\n"
-            "Eng oson usul:\n"
-            "1. Uzum Seller kabinetiga kiring.\n"
-            "2. Bot xodimini do‘koningizga qo‘shing." + phone_line_uz + "\n"
-            "3. Unga savdo, moliya, tovarlar va qoldiq bo‘yicha huquqlarni bering.\n"
-            "4. Bu yerga Shop ID ni yuboring.\n\n"
-            "Masalan: <code>113982</code>\n\n"
-            "Agar bu usul ishlamasa, API-kalit orqali ulash mumkin: <code>/connect</code>\n"
+            "Do‘konni ulash uchun Uzum Seller kabinetidan API-kalit yarating va shu yerga yuboring.\n\n"
+            "🎥 Videoqo‘llanma: <code>/video</code>\n"
+            "📌 Yozma yo‘riqnoma: <code>/api_token</code>\n\n"
+            "API-kalitni keyingi xabarda yuboring.\n"
             "Bekor qilish: <code>/cancel</code>"
         )
     else:
         text = (
             "🔌 <b>Подключение магазина</b>\n\n"
-            "Самый простой способ:\n"
-            "1. Зайдите в кабинет Uzum Seller.\n"
-            "2. Добавьте нашего сотрудника в свой магазин." + phone_line + "\n"
-            "3. Дайте права на продажи, финансы, товары и остатки.\n"
-            "4. Вернитесь сюда и отправьте Shop ID магазина.\n\n"
-            "Пример: <code>113982</code>\n\n"
-            "Если этот способ не получится, можно подключить через API-ключ: <code>/connect</code>\n"
+            "Чтобы подключить магазин, создайте API-ключ в кабинете Uzum Seller и отправьте его сюда.\n\n"
+            "🎥 Видеоинструкция: <code>/video</code>\n"
+            "📌 Текстовая инструкция: <code>/api_token</code>\n\n"
+            "Отправьте API-ключ следующим сообщением.\n"
             "Отмена: <code>/cancel</code>"
         )
     await message.answer(text, reply_markup=menu_for_message(message))
@@ -1941,7 +2029,7 @@ async def connect_shop_button(message: Message, state: FSMContext) -> None:
 
 @dp.message(ConnectStates.waiting_for_shop_id, F.text)
 async def connect_waiting_shop_id(message: Message, state: FSMContext) -> None:
-    await connect_shop_by_staff(message, message.text or "", state)
+    await connect_token(message, message.text or "", state)
 
 
 @dp.message(Command("connect", "reconnect"))
@@ -1960,7 +2048,7 @@ async def connect(message: Message, state: FSMContext) -> None:
             "Uzum Seller kabinetidan olingan API-kalitni keyingi xabarda yuboring.\n\n"
             "Kalitni qayerdan olish: <code>/api_token</code>\n\n"
             "Muhim:\n"
-            "• imkon bo‘lsa, bot uchun alohida xodim yarating;\n"
+            "• API-kalit kabinet paroli emas;\n"
             "• kalit himoyalangan ko‘rinishda saqlanadi;\n"
             "• tekshiruvdan so‘ng bot kalit yuborilgan xabarni o‘chirishga harakat qiladi;\n"
             "• bekor qilish: <code>/cancel</code>."
@@ -1971,7 +2059,7 @@ async def connect(message: Message, state: FSMContext) -> None:
             "Отправьте следующим сообщением API-ключ из кабинета Uzum Seller.\n\n"
             "Где взять ключ: <code>/api_token</code>\n\n"
             "Важно:\n"
-            "• лучше создать отдельного сотрудника для бота;\n"
+            "• API-ключ — это не пароль от кабинета;\n"
             "• ключ хранится в защищённом виде;\n"
             "• после проверки бот постарается удалить сообщение с ключом;\n"
             "• отменить: <code>/cancel</code>."
@@ -3968,10 +4056,8 @@ async def api_token_help(message: Message) -> None:
         text = (
             "🔑 <b>Uzum API-kalitini botga ulash</b>\n\n"
             "🎥 Videoqo‘llanma: <code>/video</code>\n\n"
-            "Xavfsiz variant:\n"
-            "1. Uzum Seller kabinetida bot uchun alohida xodim yarating.\n"
-            "2. Unga savdo, qoldiq va hisobotlarni ko‘rish huquqlarini bering.\n"
-            "3. Shu xodim orqali kabinetga kiring.\n\n"
+            "API-kalitni faqat Uzum Seller kabinetidan olasiz.\n"
+            "Bu kabinet paroli emas, uni istalgan vaqtda o‘chirishingiz mumkin.\n\n"
             "API-kalit qayerda:\n"
             "1. Yuqori o‘ng burchakdagi profil / avatarni bosing.\n"
             "2. <b>Mening profilim</b> bo‘limini oching.\n"
@@ -3986,10 +4072,8 @@ async def api_token_help(message: Message) -> None:
         text = (
             "🔑 <b>Как подключить Uzum API к боту</b>\n\n"
             "🎥 Видеоинструкция: <code>/video</code>\n\n"
-            "Рекомендуемый безопасный вариант:\n"
-            "1. В кабинете Uzum Seller создайте отдельного сотрудника для бота.\n"
-            "2. Выдайте ему нужные права для просмотра продаж, остатков и отчётов.\n"
-            "3. Зайдите в кабинет под этим сотрудником.\n\n"
+            "API-ключ создаётся только в вашем кабинете Uzum Seller.\n"
+            "Это не пароль от кабинета, ключ можно удалить в любой момент.\n\n"
             "Где взять API-ключ:\n"
             "1. Нажмите на профиль / аватарку в правом верхнем углу.\n"
             "2. Откройте <b>Мой профиль</b>.\n"
@@ -4195,23 +4279,10 @@ async def admin_blocked_users(message: Message) -> None:
 
 @dp.message(Command("staff_connections"))
 async def staff_connections_admin(message: Message) -> None:
-    telegram_id = upsert_from_message(message)
-    if not is_admin(telegram_id):
-        await message.answer("⛔ Команда доступна только админу.", reply_markup=menu_for_message(message))
-        return
-    rows = list_staff_shop_connections(30)
-    if not rows:
-        await message.answer("Заявок/подключений через сотрудника пока нет.", reply_markup=admin_menu_for_message(message))
-        return
-    lines = []
-    for r in rows:
-        err = (r.get("error") or "").strip()
-        err_part = f" | {escape(err[:80])}" if err else ""
-        lines.append(
-            f"{escape(str(r.get('status') or ''))} | user <code>{int(r.get('telegram_id') or 0)}</code> | "
-            f"shop <code>{int(r.get('shop_id') or 0)}</code> | {_fmt_dt(r.get('updated_at'))}{err_part}"
-        )
-    await message.answer("🔌 <b>Подключения через сотрудника</b>\n\n" + "\n".join(lines), reply_markup=admin_menu_for_message(message))
+    await message.answer(
+        "🔑 Подключение через сотрудника отключено. Сейчас используется официальный способ через API-ключ: /connect",
+        reply_markup=admin_menu_for_message(message),
+    )
 
 
 @dp.message(F.text == "🔌 Через сотрудника")
@@ -6513,6 +6584,244 @@ async def admin_extend_6_months(message: Message) -> None:
     await message.answer(f"✅ Продлено на 6 месяцев для <code>{target}</code>. До: <b>{_fmt_dt(new_until)}</b>", reply_markup=menu_for_message(message))
 
 
+
+
+# --- Юнит-экономика ---
+def _unit_group_key(item: dict[str, Any]) -> str:
+    sku = _finance_sku_title(item)
+    if sku and sku != "-":
+        return _unit_sku_key(sku)
+    return _unit_sku_key(_finance_title(item))
+
+
+def _unit_cost_lookup(costs: dict[str, dict[str, Any]], item: dict[str, Any]) -> float | None:
+    for key in (_finance_sku_title(item), _finance_title(item), str(_deep_pick_value(item, ("skuId", "sku", "barcode", "offerId")) or "")):
+        sku_key = _unit_sku_key(key)
+        if sku_key and sku_key in costs:
+            try:
+                return float(costs[sku_key].get("cost") or 0)
+            except Exception:
+                return None
+    return None
+
+
+async def _unit_economy_for_shop(client: UzumClient, telegram_id: int, shop_id: int, days: int = 30) -> tuple[list[dict[str, Any]], dict[str, Any], int]:
+    date_from, date_to = _days_range_ms(days)
+    rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=5, page_size=100)
+    costs = get_unit_cost_map(telegram_id, shop_id)
+    groups: dict[str, dict[str, Any]] = {}
+    for item in rows:
+        if _is_cancelled_status(_finance_status(item)):
+            continue
+        key = _unit_group_key(item)
+        if not key:
+            continue
+        qty = _finance_qty(item)
+        revenue = _finance_gross_revenue(item)
+        commission = _finance_commission(item)
+        logistics = _finance_logistics(item)
+        payout_direct = _finance_payout_direct(item)
+        payout = payout_direct if payout_direct is not None else max(0.0, revenue - commission - logistics)
+        cost_per_unit = _unit_cost_lookup(costs, item)
+        entry = groups.setdefault(key, {
+            "sku": _finance_sku_title(item),
+            "title": _finance_title(item),
+            "qty": 0.0,
+            "revenue": 0.0,
+            "commission": 0.0,
+            "logistics": 0.0,
+            "payout": 0.0,
+            "cost_per_unit": cost_per_unit,
+            "cost_total": 0.0,
+            "profit": None,
+        })
+        if entry.get("cost_per_unit") is None and cost_per_unit is not None:
+            entry["cost_per_unit"] = cost_per_unit
+        entry["qty"] += qty
+        entry["revenue"] += revenue
+        entry["commission"] += commission
+        entry["logistics"] += logistics
+        entry["payout"] += max(0.0, payout)
+        if cost_per_unit is not None:
+            entry["cost_total"] += float(cost_per_unit) * qty
+    for entry in groups.values():
+        if entry.get("cost_per_unit") is not None:
+            entry["profit"] = float(entry.get("payout") or 0) - float(entry.get("cost_total") or 0)
+            revenue = float(entry.get("revenue") or 0)
+            entry["margin"] = (float(entry["profit"]) / revenue * 100.0) if revenue > 0 else 0.0
+        else:
+            entry["margin"] = None
+    top = sorted(groups.values(), key=lambda x: float(x.get("revenue") or 0), reverse=True)
+    return top, _build_noorza_today_stats(rows), len(costs)
+
+
+def _format_unit_economy(shop_id: int, days: int, rows: list[dict[str, Any]], stats: dict[str, Any], saved_costs: int, lang: str = "ru") -> str:
+    lang = normalize_lang(lang)
+    if lang == "uz":
+        if not rows:
+            return (
+                f"🧾 <b>Unit iqtisodiyot</b>\n🏪 Do‘kon: <code>{shop_id}</code>\n\n"
+                "Savdolar topilmadi. Avval 30 kunlik savdolar bo‘yicha ma’lumot bo‘lishi kerak."
+            )
+        total_known_profit = sum(float(x.get("profit") or 0) for x in rows if x.get("profit") is not None)
+        known_items = sum(1 for x in rows if x.get("profit") is not None)
+        lines = [
+            f"🧾 <b>Unit iqtisodiyot — {days} kun</b>",
+            f"🏪 Do‘kon: <code>{shop_id}</code>",
+            f"📦 Sotilgan: <b>{float(stats.get('units') or 0):.0f} dona</b>",
+            f"💵 Tushum: <b>{_format_money(float(stats.get('revenue') or 0))}</b>",
+            f"✅ To‘lovga: <b>{_format_money(float(stats.get('payout_total') or 0))}</b>",
+            f"💾 Kiritilgan tannarxlar: <b>{saved_costs}</b>",
+        ]
+        if known_items:
+            lines.append(f"💰 Taxminiy sof foyda: <b>{_format_money(total_known_profit)}</b>")
+        lines.append("\n<b>Top tovarlar:</b>")
+        for idx, item in enumerate(rows[:10], start=1):
+            sku = escape(_short_text(item.get("sku"), 55))
+            title = escape(_short_text(item.get("title"), 70))
+            cost = item.get("cost_per_unit")
+            if cost is None:
+                hint = f"\n   ⚠️ Tannarx kiritilmagan: <code>/cost {sku} 60000</code>"
+            else:
+                profit = float(item.get("profit") or 0)
+                margin = float(item.get("margin") or 0)
+                hint = f"\n   🧾 Tannarx: <b>{_format_money(float(cost))}</b> | 💰 Foyda: <b>{_format_money(profit)}</b> | 📈 Marja: <b>{margin:.1f}%</b>"
+            lines.append(
+                f"{idx}. <b>{title}</b>\n"
+                f"   🔖 SKU: <code>{sku}</code>\n"
+                f"   🔢 Soni: <b>{float(item.get('qty') or 0):.0f} dona</b> | "
+                f"💵 Tushum: <b>{_format_money(float(item.get('revenue') or 0))}</b> | "
+                f"✅ To‘lovga: <b>{_format_money(float(item.get('payout') or 0))}</b>" + hint
+            )
+        lines.append("\nTannarx qo‘shish: <code>/cost SKU 60000</code>")
+        return "\n\n".join(lines)
+
+    if not rows:
+        return (
+            f"🧾 <b>Юнит-экономика</b>\n🏪 Магазин: <code>{shop_id}</code>\n\n"
+            "Продаж не найдено. Сначала должны быть продажи за выбранный период."
+        )
+    total_known_profit = sum(float(x.get("profit") or 0) for x in rows if x.get("profit") is not None)
+    known_items = sum(1 for x in rows if x.get("profit") is not None)
+    lines = [
+        f"🧾 <b>Юнит-экономика за {days} дней</b>",
+        f"🏪 Магазин: <code>{shop_id}</code>",
+        f"📦 Продано: <b>{float(stats.get('units') or 0):.0f} шт.</b>",
+        f"💵 Выручка: <b>{_format_money(float(stats.get('revenue') or 0))}</b>",
+        f"✅ К выплате: <b>{_format_money(float(stats.get('payout_total') or 0))}</b>",
+        f"💾 Себестоимостей сохранено: <b>{saved_costs}</b>",
+    ]
+    if known_items:
+        lines.append(f"💰 Примерная чистая прибыль: <b>{_format_money(total_known_profit)}</b>")
+    lines.append("\n<b>Топ товаров:</b>")
+    for idx, item in enumerate(rows[:10], start=1):
+        sku = escape(_short_text(item.get("sku"), 55))
+        title = escape(_short_text(item.get("title"), 70))
+        cost = item.get("cost_per_unit")
+        if cost is None:
+            hint = f"\n   ⚠️ Себестоимость не указана: <code>/cost {sku} 60000</code>"
+        else:
+            profit = float(item.get("profit") or 0)
+            margin = float(item.get("margin") or 0)
+            hint = f"\n   🧾 Себестоимость: <b>{_format_money(float(cost))}</b> | 💰 Прибыль: <b>{_format_money(profit)}</b> | 📈 Маржа: <b>{margin:.1f}%</b>"
+        lines.append(
+            f"{idx}. <b>{title}</b>\n"
+            f"   🔖 SKU: <code>{sku}</code>\n"
+            f"   🔢 Кол-во: <b>{float(item.get('qty') or 0):.0f} шт.</b> | "
+            f"💵 Выручка: <b>{_format_money(float(item.get('revenue') or 0))}</b> | "
+            f"✅ К выплате: <b>{_format_money(float(item.get('payout') or 0))}</b>" + hint
+        )
+    lines.append("\nДобавить себестоимость: <code>/cost SKU 60000</code>")
+    return "\n\n".join(lines)
+
+
+@dp.message(Command("unit", "unit_economy", "profit"))
+async def unit_economy(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, client, shop_id = req
+    lang = get_user_language(telegram_id)
+    await message.answer("⌛ Hisoblayapman..." if lang == "uz" else "⌛ Считаю юнит-экономику...", reply_markup=menu_for_message(message))
+    try:
+        rows, stats, saved_costs = await _unit_economy_for_shop(client, telegram_id, shop_id, days=30)
+        text = _format_unit_economy(shop_id, 30, rows, stats, saved_costs, lang=lang)
+        for part in _split_long_message(text):
+            await message.answer(part, reply_markup=menu_for_message(message))
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+@dp.message(Command("cost", "setcost", "set_cost"))
+async def set_cost_command(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, _, shop_id = req
+    lang = get_user_language(telegram_id)
+    parsed = _parse_cost_command_args(message.text or "")
+    if not parsed:
+        text = (
+            "Tannarxni shunday kiriting:\n<code>/cost SKU 60000</code>\n\nMasalan:\n<code>/cost NOORZA-NR751-BEJEV-XXL 60000</code>"
+            if lang == "uz" else
+            "Укажите себестоимость так:\n<code>/cost SKU 60000</code>\n\nНапример:\n<code>/cost NOORZA-NR751-БЕЖЕВ-XXL 60000</code>"
+        )
+        await message.answer(text, reply_markup=menu_for_message(message))
+        return
+    sku, cost = parsed
+    save_unit_cost(telegram_id, shop_id, sku, cost, title=sku)
+    if lang == "uz":
+        await message.answer(f"✅ Saqlandi\n🔖 SKU: <code>{escape(sku)}</code>\n🧾 Tannarx: <b>{_format_money(cost)}</b>", reply_markup=menu_for_message(message))
+    else:
+        await message.answer(f"✅ Сохранено\n🔖 SKU: <code>{escape(sku)}</code>\n🧾 Себестоимость: <b>{_format_money(cost)}</b>", reply_markup=menu_for_message(message))
+
+
+@dp.message(Command("costs"))
+async def costs_command(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, _, shop_id = req
+    lang = get_user_language(telegram_id)
+    rows = list_unit_costs(telegram_id, shop_id, limit=50)
+    if not rows:
+        text = "Hali tannarxlar kiritilmagan. Qo‘shish: <code>/cost SKU 60000</code>" if lang == "uz" else "Себестоимость ещё не указана. Добавить: <code>/cost SKU 60000</code>"
+        await message.answer(text, reply_markup=menu_for_message(message))
+        return
+    title = "🧾 <b>Saqlangan tannarxlar</b>" if lang == "uz" else "🧾 <b>Сохранённая себестоимость</b>"
+    lines = [title, f"🏪 <code>{shop_id}</code>"]
+    for r in rows:
+        lines.append(f"• <code>{escape(str(r.get('sku_key') or ''))}</code> — <b>{_format_money(float(r.get('cost') or 0))}</b>")
+    await message.answer("\n".join(lines), reply_markup=menu_for_message(message))
+
+
+@dp.message(Command("delcost", "delete_cost"))
+async def delete_cost_command(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, _, shop_id = req
+    sku = parse_args(message.text or "").strip()
+    lang = get_user_language(telegram_id)
+    if not sku:
+        await message.answer("Напишите так: <code>/delcost SKU</code>", reply_markup=menu_for_message(message))
+        return
+    ok = delete_unit_cost(telegram_id, shop_id, sku)
+    if lang == "uz":
+        await message.answer("✅ O‘chirildi" if ok else "Topilmadi", reply_markup=menu_for_message(message))
+    else:
+        await message.answer("✅ Удалено" if ok else "Не найдено", reply_markup=menu_for_message(message))
+
+
+@dp.message(F.text == "🧾 Unit iqtisodiyot")
+@dp.message(F.text == "🧾 Юнит-экономика")
+async def button_unit_economy(message: Message) -> None:
+    await unit_economy(message)
+
 @dp.message(F.text == "🌐 Barcha do‘konlar")
 @dp.message(F.text == "🌐 Все магазины")
 async def button_all_shops(message: Message) -> None:
@@ -7132,7 +7441,7 @@ async def cancel_notify_status(message: Message) -> None:
     await message.answer(text, reply_markup=main_menu_for_user(telegram_id))
 
 async def main() -> None:
-    logging.info("FINANCE_SECONDS_PATCH_LOADED: dateFrom for Finance = seconds, dateTo = milliseconds")
+    logging.info("API_ONLY_POLISHED_LOADED: official API-key connection, simple interface")
     init_language_tables()
     await bot.delete_webhook(drop_pending_updates=True)
     if NEW_ORDER_NOTIFICATIONS:
