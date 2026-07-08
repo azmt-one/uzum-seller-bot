@@ -2069,7 +2069,48 @@ async def connect(message: Message, state: FSMContext) -> None:
 
 @dp.message(ConnectStates.waiting_for_token, F.text)
 async def connect_waiting_token(message: Message, state: FSMContext) -> None:
-    await connect_token(message, message.text or "", state)
+    # Пока бот ждёт API-ключ, команды помощи не должны восприниматься как токен.
+    # Иначе /video или /api_token попадают в проверку токена и пользователь видит ошибку.
+    raw_text = (message.text or "").strip()
+    command = raw_text.split()[0].lower() if raw_text.startswith("/") else ""
+
+    if command in {"/video", "/api_video", "/instruction"}:
+        await video_instruction(message)
+        return
+
+    if command in {"/api_token", "/token_help", "/how_token"}:
+        await api_token_help(message)
+        return
+
+    if command == "/cancel":
+        await cancel(message, state)
+        return
+
+    if command == "/menu":
+        await state.clear()
+        await menu(message)
+        return
+
+    if raw_text.startswith("/"):
+        telegram_id = upsert_from_message(message)
+        lang = get_user_language(telegram_id)
+        if lang == "uz":
+            await message.answer(
+                "Hozir bot API-kalitni kutyapti.\n\n"
+                "API-kalitni yuboring yoki bekor qilish uchun <code>/cancel</code> bosing.\n"
+                "Yordam: <code>/video</code> yoki <code>/api_token</code>",
+                reply_markup=menu_for_message(message),
+            )
+        else:
+            await message.answer(
+                "Сейчас бот ждёт API-ключ.\n\n"
+                "Отправьте API-ключ или нажмите <code>/cancel</code>, чтобы отменить подключение.\n"
+                "Помощь: <code>/video</code> или <code>/api_token</code>",
+                reply_markup=menu_for_message(message),
+            )
+        return
+
+    await connect_token(message, raw_text, state)
 
 
 def disconnect_uzum_for_user(telegram_id: int) -> None:
@@ -7463,5 +7504,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
