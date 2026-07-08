@@ -2439,41 +2439,124 @@ async def products(message: Message) -> None:
         await send_api_error(message, e)
 
 
+STOCK_PAGE_SIZE = int(os.getenv("STOCK_PAGE_SIZE", "10"))
+_stock_page_cache: dict[int, dict[str, Any]] = {}
+
+
+def _stock_page_markup(page: int, total_pages: int, lang: str) -> InlineKeyboardMarkup | None:
+    if total_pages <= 1:
+        return None
+    buttons: list[InlineKeyboardButton] = []
+    if page > 0:
+        buttons.append(InlineKeyboardButton(text="⬅️ Oldingi" if lang == "uz" else "⬅️ Назад", callback_data=f"stockpg:{page-1}"))
+    buttons.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="stockpg:noop"))
+    if page < total_pages - 1:
+        buttons.append(InlineKeyboardButton(text="Keyingi ➡️" if lang == "uz" else "След. страница ➡️", callback_data=f"stockpg:{page+1}"))
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+
+def _stock_page_text(session: dict[str, Any], page: int) -> str:
+    rows = session["rows"]
+    mode = session["mode"]
+    title = session["title"]
+    lang = session["lang"]
+    page_size = session.get("page_size") or STOCK_PAGE_SIZE
+    total = len(rows)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start_i = page * page_size
+    chunk = rows[start_i:start_i + page_size]
+    lines = [format_sku_stock_line(row, mode=mode) for row in chunk]
+    start_n = start_i + 1 if total else 0
+    end_n = start_i + len(chunk)
+    if lang == "uz":
+        header = f"{title}\nKo‘rsatilmoqda: {start_n}–{end_n} / {total}\nSahifa: {page + 1}/{total_pages}"
+    else:
+        header = f"{title}\nПоказано: {start_n}–{end_n} из {total}\nСтраница: {page + 1}/{total_pages}"
+    return header + "\n\n" + "\n\n".join(lines)
+
+
 async def send_stock_list(message: Message, mode: str = "all") -> None:
     req = await require_connection(message)
     if req is None:
         return
     _, client, shop_id = req
     search_query = parse_args(message.text or "")
+    lang = get_user_language(message.from_user.id if message.from_user else None)
 
     try:
-        rows = await load_sku_rows(client, shop_id, search_query=search_query, max_pages=10)
+        rows = await load_sku_rows(client, shop_id, search_query=search_query, max_pages=20)
         if not rows:
-            await message.answer("SKU-остатки не найдены.", reply_markup=menu_for_message(message))
+            text = "SKU qoldiqlari topilmadi." if lang == "uz" else "SKU-остатки не найдены."
+            await message.answer(text, reply_markup=menu_for_message(message))
             return
 
         if mode == "fbo":
             rows = [r for r in rows if (r.get("fbo") or 0) > 0]
-            title = "📊 <b>Остатки FBO / склад Uzum</b>"
+            title = "📦 <b>FBO qoldiqlari / Uzum ombori</b>" if lang == "uz" else "📦 <b>Остатки FBO / склад Uzum</b>"
         elif mode == "fbs":
             rows = [r for r in rows if (r.get("fbs") or 0) > 0]
-            title = "📊 <b>Остатки FBS/DBS / склад продавца</b>"
+            title = "📦 <b>FBS/DBS qoldiqlari / sotuvchi ombori</b>" if lang == "uz" else "📦 <b>Остатки FBS/DBS / склад продавца</b>"
         else:
-            title = "📊 <b>Остатки по SKU: FBO + FBS/DBS + итого</b>"
+            title = "📦 <b>SKU bo‘yicha qoldiqlar: FBO + FBS/DBS + jami</b>" if lang == "uz" else "📦 <b>Остатки по SKU: FBO + FBS/DBS + итого</b>"
 
         if search_query:
-            title += f"\nПоиск: {escape(search_query)}"
+            title += (f"\nQidiruv: {escape(search_query)}" if lang == "uz" else f"\nПоиск: {escape(search_query)}")
         if not rows:
-            await message.answer(title + "\n\nНичего не найдено.", reply_markup=menu_for_message(message))
+            empty = "Hech narsa topilmadi." if lang == "uz" else "Ничего не найдено."
+            await message.answer(title + "\n\n" + empty, reply_markup=menu_for_message(message))
             return
 
-        lines = [format_sku_stock_line(row, mode=mode) for row in rows[:25]]
+        user_id = message.from_user.id if message.from_user else 0
+        page_size = max(5, min(20, STOCK_PAGE_SIZE))
+        total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+        _stock_page_cache[user_id] = {
+            "rows": rows,
+            "mode": mode,
+            "title": title,
+            "lang": lang,
+            "page_size": page_size,
+        }
         await message.answer(
-            title + f"\nПоказано: {min(len(rows), 25)} из {len(rows)}\n\n" + "\n\n".join(lines),
-            reply_markup=menu_for_message(message),
+            _stock_page_text(_stock_page_cache[user_id], 0),
+            reply_markup=_stock_page_markup(0, total_pages, lang),
         )
     except Exception as e:
         await send_api_error(message, e)
+
+
+@dp.callback_query(F.data.startswith("stockpg:"))
+async def stock_page_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user:
+        await callback.answer()
+        return
+    raw = (callback.data or "").split(":", 1)[-1]
+    if raw == "noop":
+        await callback.answer()
+        return
+    try:
+        page = int(raw)
+    except ValueError:
+        await callback.answer()
+        return
+    session = _stock_page_cache.get(callback.from_user.id)
+    lang = get_user_language(callback.from_user.id)
+    if not session:
+        await callback.answer("Список устарел. Нажмите Остатки заново." if lang != "uz" else "Ro‘yxat eskirdi. Qoldiqni qayta bosing.", show_alert=True)
+        return
+    rows = session["rows"]
+    page_size = session.get("page_size") or STOCK_PAGE_SIZE
+    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    try:
+        if callback.message:
+            await callback.message.edit_text(
+                _stock_page_text(session, page),
+                reply_markup=_stock_page_markup(page, total_pages, session.get("lang", lang)),
+            )
+        await callback.answer()
+    except Exception:
+        await callback.answer("Не получилось открыть страницу" if lang != "uz" else "Sahifani ochib bo‘lmadi", show_alert=True)
 
 
 @dp.message(Command("stock"))
@@ -8647,7 +8730,7 @@ def translate_runtime_text_to_uz(text: str) -> str:
     return text
 
 async def main() -> None:
-    logging.info("INTUITIVE_ATTENTION_INTERFACE_LOADED: simple sections + attention report")
+    logging.info("INTUITIVE_ATTENTION_INTERFACE_LOADED: simple sections + attention report + full stock list")
     init_language_tables()
     await bot.delete_webhook(drop_pending_updates=True)
     if NEW_ORDER_NOTIFICATIONS:
@@ -8669,4 +8752,5 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
