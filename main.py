@@ -1226,6 +1226,54 @@ MAIN_MENU_UZ_ADMIN = ReplyKeyboardMarkup(
     input_field_placeholder="Bo‘limni tanlang",
 )
 
+# Главное меню после подключения API: кнопку подключения убираем,
+# чтобы клиент случайно не думал, что магазин нужно подключать заново.
+MAIN_MENU_RU_CONNECTED = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
+        [KeyboardButton(text="🔔 Уведомления"), KeyboardButton(text="📊 Отчёты")],
+        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="💎 Подписка")],
+        [KeyboardButton(text="🌐 Язык"), KeyboardButton(text="ℹ️ Помощь")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выберите раздел",
+)
+
+MAIN_MENU_RU_CONNECTED_ADMIN = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
+        [KeyboardButton(text="🔔 Уведомления"), KeyboardButton(text="📊 Отчёты")],
+        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="💎 Подписка")],
+        [KeyboardButton(text="🌐 Язык"), KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="👑 Админ")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Выберите раздел",
+)
+
+MAIN_MENU_UZ_CONNECTED = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
+        [KeyboardButton(text="🔔 Xabarnomalar"), KeyboardButton(text="📊 Hisobotlar")],
+        [KeyboardButton(text="🏪 Do‘konlar"), KeyboardButton(text="💎 Obuna")],
+        [KeyboardButton(text="🌐 Til"), KeyboardButton(text="ℹ️ Yordam")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Bo‘limni tanlang",
+)
+
+MAIN_MENU_UZ_CONNECTED_ADMIN = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
+        [KeyboardButton(text="🔔 Xabarnomalar"), KeyboardButton(text="📊 Hisobotlar")],
+        [KeyboardButton(text="🏪 Do‘konlar"), KeyboardButton(text="💎 Obuna")],
+        [KeyboardButton(text="🌐 Til"), KeyboardButton(text="ℹ️ Yordam")],
+        [KeyboardButton(text="👑 Admin")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Bo‘limni tanlang",
+)
+
 SALES_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Сегодня"), KeyboardButton(text="📆 Вчера")],
@@ -1346,10 +1394,31 @@ NOTIFICATIONS_MENU = MAIN_MENU_RU
 SETTINGS_MENU = MAIN_MENU_RU
 
 
+def _user_has_uzum_connection(telegram_id: int | None) -> bool:
+    if not telegram_id:
+        return False
+    try:
+        if hasattr(db, "has_uzum_connection"):
+            return bool(db.has_uzum_connection(int(telegram_id)))
+        user = db.get_user(int(telegram_id))
+        return bool(user and user["uzum_token_encrypted"])
+    except Exception:
+        return False
+
+
 def main_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
-    if get_user_language(telegram_id) == "uz":
-        return MAIN_MENU_UZ_ADMIN if is_admin(telegram_id) else MAIN_MENU_UZ
-    return MAIN_MENU_RU_ADMIN if is_admin(telegram_id) else MAIN_MENU_RU
+    lang = get_user_language(telegram_id)
+    admin = is_admin(telegram_id)
+    connected = _user_has_uzum_connection(telegram_id)
+
+    if lang == "uz":
+        if connected:
+            return MAIN_MENU_UZ_CONNECTED_ADMIN if admin else MAIN_MENU_UZ_CONNECTED
+        return MAIN_MENU_UZ_ADMIN if admin else MAIN_MENU_UZ
+
+    if connected:
+        return MAIN_MENU_RU_CONNECTED_ADMIN if admin else MAIN_MENU_RU_CONNECTED
+    return MAIN_MENU_RU_ADMIN if admin else MAIN_MENU_RU
 
 
 def sales_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
@@ -1994,12 +2063,36 @@ async def status(message: Message) -> None:
         reply_markup=menu_for_message(message),
     )
 
+
+def api_already_connected_text(lang: str) -> str:
+    if lang == "uz":
+        return (
+            "✅ <b>Do‘kon allaqachon ulangan</b>\n\n"
+            "Tasodifan <b>🔌 Ulash</b> tugmasini bossangiz ham, eski API-kalit o‘chmaydi.\n\n"
+            "API-kalitni almashtirish kerak bo‘lsa, faqat shunda <code>/reconnect</code> buyrug‘ini yuboring.\n"
+            "Ulanishni butunlay o‘chirish uchun: <code>/disconnect</code>"
+        )
+    return (
+        "✅ <b>Магазин уже подключён</b>\n\n"
+        "Если вы случайно нажали <b>🔌 Подключить</b>, ничего страшного — старый API-ключ не удалён и не слетит.\n\n"
+        "Чтобы заменить API-ключ, используйте только команду <code>/reconnect</code>.\n"
+        "Чтобы полностью удалить подключение: <code>/disconnect</code>"
+    )
+
+
 @dp.message(Command("connect_shop", "staff_connect", "addshop"))
 async def connect_shop_command(message: Message, state: FSMContext) -> None:
-    # Совместимость со старой командой: теперь подключение только через API-ключ продавца.
+    # Подключение только через API-ключ продавца.
+    # Безопасность: если API уже подключён, обычная кнопка/команда не переводит пользователя
+    # в режим замены и не трогает старый ключ. Для замены есть отдельная команда /reconnect.
     telegram_id = upsert_from_message(message)
-    await state.set_state(ConnectStates.waiting_for_token)
     lang = get_user_language(telegram_id)
+    if db.has_uzum_connection(telegram_id):
+        await state.clear()
+        await message.answer(api_already_connected_text(lang), reply_markup=menu_for_message(message))
+        return
+
+    await state.set_state(ConnectStates.waiting_for_token)
     if lang == "uz":
         text = (
             "🔌 <b>Do‘konni ulash</b>\n\n"
@@ -2034,33 +2127,46 @@ async def connect_waiting_shop_id(message: Message, state: FSMContext) -> None:
 
 @dp.message(Command("connect", "reconnect"))
 async def connect(message: Message, state: FSMContext) -> None:
-    token = parse_args(message.text or "")
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    raw_text = (message.text or "").strip()
+    command = raw_text.split()[0].lower() if raw_text.startswith("/") else ""
+    is_reconnect = command.startswith("/reconnect")
+    token = parse_args(raw_text)
+
+    # Безопасность: /connect не заменяет уже подключённый ключ.
+    # Замена разрешена только через явную команду /reconnect или если пользователь сразу передал токен в /reconnect <token>.
+    if db.has_uzum_connection(telegram_id) and not is_reconnect:
+        await state.clear()
+        await message.answer(api_already_connected_text(lang), reply_markup=menu_for_message(message))
+        return
+
     if token:
         await connect_token(message, token, state)
         return
 
-    upsert_from_message(message)
     await state.set_state(ConnectStates.waiting_for_token)
-    lang = get_user_language(upsert_from_message(message))
     if lang == "uz":
+        title = "🔁 <b>API-kalitni almashtirish</b>" if is_reconnect else "🔑 <b>API-kalitni ulash</b>"
         text_connect = (
-            "🔑 <b>API-kalitni ulash</b>\n\n"
+            f"{title}\n\n"
             "Uzum Seller kabinetidan olingan API-kalitni keyingi xabarda yuboring.\n\n"
             "Kalitni qayerdan olish: <code>/api_token</code>\n\n"
             "Muhim:\n"
             "• API-kalit kabinet paroli emas;\n"
-            "• kalit himoyalangan ko‘rinishda saqlanadi;\n"
+            "• eski kalit faqat yangi kalit muvaffaqiyatli tekshirilgandan keyin almashtiriladi;\n"
             "• tekshiruvdan so‘ng bot kalit yuborilgan xabarni o‘chirishga harakat qiladi;\n"
             "• bekor qilish: <code>/cancel</code>."
         )
     else:
+        title = "🔁 <b>Замена API-ключа</b>" if is_reconnect else "🔑 <b>Подключение API-ключа</b>"
         text_connect = (
-            "🔑 <b>Подключение API-ключа</b>\n\n"
+            f"{title}\n\n"
             "Отправьте следующим сообщением API-ключ из кабинета Uzum Seller.\n\n"
             "Где взять ключ: <code>/api_token</code>\n\n"
             "Важно:\n"
             "• API-ключ — это не пароль от кабинета;\n"
-            "• ключ хранится в защищённом виде;\n"
+            "• старый ключ заменится только после успешной проверки нового;\n"
             "• после проверки бот постарается удалить сообщение с ключом;\n"
             "• отменить: <code>/cancel</code>."
         )
@@ -7504,3 +7610,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
