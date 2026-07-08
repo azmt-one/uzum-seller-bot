@@ -99,6 +99,24 @@ SUBSCRIPTION_PLANS_TEXT = os.getenv(
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "azmt_one").strip().lstrip("@")
 ADMIN_CONTACT_URL = os.getenv("ADMIN_CONTACT_URL", "").strip()
 VIDEO_INSTRUCTION_URL = os.getenv("VIDEO_INSTRUCTION_URL", "https://t.me/uzum_assist_bot/2").strip()
+
+# Простой способ подключения: клиент добавляет нашего технического сотрудника
+# в Uzum Seller, а в боте отправляет только ID магазина. API-ключ сотрудника
+# хранится только в переменных окружения BotHost, не в GitHub.
+STAFF_UZUM_TOKEN = (
+    os.getenv("STAFF_UZUM_TOKEN", "").strip()
+    or os.getenv("TECHNICAL_UZUM_TOKEN", "").strip()
+    or os.getenv("MASTER_UZUM_TOKEN", "").strip()
+)
+STAFF_PHONE = (
+    os.getenv("STAFF_PHONE", "").strip()
+    or os.getenv("BOT_STAFF_PHONE", "").strip()
+    or os.getenv("TECHNICAL_STAFF_PHONE", "").strip()
+)
+STAFF_CONNECT_ENABLED = (
+    bool(STAFF_UZUM_TOKEN)
+    and os.getenv("STAFF_CONNECT_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"}
+)
 REPORT_INVOICE_PRODUCT_LIMIT = int(os.getenv("REPORT_INVOICE_PRODUCT_LIMIT", "10") or "10")
 SMART_LOW_STOCK_DAYS = int(os.getenv("SMART_LOW_STOCK_DAYS", "3") or "3")
 TOP_PRODUCTS_DAYS = int(os.getenv("TOP_PRODUCTS_DAYS", "30") or "30")
@@ -595,8 +613,61 @@ def list_blocked_users(limit: int = 50) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+
+def init_staff_connect_tables() -> None:
+    with db.connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS staff_shop_connections (
+                telegram_id INTEGER NOT NULL,
+                shop_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (telegram_id, shop_id)
+            )
+            """
+        )
+        conn.commit()
+
+
+def save_staff_shop_status(telegram_id: int, shop_id: int, status: str, error: str = "") -> None:
+    init_staff_connect_tables()
+    now = _dt_to_db(_utc_now()) or ""
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO staff_shop_connections (telegram_id, shop_id, status, error, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_id, shop_id) DO UPDATE SET
+                status = excluded.status,
+                error = excluded.error,
+                updated_at = excluded.updated_at
+            """,
+            (int(telegram_id), int(shop_id), str(status), str(error)[:1000], now, now),
+        )
+        conn.commit()
+
+
+def list_staff_shop_connections(limit: int = 30) -> list[dict[str, Any]]:
+    init_staff_connect_tables()
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT telegram_id, shop_id, status, error, created_at, updated_at
+            FROM staff_shop_connections
+            ORDER BY updated_at DESC
+            LIMIT ?
+            """,
+            (int(limit),),
+        ).fetchall()
+    return [dict(r) for r in rows]
+
+
 init_subscription_tables()
 init_business_tables()
+init_staff_connect_tables()
 
 # --- Языки интерфейса ---
 # Основной код отчётов остаётся совместимым с русскими командами, но клиент может выбрать язык меню и основных экранов.
@@ -839,9 +910,7 @@ def translate_runtime_text_to_uz(text: str) -> str:
         ("Отчёт готов", "Hisobot tayyor"),
 
         # explanations / errors
-        ("Расчёт по данным /v1/finance/orders. Если в кабинете Uzum есть корректировки/расходы, итог может отличаться.",
-         "Hisob-kitob /v1/finance/orders ma’lumotlari bo‘yicha. Agar Uzum kabinetida tuzatishlar/xarajatlar bo‘lsa, yakun farq qilishi mumkin."),
-        ("Finance API пока не вернул строки продаж за сегодня. Если в кабинете продажа уже есть, она может появиться здесь позже.",
+                ("Finance API пока не вернул строки продаж за сегодня. Если в кабинете продажа уже есть, она может появиться здесь позже.",
          "Finance API bugungi sotuvlarni hali qaytarmadi. Agar kabinetda sotuv ko‘rinsa, bu yerda biroz keyin paydo bo‘lishi mumkin."),
         ("за выбранный период", "tanlangan davr uchun"),
         ("за сегодня", "bugun uchun"),
@@ -1015,8 +1084,9 @@ MAIN_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
         [KeyboardButton(text="🔔 Уведомления"), KeyboardButton(text="📊 Отчёты")],
-        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="💎 Подписка")],
-        [KeyboardButton(text="🌐 Язык"), KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="🔌 Подключить")],
+        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
+        [KeyboardButton(text="ℹ️ Помощь")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите раздел",
@@ -1026,9 +1096,9 @@ MAIN_MENU_RU_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
         [KeyboardButton(text="🔔 Уведомления"), KeyboardButton(text="📊 Отчёты")],
-        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="💎 Подписка")],
-        [KeyboardButton(text="🌐 Язык"), KeyboardButton(text="👑 Админ")],
-        [KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="🔌 Подключить")],
+        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
+        [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="👑 Админ")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите раздел",
@@ -1038,8 +1108,9 @@ MAIN_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
         [KeyboardButton(text="🔔 Xabarnomalar"), KeyboardButton(text="📊 Hisobotlar")],
-        [KeyboardButton(text="🏪 Do‘konlar"), KeyboardButton(text="💎 Obuna")],
-        [KeyboardButton(text="🌐 Til"), KeyboardButton(text="ℹ️ Yordam")],
+        [KeyboardButton(text="🏪 Do‘konlar"), KeyboardButton(text="🔌 Ulash")],
+        [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
+        [KeyboardButton(text="ℹ️ Yordam")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Bo‘limni tanlang",
@@ -1049,9 +1120,9 @@ MAIN_MENU_UZ_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
         [KeyboardButton(text="🔔 Xabarnomalar"), KeyboardButton(text="📊 Hisobotlar")],
-        [KeyboardButton(text="🏪 Do‘konlar"), KeyboardButton(text="💎 Obuna")],
-        [KeyboardButton(text="🌐 Til"), KeyboardButton(text="👑 Admin")],
-        [KeyboardButton(text="ℹ️ Yordam")],
+        [KeyboardButton(text="🏪 Do‘konlar"), KeyboardButton(text="🔌 Ulash")],
+        [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
+        [KeyboardButton(text="ℹ️ Yordam"), KeyboardButton(text="👑 Admin")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Bo‘limni tanlang",
@@ -1145,7 +1216,8 @@ ADMIN_PANEL_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="💳 Оплаты")],
         [KeyboardButton(text="⏳ Скоро заканчиваются"), KeyboardButton(text="⛔ Заблокированные")],
-        [KeyboardButton(text="✅ Проверить подключение"), KeyboardButton(text="📦 Бэкап базы")],
+        [KeyboardButton(text="✅ Проверить подключение"), KeyboardButton(text="🔌 Через сотрудника")],
+        [KeyboardButton(text="📦 Бэкап базы")],
         [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="⬅️ Главное меню")],
     ],
     resize_keyboard=True,
@@ -1156,7 +1228,8 @@ ADMIN_PANEL_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="👥 Foydalanuvchilar"), KeyboardButton(text="💳 To‘lovlar")],
         [KeyboardButton(text="⏳ Tugayotganlar"), KeyboardButton(text="⛔ Bloklanganlar")],
-        [KeyboardButton(text="✅ Ulanishni tekshirish"), KeyboardButton(text="📦 Baza zaxirasi")],
+        [KeyboardButton(text="✅ Ulanishni tekshirish"), KeyboardButton(text="🔌 Xodim orqali")],
+        [KeyboardButton(text="📦 Baza zaxirasi")],
         [KeyboardButton(text="📢 Xabar yuborish"), KeyboardButton(text="⬅️ Asosiy menyu")],
     ],
     resize_keyboard=True,
@@ -1327,6 +1400,7 @@ def subscription_full_text(telegram_id: int) -> str:
 
 class ConnectStates(StatesGroup):
     waiting_for_token = State()
+    waiting_for_shop_id = State()
 
 
 def get_tg_id(message: Message) -> int:
@@ -1351,6 +1425,173 @@ def get_uzum_for_user(telegram_id: int) -> UzumClient | None:
     return UzumClient(token, UZUM_API_BASE_URL)
 
 
+def get_staff_uzum_client() -> UzumClient | None:
+    if not STAFF_CONNECT_ENABLED or not STAFF_UZUM_TOKEN:
+        return None
+    return UzumClient(STAFF_UZUM_TOKEN, UZUM_API_BASE_URL)
+
+
+def _shop_id_from_obj(shop: Any) -> int | None:
+    if not isinstance(shop, dict):
+        return None
+    for key in ("id", "shopId", "shop_id", "storeId"):
+        value = shop.get(key)
+        if value is not None:
+            try:
+                return int(value)
+            except Exception:
+                pass
+    return None
+
+
+def _find_shop_in_list(shops: list[Any], shop_id: int) -> dict[str, Any] | None:
+    for item in shops:
+        if isinstance(item, dict) and _shop_id_from_obj(item) == int(shop_id):
+            return item
+    return None
+
+
+def _fallback_shop_obj(shop_id: int) -> dict[str, Any]:
+    return {
+        "id": int(shop_id),
+        "shopId": int(shop_id),
+        "title": f"Магазин {int(shop_id)}",
+        "name": f"Магазин {int(shop_id)}",
+    }
+
+
+async def notify_admins_staff_shop_connected(message: Message, telegram_id: int, shop_id: int) -> None:
+    user = message.from_user
+    username = f"@{user.username}" if user and user.username else "—"
+    first_name = user.first_name if user and user.first_name else "—"
+    text = (
+        "🆕 <b>Магазин подключён через сотрудника</b>\n\n"
+        f"Пользователь: {escape(first_name)} {escape(username)}\n"
+        f"Telegram ID: <code>{telegram_id}</code>\n"
+        f"Shop ID: <code>{shop_id}</code>\n"
+        f"Доступ: {subscription_status_text(telegram_id)}"
+    )
+    for admin_id in ADMIN_IDS:
+        if int(admin_id) == int(telegram_id):
+            continue
+        try:
+            await bot.send_message(int(admin_id), text, reply_markup=admin_menu_for_user(int(admin_id)))
+            await asyncio.sleep(0.1)
+        except Exception:
+            logging.exception("Failed to notify admin about staff shop connection")
+
+
+async def connect_shop_by_staff(message: Message, shop_id_text: str, state: FSMContext | None = None) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    shop_id_text = (shop_id_text or "").strip()
+    if not shop_id_text.isdigit():
+        if lang == "uz":
+            await message.answer(
+                "Shop ID faqat raqamlardan iborat bo‘lishi kerak.\nMasalan: <code>113982</code>",
+                reply_markup=menu_for_message(message),
+            )
+        else:
+            await message.answer(
+                "ID магазина должен состоять только из цифр.\nНапример: <code>113982</code>",
+                reply_markup=menu_for_message(message),
+            )
+        return
+
+    if not await require_active_subscription(message, telegram_id):
+        return
+
+    staff_client = get_staff_uzum_client()
+    if staff_client is None:
+        await message.answer(
+            "⚠️ Простой способ подключения пока не настроен.\n\n"
+            "Можно подключиться старым способом через API-ключ: <code>/connect</code>",
+            reply_markup=menu_for_message(message),
+        )
+        if state:
+            await state.clear()
+        return
+
+    shop_id = int(shop_id_text)
+    save_staff_shop_status(telegram_id, shop_id, "pending")
+
+    try:
+        shops: list[Any] = []
+        shop_obj: dict[str, Any] | None = None
+        try:
+            shops_data = await staff_client.get_shops()
+            shops = extract_items(shops_data)
+            shop_obj = _find_shop_in_list(shops, shop_id)
+        except Exception:
+            logging.exception("Staff connect: failed to load shops list")
+
+        await staff_client.get_products(shop_id, page=0, size=1)
+
+        # Проверяем доступ к Finance. Даже если продаж нет, метод должен ответить без 403.
+        date_from, date_to = _days_range_ms(30)
+        await _load_finance_orders(
+            staff_client,
+            shop_id,
+            date_from_ms=date_from,
+            date_to_ms=date_to,
+            max_pages=1,
+            page_size=1,
+        )
+
+        encrypted = cipher.encrypt(STAFF_UZUM_TOKEN)
+        db.save_connection(telegram_id, encrypted, [shop_obj or _fallback_shop_obj(shop_id)])
+        try:
+            db.set_default_shop_id(telegram_id, shop_id)
+        except Exception:
+            pass
+        save_staff_shop_status(telegram_id, shop_id, "connected")
+
+        if state:
+            await state.clear()
+
+        if lang == "uz":
+            text_ok = (
+                "✅ <b>Do‘kon ulandi</b>\n\n"
+                f"Shop ID: <code>{shop_id}</code>\n"
+                "Xodim orqali kirish tasdiqlandi.\n\n"
+                "Endi savdolar, qoldiqlar va hisobotlardan foydalanishingiz mumkin."
+            )
+        else:
+            text_ok = (
+                "✅ <b>Магазин подключён</b>\n\n"
+                f"Shop ID: <code>{shop_id}</code>\n"
+                "Доступ через сотрудника подтверждён.\n\n"
+                "Теперь можно смотреть продажи, остатки и отчёты."
+            )
+        await message.answer(text_ok, reply_markup=menu_for_message(message))
+        await notify_admins_staff_shop_connected(message, telegram_id, shop_id)
+
+    except Exception as e:
+        save_staff_shop_status(telegram_id, shop_id, "no_access", str(e))
+        raw = str(e)
+        low = raw.lower()
+        if "403" in raw or "rbac" in low or "forbidden" in low or "access" in low:
+            if lang == "uz":
+                text = (
+                    "⛔ <b>Do‘konga kirish topilmadi</b>\n\n"
+                    "Ehtimol, xodim hali qo‘shilmagan yoki unga savdo/moliya/tovarlar bo‘yicha huquqlar berilmagan.\n\n"
+                    "1. Uzum Seller kabinetida xodim qo‘shilganini tekshiring.\n"
+                    "2. Savdo, moliya, tovarlar va qoldiq huquqlarini bering.\n"
+                    "3. Keyin Shop ID ni qayta yuboring."
+                )
+            else:
+                text = (
+                    "⛔ <b>Доступ к магазину не найден</b>\n\n"
+                    "Скорее всего, сотрудник ещё не добавлен или ему не дали права на продажи/финансы/товары.\n\n"
+                    "1. Проверьте, что сотрудник добавлен в Uzum Seller.\n"
+                    "2. Дайте права на продажи, финансы, товары и остатки.\n"
+                    "3. После этого отправьте Shop ID ещё раз."
+                )
+            await message.answer(text, reply_markup=menu_for_message(message))
+            return
+        await send_api_error(message, e)
+
+
 async def require_connection(message: Message) -> tuple[int, UzumClient, int] | None:
     telegram_id = upsert_from_message(message)
     if not await require_active_subscription(message, telegram_id):
@@ -1360,8 +1601,9 @@ async def require_connection(message: Message) -> tuple[int, UzumClient, int] | 
 
     if client is None:
         await message.answer(
-            "Сначала подключите ваш Uzum Seller API-токен.\n\n"
-            "Команда: <code>/connect</code>",
+            "Сначала подключите магазин.\n\n"
+            "Проще: <code>/connect_shop</code> — добавить сотрудника и отправить ID магазина.\n"
+            "Запасной способ: <code>/connect</code> — подключить API-ключ.",
             reply_markup=menu_for_message(message),
         )
         return None
@@ -1598,8 +1840,8 @@ async def start(message: Message) -> None:
             f"Kirish: {sub_line}\n"
             f"Til: <b>{language_title(lang)}</b>\n\n"
             "🚀 <b>Boshlash uchun 3 qadam:</b>\n"
-            "1. <code>/api_token</code> — API-kalit olish yo‘riqnomasi\n"
-            "2. <code>/connect</code> — kalitni botga ulash\n"
+            "1. <code>/connect_shop</code> — do‘konni oddiy usulda ulash\n"
+            "2. Xodimni Uzum Seller kabinetiga qo‘shib, Shop ID yuborish\n"
             "3. <b>💰 Savdo</b> yoki <b>📦 Ombor</b> bo‘limini tanlash\n\n"
             "Asosiy menyuda faqat eng kerakli bo‘limlar qoldirildi.\n"
             "Yordam: <code>/support</code>"
@@ -1613,8 +1855,8 @@ async def start(message: Message) -> None:
             f"Доступ: {sub_line}\n"
             f"Язык: <b>{language_title(lang)}</b>\n\n"
             "🚀 <b>Начать в 3 шага:</b>\n"
-            "1. <code>/api_token</code> — посмотреть инструкцию, где взять API-ключ\n"
-            "2. <code>/connect</code> — подключить API-ключ к боту\n"
+            "1. <code>/connect_shop</code> — подключить магазин простым способом\n"
+            "2. Добавить сотрудника в Uzum Seller и отправить Shop ID\n"
             "3. Выбрать раздел <b>💰 Продажи</b> или <b>📦 Склад</b>\n\n"
             "В главном меню оставлены только самые нужные разделы, чтобы не путаться.\n"
             "Поддержка: <code>/support</code>"
@@ -1651,6 +1893,56 @@ async def status(message: Message) -> None:
         f"Подписка: {subscription_status_text(telegram_id)}\n",
         reply_markup=menu_for_message(message),
     )
+
+@dp.message(Command("connect_shop", "staff_connect", "addshop"))
+async def connect_shop_command(message: Message, state: FSMContext) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    arg = parse_args(message.text or "")
+    if arg:
+        await connect_shop_by_staff(message, arg, state)
+        return
+
+    await state.set_state(ConnectStates.waiting_for_shop_id)
+    phone_line = f"\n📞 Номер сотрудника: <code>{escape(STAFF_PHONE)}</code>" if STAFF_PHONE else ""
+    phone_line_uz = f"\n📞 Xodim raqami: <code>{escape(STAFF_PHONE)}</code>" if STAFF_PHONE else ""
+    if lang == "uz":
+        text = (
+            "🔌 <b>Do‘konni ulash</b>\n\n"
+            "Eng oson usul:\n"
+            "1. Uzum Seller kabinetiga kiring.\n"
+            "2. Bot xodimini do‘koningizga qo‘shing." + phone_line_uz + "\n"
+            "3. Unga savdo, moliya, tovarlar va qoldiq bo‘yicha huquqlarni bering.\n"
+            "4. Bu yerga Shop ID ni yuboring.\n\n"
+            "Masalan: <code>113982</code>\n\n"
+            "Agar bu usul ishlamasa, API-kalit orqali ulash mumkin: <code>/connect</code>\n"
+            "Bekor qilish: <code>/cancel</code>"
+        )
+    else:
+        text = (
+            "🔌 <b>Подключение магазина</b>\n\n"
+            "Самый простой способ:\n"
+            "1. Зайдите в кабинет Uzum Seller.\n"
+            "2. Добавьте нашего сотрудника в свой магазин." + phone_line + "\n"
+            "3. Дайте права на продажи, финансы, товары и остатки.\n"
+            "4. Вернитесь сюда и отправьте Shop ID магазина.\n\n"
+            "Пример: <code>113982</code>\n\n"
+            "Если этот способ не получится, можно подключить через API-ключ: <code>/connect</code>\n"
+            "Отмена: <code>/cancel</code>"
+        )
+    await message.answer(text, reply_markup=menu_for_message(message))
+
+
+@dp.message(F.text == "🔌 Подключить")
+@dp.message(F.text == "🔌 Ulash")
+async def connect_shop_button(message: Message, state: FSMContext) -> None:
+    await connect_shop_command(message, state)
+
+
+@dp.message(ConnectStates.waiting_for_shop_id, F.text)
+async def connect_waiting_shop_id(message: Message, state: FSMContext) -> None:
+    await connect_shop_by_staff(message, message.text or "", state)
+
 
 @dp.message(Command("connect", "reconnect"))
 async def connect(message: Message, state: FSMContext) -> None:
@@ -2268,13 +2560,6 @@ def _format_sales_details(days: int, shop_id: int, stats: dict[str, Any], first_
         f"Отменённых строк: <b>{stats['cancelled']}</b>",
     ]
 
-    statuses = stats.get("statuses") or {}
-    if statuses:
-        lines.append("")
-        lines.append("<b>Статусы:</b>")
-        for status, count in sorted(statuses.items(), key=lambda x: str(x[0]))[:8]:
-            lines.append(f"• <code>{escape(str(status))}</code>: {count}")
-
     top_products = stats.get("top_products") or []
     if top_products:
         lines.append("")
@@ -2513,35 +2798,24 @@ def _build_noorza_today_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _format_noorza_today(shop_id: int, stats: dict[str, Any], rows: list[dict[str, Any]]) -> str:
-    statuses = stats.get("statuses") or {}
-    status_lines = []
-    for key in ("PROCESSING", "TO_WITHDRAW"):
-        status_lines.append(f"{key}: <b>{int(statuses.get(key, 0))}</b>")
-    for k, v in sorted(statuses.items()):
-        if k not in {"PROCESSING", "TO_WITHDRAW"}:
-            status_lines.append(f"{escape(str(k))}: <b>{int(v)}</b>")
-        if len(status_lines) >= 7:
-            break
     extra = ""
     if not rows:
         extra = (
-            "\n\n<i>Finance API пока не вернул строки продаж за сегодня. "
-            "Если в кабинете продажа уже есть, она может появиться здесь позже.</i>"
+            "\n\n<i>Пока продаж за выбранный период не найдено. "
+            "Если продажа только появилась в кабинете, она может отобразиться чуть позже.</i>"
         )
     return (
-        "💰 <b>Продажи Uzum FBO/FBS за сегодня</b>\n"
-        f"Магазин: <code>{shop_id}</code>\n\n"
-        f"<b>Позиции продаж:</b> {int(stats['rows'])}\n"
-        f"<b>Кол-во товаров:</b> {float(stats['units']):.0f} шт.\n"
-        f"<b>Возвраты:</b> {float(stats['returns']):.0f} шт.\n\n"
-        f"<b>Выручка:</b> {_format_money(float(stats['revenue']))}\n"
-        f"<b>Комиссия Uzum:</b> {_format_money(float(stats['commission']))}\n"
-        f"<b>Логистика:</b> {_format_money(float(stats['logistics']))}\n\n"
-        f"<b>К выплате всего:</b> {_format_money(float(stats['payout_total']))}\n"
-        f"<b>Уже выведено:</b> {_format_money(float(stats['withdrawn']))}\n"
-        f"<b>Остаток к выплате:</b> {_format_money(float(stats['left_to_withdraw']))}\n\n"
-        "<b>Статусы:</b>\n" + "\n".join(status_lines) +
-        "\n\n<i>Расчёт по данным /v1/finance/orders. Если в кабинете Uzum есть корректировки/расходы, итог может отличаться.</i>" + extra
+        "💰 <b>Продажи за сегодня</b>\n"
+        f"🏪 Магазин: <code>{shop_id}</code>\n\n"
+        f"🛒 Продаж: <b>{int(stats['rows'])}</b>\n"
+        f"📦 Товаров продано: <b>{float(stats['units']):.0f} шт.</b>\n"
+        f"↩️ Возвратов: <b>{float(stats['returns']):.0f} шт.</b>\n\n"
+        f"💵 Выручка: <b>{_format_money(float(stats['revenue']))}</b>\n"
+        f"🏷 Комиссия Uzum: <b>{_format_money(float(stats['commission']))}</b>\n"
+        f"🚚 Логистика: <b>{_format_money(float(stats['logistics']))}</b>\n\n"
+        f"✅ К выплате: <b>{_format_money(float(stats['payout_total']))}</b>\n"
+        f"💳 Уже выведено: <b>{_format_money(float(stats['withdrawn']))}</b>\n"
+        f"🧾 Остаток к выплате: <b>{_format_money(float(stats['left_to_withdraw']))}</b>" + extra
     )
 
 
@@ -2562,6 +2836,7 @@ async def today_sales(message: Message) -> None:
 
 def _format_noorza_period(title: str, shop_id: int, stats: dict[str, Any], rows: list[dict[str, Any]]) -> str:
     text = _format_noorza_today(shop_id, stats, rows)
+    text = text.replace("💰 <b>Продажи за сегодня</b>", f"💰 <b>{escape(title)}</b>", 1)
     text = text.replace("💰 <b>Продажи Uzum FBO/FBS за сегодня</b>", f"💰 <b>{escape(title)}</b>", 1)
     if not rows:
         text = text.replace("за сегодня", "за выбранный период")
@@ -3918,6 +4193,33 @@ async def admin_blocked_users(message: Message) -> None:
     )
 
 
+@dp.message(Command("staff_connections"))
+async def staff_connections_admin(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    if not is_admin(telegram_id):
+        await message.answer("⛔ Команда доступна только админу.", reply_markup=menu_for_message(message))
+        return
+    rows = list_staff_shop_connections(30)
+    if not rows:
+        await message.answer("Заявок/подключений через сотрудника пока нет.", reply_markup=admin_menu_for_message(message))
+        return
+    lines = []
+    for r in rows:
+        err = (r.get("error") or "").strip()
+        err_part = f" | {escape(err[:80])}" if err else ""
+        lines.append(
+            f"{escape(str(r.get('status') or ''))} | user <code>{int(r.get('telegram_id') or 0)}</code> | "
+            f"shop <code>{int(r.get('shop_id') or 0)}</code> | {_fmt_dt(r.get('updated_at'))}{err_part}"
+        )
+    await message.answer("🔌 <b>Подключения через сотрудника</b>\n\n" + "\n".join(lines), reply_markup=admin_menu_for_message(message))
+
+
+@dp.message(F.text == "🔌 Через сотрудника")
+@dp.message(F.text == "🔌 Xodim orqali")
+async def staff_connections_button(message: Message) -> None:
+    await staff_connections_admin(message)
+
+
 @dp.message(Command("users"))
 async def admin_users(message: Message) -> None:
     telegram_id = upsert_from_message(message)
@@ -5109,38 +5411,36 @@ def build_new_sale_message(item: dict[str, Any], shop_id: int | None = None, lan
     payout = payout_direct if payout_direct is not None else max(0.0, _finance_gross_revenue(item) - commission - logistics)
 
     if lang == "uz":
-        shop_line = f"Do‘kon: <code>{shop_id}</code>\n" if shop_id is not None else ""
+        shop_line = f"🏪 Do‘kon: <code>{shop_id}</code>\n" if shop_id is not None else ""
         return (
-            "🛒 <b>Yangi Uzum FBO savdosi</b>\n\n"
+            "🛒 <b>Yangi savdo</b>\n\n"
             + shop_line +
-            f"<b>Tovar:</b> {title}\n"
-            f"<b>SKU:</b> {sku}\n"
-            f"<b>Soni:</b> {qty:g} dona\n\n"
-            f"<b>Sotuv narxi:</b> {_format_money(float(unit_price or 0))}\n"
-            f"<b>Komissiya:</b> {_format_money(float(commission))}\n"
-            f"<b>Logistika:</b> {_format_money(float(logistics))}\n"
-            f"<b>To‘lovga:</b> {_format_money(float(payout))}\n\n"
-            f"<b>Buyurtma ID:</b> {escape(_finance_order_id(item))}\n"
-            f"<b>Savdo ID:</b> {escape(_finance_sale_id(item))}\n"
-            f"<b>Status:</b> {escape(_finance_status(item))}\n"
-            f"<b>Sana:</b> {escape(_format_finance_date(_finance_date_value(item)))}"
+            f"📦 Tovar: <b>{title}</b>\n"
+            f"🔖 SKU: <code>{sku}</code>\n"
+            f"🔢 Soni: <b>{qty:g} dona</b>\n\n"
+            f"💵 Narx: <b>{_format_money(float(unit_price or 0))}</b>\n"
+            f"🏷 Komissiya: <b>{_format_money(float(commission))}</b>\n"
+            f"🚚 Logistika: <b>{_format_money(float(logistics))}</b>\n"
+            f"✅ To‘lovga: <b>{_format_money(float(payout))}</b>\n\n"
+            f"🆔 Buyurtma: <code>{escape(_finance_order_id(item))}</code>\n"
+            f"📌 Status: <code>{escape(_finance_status(item))}</code>\n"
+            f"🕒 Sana: {escape(_format_finance_date(_finance_date_value(item)))}"
         )
 
-    shop_line = f"Магазин: <code>{shop_id}</code>\n" if shop_id is not None else ""
+    shop_line = f"🏪 Магазин: <code>{shop_id}</code>\n" if shop_id is not None else ""
     return (
-        "🛒 <b>Новая продажа Uzum FBO</b>\n\n"
+        "🛒 <b>Новая продажа</b>\n\n"
         + shop_line +
-        f"<b>Товар:</b> {title}\n"
-        f"<b>SKU:</b> {sku}\n"
-        f"<b>Кол-во:</b> {qty:g} шт.\n\n"
-        f"<b>Цена продажи:</b> {_format_money(float(unit_price or 0))}\n"
-        f"<b>Комиссия:</b> {_format_money(float(commission))}\n"
-        f"<b>Логистика:</b> {_format_money(float(logistics))}\n"
-        f"<b>К выплате:</b> {_format_money(float(payout))}\n\n"
-        f"<b>ID заказа:</b> {escape(_finance_order_id(item))}\n"
-        f"<b>ID продажи:</b> {escape(_finance_sale_id(item))}\n"
-        f"<b>Статус:</b> {escape(_finance_status(item))}\n"
-        f"<b>Дата:</b> {escape(_format_finance_date(_finance_date_value(item)))}"
+        f"📦 Товар: <b>{title}</b>\n"
+        f"🔖 SKU: <code>{sku}</code>\n"
+        f"🔢 Кол-во: <b>{qty:g} шт.</b>\n\n"
+        f"💵 Цена: <b>{_format_money(float(unit_price or 0))}</b>\n"
+        f"🏷 Комиссия: <b>{_format_money(float(commission))}</b>\n"
+        f"🚚 Логистика: <b>{_format_money(float(logistics))}</b>\n"
+        f"✅ К выплате: <b>{_format_money(float(payout))}</b>\n\n"
+        f"🆔 Заказ: <code>{escape(_finance_order_id(item))}</code>\n"
+        f"📌 Статус: <code>{escape(_finance_status(item))}</code>\n"
+        f"🕒 Дата: {escape(_format_finance_date(_finance_date_value(item)))}"
     )
 
 
@@ -5453,7 +5753,7 @@ async def button_admin_blocked(message: Message) -> None:
 async def button_sales_section_simple(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     lang = get_user_language(telegram_id)
-    text = "💰 <b>Savdo bo‘limi</b>\nKerakli davr yoki hisobotni tanlang 👇" if lang == "uz" else "💰 <b>Продажи</b>\nВыберите период или отчёт 👇"
+    text = "💰 <b>Savdo bo‘limi</b>\nKerakli davr yoki hisobotni tanlang 👇" if lang == "uz" else "💰 <b>Продажи</b>\nВыберите, что посмотреть 👇"
     await message.answer(text, reply_markup=sales_menu_for_message(message))
 
 
@@ -5462,7 +5762,7 @@ async def button_sales_section_simple(message: Message) -> None:
 async def button_stock_section_simple(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     lang = get_user_language(telegram_id)
-    text = "📦 <b>Ombor</b>\nQoldiq, prognoz yoki FBO yuk xatlarini tanlang 👇" if lang == "uz" else "📦 <b>Склад</b>\nВыберите остатки, прогноз или FBO-накладные 👇"
+    text = "📦 <b>Ombor</b>\nQoldiq, prognoz yoki FBO yuk xatlarini tanlang 👇" if lang == "uz" else "📦 <b>Склад</b>\nОстатки, прогноз и FBO-накладные 👇"
     await message.answer(text, reply_markup=stock_menu_for_message(message))
 
 
@@ -5471,7 +5771,7 @@ async def button_stock_section_simple(message: Message) -> None:
 async def button_notifications_section_simple(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     lang = get_user_language(telegram_id)
-    text = "🔔 <b>Xabarnomalar</b>\nKerakli holatni tanlang 👇" if lang == "uz" else "🔔 <b>Уведомления</b>\nВыберите, что проверить 👇"
+    text = "🔔 <b>Xabarnomalar</b>\nKerakli holatni tanlang 👇" if lang == "uz" else "🔔 <b>Уведомления</b>\nПроверьте, что включено 👇"
     await message.answer(text, reply_markup=notify_menu_for_message(message))
 
 
@@ -5480,7 +5780,7 @@ async def button_notifications_section_simple(message: Message) -> None:
 async def button_reports_section_simple(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     lang = get_user_language(telegram_id)
-    text = "📊 <b>Hisobotlar</b>\nExcel, ertalabki hisobot yoki ulanish tekshiruvi 👇" if lang == "uz" else "📊 <b>Отчёты</b>\nExcel, утренний отчёт или проверка подключения 👇"
+    text = "📊 <b>Hisobotlar</b>\nExcel, ertalabki hisobot yoki ulanish tekshiruvi 👇" if lang == "uz" else "📊 <b>Отчёты</b>\nExcel, утренний отчёт и проверка подключения 👇"
     await message.answer(text, reply_markup=report_menu_for_message(message))
 
 
@@ -5903,31 +6203,21 @@ def _merge_noorza_stats(stats_list: list[dict[str, Any]]) -> dict[str, Any]:
 
 
 def _format_all_shops_balance(days_title: str, shops_count: int, stats: dict[str, Any], per_shop: list[str]) -> str:
-    statuses = stats.get("statuses") or {}
-    status_lines = []
-    for key in ("PROCESSING", "TO_WITHDRAW"):
-        status_lines.append(f"{key}: <b>{int(statuses.get(key, 0))}</b>")
-    for k, v in sorted(statuses.items()):
-        if k not in {"PROCESSING", "TO_WITHDRAW"}:
-            status_lines.append(f"{escape(str(k))}: <b>{int(v)}</b>")
-        if len(status_lines) >= 7:
-            break
     text = (
         f"🌐 <b>Баланс по всем магазинам {escape(days_title)}</b>\n\n"
-        f"Магазинов: <b>{shops_count}</b>\n"
-        f"Позиции продаж: <b>{int(stats['rows'])}</b>\n"
-        f"Кол-во товаров: <b>{float(stats['units']):.0f} шт.</b>\n"
-        f"Возвраты: <b>{float(stats['returns']):.0f} шт.</b>\n\n"
-        f"Выручка: <b>{_format_money(float(stats['revenue']))}</b>\n"
-        f"Комиссия Uzum: <b>{_format_money(float(stats['commission']))}</b>\n"
-        f"Логистика: <b>{_format_money(float(stats['logistics']))}</b>\n\n"
-        f"К выплате всего: <b>{_format_money(float(stats['payout_total']))}</b>\n"
-        f"Уже выведено: <b>{_format_money(float(stats['withdrawn']))}</b>\n"
-        f"Остаток к выплате: <b>{_format_money(float(stats['left_to_withdraw']))}</b>\n\n"
-        "<b>Статусы:</b>\n" + "\n".join(status_lines)
+        f"🏪 Магазинов: <b>{shops_count}</b>\n"
+        f"🛒 Продаж: <b>{int(stats['rows'])}</b>\n"
+        f"📦 Товаров продано: <b>{float(stats['units']):.0f} шт.</b>\n"
+        f"↩️ Возвратов: <b>{float(stats['returns']):.0f} шт.</b>\n\n"
+        f"💵 Выручка: <b>{_format_money(float(stats['revenue']))}</b>\n"
+        f"🏷 Комиссия Uzum: <b>{_format_money(float(stats['commission']))}</b>\n"
+        f"🚚 Логистика: <b>{_format_money(float(stats['logistics']))}</b>\n\n"
+        f"✅ К выплате: <b>{_format_money(float(stats['payout_total']))}</b>\n"
+        f"💳 Уже выведено: <b>{_format_money(float(stats['withdrawn']))}</b>\n"
+        f"🧾 Остаток к выплате: <b>{_format_money(float(stats['left_to_withdraw']))}</b>"
     )
     if per_shop:
-        text += "\n\n<b>По магазинам:</b>\n" + "\n".join(per_shop[:20])
+        text += "\n\n<b>🏪 По магазинам:</b>\n" + "\n".join(per_shop[:20])
     return text
 
 
@@ -6689,34 +6979,32 @@ def build_cancel_message(item: dict[str, Any], shop_id: int | None = None, lang:
     date_text = escape(_format_finance_date(_finance_date_value(item)))
 
     if lang == "uz":
-        shop_line = f"Do‘kon: <code>{shop_id}</code>\n" if shop_id is not None else ""
-        price_line = f"<b>Sotuv narxi:</b> {_format_money(float(unit_price or 0))}\n" if unit_price is not None else ""
+        shop_line = f"🏪 Do‘kon: <code>{shop_id}</code>\n" if shop_id is not None else ""
+        price_line = f"💵 Summa: <b>{_format_money(float(unit_price or 0))}</b>\n" if unit_price is not None else ""
         return (
-            "❌ <b>Uzum buyurtmasi bekor qilindi</b>\n\n"
+            "❌ <b>Buyurtma bekor qilindi</b>\n\n"
             + shop_line +
-            f"<b>Tovar:</b> {title}\n"
-            f"<b>SKU:</b> {sku}\n"
-            f"<b>Soni:</b> {qty:g} dona\n\n"
+            f"📦 Tovar: <b>{title}</b>\n"
+            f"🔖 SKU: <code>{sku}</code>\n"
+            f"🔢 Soni: <b>{qty:g} dona</b>\n\n"
             + price_line +
-            f"<b>Buyurtma ID:</b> {order_id}\n"
-            f"<b>Savdo ID:</b> {sale_id}\n"
-            f"<b>Status:</b> {status}\n"
-            f"<b>Sana:</b> {date_text}"
+            f"🆔 Buyurtma: <code>{order_id}</code>\n"
+            f"📌 Status: <code>{status}</code>\n"
+            f"🕒 Sana: {date_text}"
         )
 
-    shop_line = f"Магазин: <code>{shop_id}</code>\n" if shop_id is not None else ""
-    price_line = f"<b>Цена продажи:</b> {_format_money(float(unit_price or 0))}\n" if unit_price is not None else ""
+    shop_line = f"🏪 Магазин: <code>{shop_id}</code>\n" if shop_id is not None else ""
+    price_line = f"💵 Сумма: <b>{_format_money(float(unit_price or 0))}</b>\n" if unit_price is not None else ""
     return (
-        "❌ <b>Отмена заказа Uzum FBO</b>\n\n"
+        "❌ <b>Отмена заказа</b>\n\n"
         + shop_line +
-        f"<b>Товар:</b> {title}\n"
-        f"<b>SKU:</b> {sku}\n"
-        f"<b>Кол-во:</b> {qty:g} шт.\n\n"
+        f"📦 Товар: <b>{title}</b>\n"
+        f"🔖 SKU: <code>{sku}</code>\n"
+        f"🔢 Кол-во: <b>{qty:g} шт.</b>\n\n"
         + price_line +
-        f"<b>ID заказа:</b> {order_id}\n"
-        f"<b>ID продажи:</b> {sale_id}\n"
-        f"<b>Статус:</b> {status}\n"
-        f"<b>Дата:</b> {date_text}"
+        f"🆔 Заказ: <code>{order_id}</code>\n"
+        f"📌 Статус: <code>{status}</code>\n"
+        f"🕒 Дата: {date_text}"
     )
 
 
@@ -6866,4 +7154,5 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
