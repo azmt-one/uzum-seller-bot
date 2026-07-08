@@ -8208,6 +8208,444 @@ async def friendly_auto_start(message: Message, state: FSMContext) -> None:
         )
     await message.answer(text, reply_markup=menu_for_message(message))
 
+
+# --- Финальная чистка узбекских сообщений для клиентов ---
+# Убирает оставшиеся русские фразы в разделах уведомлений, подписки и помощи.
+_FINAL_UZ_TRANSLATE_RUNTIME_TEXT_TO_UZ = translate_runtime_text_to_uz
+
+
+def translate_runtime_text_to_uz(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+    text = _FINAL_UZ_TRANSLATE_RUNTIME_TEXT_TO_UZ(text)
+
+    fixes = [
+        # Уведомления о низких остатках
+        ("📉 <b>Уведомления о низких остатках</b>", "📉 <b>Kam qoldiq xabarnomalari</b>"),
+        ("Уведомления о низких остатках", "Kam qoldiq xabarnomalari"),
+        ("📉 <b>Низкие остатки</b>", "📉 <b>Kam qoldiq</b>"),
+        ("Низкие остатки", "Kam qoldiq"),
+        ("Порог:", "Chegara:"),
+        ("Chegara: ≤", "Chegara: ≤"),
+        ("шт.", "dona"),
+        ("Проверка каждые:", "Tekshiruv har"),
+        ("Tekshiruv har: <b>", "Tekshiruv har <b>"),
+        ("Tekshiruv har <b>1800</b> soniya", "Tekshiruv har <b>1800</b> soniyada"),
+        ("Tekshiruv har <b>300</b> soniya", "Tekshiruv har <b>300</b> soniyada"),
+        ("Tekshiruv har <b>60</b> soniya", "Tekshiruv har <b>60</b> soniyada"),
+        ("Состояние: остатки уже запомнены", "Holat: qoldiqlar allaqachon eslab qolingan"),
+        ("Состояние: нулевые остатки уже запомнены", "Holat: nol qoldiqlar allaqachon eslab qolingan"),
+        ("Состояние: инициализация при следующей проверке", "Holat: keyingi tekshiruvda ishga tushadi"),
+        ("Holat: остатки уже запомнены", "Holat: qoldiqlar allaqachon eslab qolingan"),
+        ("Holat: нулевые остатки уже запомнены", "Holat: nol qoldiqlar allaqachon eslab qolingan"),
+        ("Holat: инициализация при следующей проверке", "Holat: keyingi tekshiruvda ishga tushadi"),
+        ("Бот уведомит, когда товар впервые опустится до порога или ниже.", "Tovar birinchi marta belgilangan chegaragacha yoki undan pastga tushganda bot xabar beradi."),
+        ("Бот уведомит, когда товар впервые опустится до остатка <b>0</b>.", "Tovar qoldig‘i birinchi marta <b>0</b> bo‘lganda bot xabar beradi."),
+
+        # Подписка / тарифы
+        ("💎 <b>Uzum Seller Assistant obunasi</b>", "💎 <b>Uzum Seller Assistant obunasi</b>"),
+        ("Nimalar kiradi:", "Nimalar kiradi:"),
+        ("1 месяц", "1 oy"),
+        ("3 месяца", "3 oy"),
+        ("6 месяцев", "6 oy"),
+        ("1 oy — 250 000 so‘m | 3 oy — 650 000 so‘m | 6 oy — 1 200 000 so‘m | Без ограничений по количеству магазинов", "1 oy — 250 000 so‘m | 3 oy — 650 000 so‘m | 6 oy — 1 200 000 so‘m | Do‘konlar soni cheklanmagan"),
+        ("Без ограничений по количеству магазинов", "Do‘konlar soni cheklanmagan"),
+        ("Без ограничений по количеству do‘konlar", "Do‘konlar soni cheklanmagan"),
+        ("To‘lov uchun administratorga yozing:", "To‘lov uchun administratorga yozing:"),
+        ("Нажмите кнопку ниже, напишите администратору и отправьте чек. После проверки доступ будет продлён.", "Quyidagi tugmani bosing, administratorga yozing va chekni yuboring. Tekshiruvdan keyin kirish uzaytiriladi."),
+        ("Нажмите кнопку ниже, напишите администратору и отправьте чек.", "Quyidagi tugmani bosing, administratorga yozing va chekni yuboring."),
+        ("После проверки доступ будет продлён.", "Tekshiruvdan keyin kirish uzaytiriladi."),
+        ("Чек tekshirilgach, administrator kirishni uzaytiradi.", "Chek tekshirilgach, administrator kirishni uzaytiradi."),
+        ("Подписка", "Obuna"),
+        ("подписка", "obuna"),
+
+        # Остатки / продажи / статусы
+        ("Статус:", "Holat:"),
+        ("Status:", "Holat:"),
+        ("Holat: ✅ включены", "Holat: ✅ yoqilgan"),
+        ("Holat: ❌ выключены", "Holat: ❌ o‘chirilgan"),
+        ("включены", "yoqilgan"),
+        ("выключены", "o‘chirilgan"),
+        ("Магазин:", "Do‘kon:"),
+        ("Do‘kon:", "Do‘kon:"),
+        ("сум", "so‘m"),
+        ("сек", "soniya"),
+
+        # Команды и подсказки
+        ("Нажмите кнопку ниже", "Quyidagi tugmani bosing"),
+        ("напишите администратору", "administratorga yozing"),
+        ("отправьте чек", "chekni yuboring"),
+        ("Проверка", "Tekshiruv"),
+        ("Состояние", "Holat"),
+        ("Порог", "Chegara"),
+    ]
+    for old, new in fixes:
+        text = text.replace(old, new)
+
+    # Небольшая нормализация после замен
+    text = text.replace("soniya.", "soniya")
+    text = text.replace("soniyaiya", "soniya")
+    text = text.replace("Holat::", "Holat:")
+    text = text.replace("Chegara::", "Chegara:")
+    text = text.replace("Tekshiruv har: har", "Tekshiruv har")
+    text = text.replace("Tekshiruv har har", "Tekshiruv har")
+    return text
+
+
+# --- FULL CHECK: финальная узбекская чистка перед запуском ---
+# Этот слой специально стоит самым последним: исправляет смешанные русско-узбекские
+# фразы, которые появляются из старых русских отчётов после автоматической замены.
+_FULL_CHECK_TRANSLATE_RUNTIME_TEXT_TO_UZ = translate_runtime_text_to_uz
+
+
+def translate_runtime_text_to_uz(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+    text = _FULL_CHECK_TRANSLATE_RUNTIME_TEXT_TO_UZ(text)
+
+    fixes = [
+        # Частые артефакты от замен "день/дней" внутри слова "сегодня/средняя"
+        ("сегоkun", "bugun"),
+        ("Сегоkun", "Bugun"),
+        ("сегодня", "bugun"),
+        ("Сегодня", "Bugun"),
+        ("Среkunя строка", "O‘rtacha savdo"),
+        ("Средняя строка", "O‘rtacha savdo"),
+        ("O‘rtacha строка", "O‘rtacha savdo"),
+        ("Отменённых qatorlar", "Bekor qilinganlar"),
+        ("Отмененных qatorlar", "Bekor qilinganlar"),
+        ("Отменённых строк", "Bekor qilinganlar"),
+        ("Отмененных строк", "Bekor qilinganlar"),
+
+        # Подключение API
+        ("🔌 <b>Подключение магазина</b>", "🔌 <b>Do‘konni ulash</b>"),
+        ("Чтобы подключить магазин, создайте API-ключ в кабинете Uzum Seller и отправьте его сюда.", "Do‘konni ulash uchun Uzum Seller kabinetida API-kalit yarating va shu yerga yuboring."),
+        ("🎥 Видеоинструкция", "🎥 Videoqo‘llanma"),
+        ("📌 Текстовая инструкция", "📌 Matnli qo‘llanma"),
+        ("Отправьте API-ключ следующим сообщением.", "API-kalitni keyingi xabarda yuboring."),
+        ("Отмена:", "Bekor qilish:"),
+        ("Похоже, это не Uzum API-токен.", "Bu Uzum API-kalitiga o‘xshamaydi."),
+        ("Отправьте полный токен или нажмите", "To‘liq kalitni yuboring yoki bosing"),
+        ("✅ <b>Магазин уже подключён</b>", "✅ <b>Do‘kon allaqachon ulangan</b>"),
+        ("Если вы случайно нажали <b>🔌 Подключить</b>, ничего страшного — старый API-ключ не удалён и не слетит.", "Agar <b>🔌 Ulash</b> tugmasini tasodifan bosgan bo‘lsangiz, xavotir olmang — eski API-kalit o‘chirilmaydi."),
+        ("Чтобы заменить API-ключ, используйте только команду", "API-kalitni almashtirish uchun faqat quyidagi buyruqdan foydalaning:"),
+        ("Чтобы полностью удалить подключение:", "Ulanishni butunlay o‘chirish uchun:"),
+        ("🔐 <b>Uzum API-ключ не принят</b>", "🔐 <b>Uzum API-kalit qabul qilinmadi</b>"),
+        ("Возможно, ключ неверный, удалён или истёк.", "Kalit noto‘g‘ri, o‘chirilgan yoki muddati tugagan bo‘lishi mumkin."),
+        ("Создайте новый ключ в кабинете Uzum Seller и подключите его через", "Uzum Seller kabinetida yangi kalit yarating va uni ulang:"),
+        ("✅ Подключение к Uzum API удалено. Можно подключить заново через", "✅ Uzum API ulanishi o‘chirildi. Qayta ulash uchun:"),
+
+        # Видео / инструкция / безопасность / поддержка
+        ("🎥 <b>Видеоинструкция по подключению API</b>", "🎥 <b>API ulash bo‘yicha videoqo‘llanma</b>"),
+        ("В видео коротко показано:", "Videoda qisqa ko‘rsatilgan:"),
+        ("Где в кабинете Uzum Seller находятся ключи API.", "Uzum Seller kabinetida API kalitlari qayerda joylashgani."),
+        ("Как создать новый ключ.", "Yangi kalitni qanday yaratish."),
+        ("Как подключить ключ к боту через", "Kalitni botga qanday ulash:"),
+        ("Нажмите кнопку ниже, чтобы открыть видео", "Videoni ochish uchun quyidagi tugmani bosing"),
+        ("▶️ Смотреть видео", "▶️ Videoni ko‘rish"),
+        ("🔑 <b>Как подключить Uzum API к боту</b>", "🔑 <b>Uzum API-kalitni botga qanday ulash mumkin</b>"),
+        ("API-ключ создаётся только в вашем кабинете Uzum Seller.", "API-kalit faqat sizning Uzum Seller kabinetingizda yaratiladi."),
+        ("Это не пароль от кабинета, ключ можно удалить в любой момент.", "Bu kabinet paroli emas, kalitni istalgan vaqtda o‘chirishingiz mumkin."),
+        ("Где взять API-ключ:", "API-kalitni qayerdan olish mumkin:"),
+        ("Нажмите на профиль / аватарку в правом верхнем углу.", "O‘ng yuqori burchakdagi profil / avatarkani bosing."),
+        ("Откройте", "Oching:"),
+        ("Ключи API", "API kalitlari"),
+        ("Создать ключ", "Kalit yaratish"),
+        ("Скопируйте ключ.", "Kalitni nusxalang."),
+        ("Вернитесь в бот и отправьте ключ через", "Botga qayting va kalitni yuboring:"),
+        ("🔐 <b>Безопасность API-ключа</b>", "🔐 <b>API-kalit xavfsizligi</b>"),
+        ("Ваш Uzum API-ключ не показывается в боте и не отправляется обратно сообщением.", "Uzum API-kalitingiz botda ko‘rsatilmaydi va qayta xabar qilib yuborilmaydi."),
+        ("После подключения бот старается удалить сообщение, где был отправлен ключ.", "Ulangandan keyin bot kalit yuborilgan xabarni o‘chirishga harakat qiladi."),
+        ("В базе хранится только защищённая версия ключа.", "Bazaga kalitning faqat himoyalangan ko‘rinishi saqlanadi."),
+        ("Вы можете в любой момент удалить подключение командой", "Ulanishni istalgan vaqtda quyidagi buyruq bilan o‘chirishingiz mumkin:"),
+        ("🛟 <b>Поддержка Uzum Seller Assistant</b>", "🛟 <b>Uzum Seller Assistant yordami</b>"),
+        ("Ваш Telegram ID:", "Telegram ID’ingiz:"),
+        ("Если бот не показывает данные, проверьте:", "Agar bot ma’lumot ko‘rsatmasa, tekshiring:"),
+        ("API-ключ активен в кабинете Uzum Seller.", "API-kalit Uzum Seller kabinetida faol."),
+        ("У ключа есть доступ к нужному магазину.", "Kalit kerakli do‘konga kirish huquqiga ega."),
+        ("В кабинете Uzum есть продажи за выбранный период.", "Uzum kabinetida tanlangan davr uchun savdolar bor."),
+        ("Если меняли API-ключ — нажмите", "Agar API-kalitni almashtirgan bo‘lsangiz, bosing:"),
+
+        # Подписка
+        ("💎 <b>Подписка Uzum Seller Assistant</b>", "💎 <b>Uzum Seller Assistant obunasi</b>"),
+        ("Что входит:", "Nimalar kiradi:"),
+        ("продажи FBO/FBS за сегодня, вчера, 7 и 30 дней", "bugun, kecha, 7 va 30 kunlik FBO/FBS savdolar"),
+        ("остатки и товары, которые заканчиваются", "qoldiqlar va tugab borayotgan tovarlar"),
+        ("потерянные товары, если Uzum отдаёт их в API", "Uzum API bersa, yo‘qolgan tovarlar"),
+        ("уведомления о новых продажах", "yangi savdolar haqida xabarnomalar"),
+        ("работа с несколькими магазинами", "bir nechta do‘kon bilan ishlash"),
+        ("Excel-отчёт и утренний отчёт", "Excel hisobot va ertalabki hisobot"),
+        ("для нового пользователя", "yangi foydalanuvchi uchun"),
+        ("💰 <b>Тарифы</b>", "💰 <b>Tariflar</b>"),
+        ("Для оплаты напишите администратору", "To‘lov uchun administratorga yozing"),
+        ("После проверки чекa администратор продлит доступ.", "Chek tekshirilgach, administrator kirishni uzaytiradi."),
+        ("Проверить статус", "Holatni tekshirish"),
+        ("Trial до:", "Trial muddati:"),
+        ("Оплачено до:", "To‘langan sana:"),
+        ("Тарифы:", "Tariflar:"),
+        ("История оплат:", "To‘lovlar tarixi:"),
+        ("Поддержка:", "Yordam:"),
+        ("Заменить API-ключ:", "API-kalitni almashtirish:"),
+        ("Удалить API-ключ:", "API-kalitni o‘chirish:"),
+        ("⛔ Obuna закончилась", "⛔ Obuna muddati tugagan"),
+        ("⛔ Подписка закончилась", "⛔ Obuna muddati tugagan"),
+        ("👑 Админ-доступ: без ограничений", "👑 Admin kirish: cheklovsiz"),
+        ("⛔ Пользователь заблокирован", "⛔ Foydalanuvchi bloklangan"),
+
+        # Разделы / меню / общее
+        ("Русский", "Rus tili"),
+        ("Выберите действие", "Amalni tanlang"),
+        ("Выберите раздел", "Bo‘limni tanlang"),
+        ("Главное меню", "Asosiy menyu"),
+        ("Действие отменено.", "Amal bekor qilindi."),
+        ("Язык интерфейса", "Interfeys tili"),
+        ("Выберите язык, на котором бот будет показывать меню и основные подсказки.", "Bot menyu va asosiy ko‘rsatmalarni qaysi tilda ko‘rsatishini tanlang."),
+        ("Язык изменён", "Til o‘zgartirildi"),
+        ("Админ-панель доступна только владельцу бота.", "Admin panel faqat bot egasi uchun."),
+        ("Доступ ограничен", "Kirish cheklangan"),
+        ("Trial или подписка закончились.", "Trial yoki obuna muddati tugagan."),
+        ("Ваш Uzum-токен и настройки сохранены — после продления всё снова заработает.", "Uzum tokeningiz va sozlamalaringiz saqlanadi — obuna uzaytirilgach hammasi yana ishlaydi."),
+        ("Проверить подписку", "Obunani tekshirish"),
+        ("Оплата", "To‘lov"),
+        ("Сначала подключите магазин", "Avval do‘konni ulang"),
+        ("Сначала подключите Uzum API-токен", "Avval Uzum API-kalitini ulang"),
+        ("Продажи", "Savdo"),
+        ("Склад", "Ombor"),
+        ("Уведомления", "Xabarnomalar"),
+        ("Отчёты", "Hisobotlar"),
+        ("Что проверить", "Tekshirish"),
+        ("Помощь", "Yordam"),
+        ("Подключить", "Ulash"),
+        ("Магазины", "Do‘konlar"),
+        ("Пользователь", "Foydalanuvchi"),
+        ("Доступ", "Kirish"),
+        ("Проверить подключение", "Ulanishni tekshirish"),
+        ("Что делать", "Nima qilish kerak"),
+        ("отправьте Uzum API-ключ", "Uzum API-kalitini yuboring"),
+
+        # Продажи / финансы / отчёты
+        ("💰 <b>Продажи за bugun</b>", "💰 <b>Bugungi savdo</b>"),
+        ("💰 <b>Продажи за Bugun</b>", "💰 <b>Bugungi savdo</b>"),
+        ("💰 <b>Продажи ", "💰 <b>Savdo "),
+        ("Продаж:", "Savdolar:"),
+        ("Товаров продано:", "Sotilgan tovarlar:"),
+        ("Возвратов:", "Qaytarilganlar:"),
+        ("Продаж не найдено", "Savdolar topilmadi"),
+        ("Пока продаж tanlangan davr uchun не найдено.", "Tanlangan davr uchun hali savdolar topilmadi."),
+        ("Если продажа только появилась в кабинете, она может отобразиться чуть позже.", "Agar savdo kabinetda endi paydo bo‘lgan bo‘lsa, botda biroz keyin ko‘rinishi mumkin."),
+        ("Ответ Finance API пришёл, но строки продаж не найдены.", "Finance API javob berdi, lekin savdo qatorlari topilmadi."),
+        ("Фрагмент ответа", "Javobdan parcha"),
+        ("Показаны первые", "Birinchi"),
+        ("позиций из", "pozitsiya ko‘rsatildi, jami"),
+        ("Новая продажа", "Yangi savdo"),
+        ("Заказ", "Buyurtma"),
+        ("Цена:", "Narx:"),
+        ("Чистая прибыль", "Sof foyda"),
+        ("Топ товаров по прибыли", "Foyda bo‘yicha top tovarlar"),
+        ("Top tovarlar по прибыли", "Foyda bo‘yicha top tovarlar"),
+        ("Загрузить себестоимость", "Tannarxni yuklash"),
+        ("Себестоимостей сохранено", "Saqlangan tannarxlar"),
+        ("Себестоимость ещё не указана", "Tannarx hali ko‘rsatilmagan"),
+        ("Добавить", "Qo‘shish"),
+        ("Укажите себестоимость так", "Tannarxni shunday kiriting"),
+        ("Например", "Masalan"),
+        ("Теперь проверьте", "Endi tekshiring"),
+        ("Юнит-экономику", "Unit iqtisodiyot"),
+        ("Unit iqtisodiyot за", "Unit iqtisodiyot"),
+
+        # Склад / товары / накладные
+        ("📦 <b>Товары магазина</b>", "📦 <b>Do‘kon tovarlari</b>"),
+        ("Tovarы магазина", "Do‘kon tovarlari"),
+        ("📊 <b>Остатки FBO / склад Uzum</b>", "📊 <b>FBO qoldiqlari / Uzum ombori</b>"),
+        ("Qoldiq FBO / склад Uzum", "FBO qoldiqlari / Uzum ombori"),
+        ("Проверяю потерянные товары", "Yo‘qolgan tovarlar tekshirilmoqda"),
+        ("Раздел использует поле quantityMissing из Products API. Если в кабинете Uzum потери считаются по актам иначе, сумма может отличаться.", "Bo‘lim Products API’dagi quantityMissing maydonidan foydalanadi. Agar Uzum kabinetida yo‘qotishlar boshqacha hisoblangan bo‘lsa, summa farq qilishi mumkin."),
+        ("Загружаю FBO-накладные поставки", "FBO yuk xatlari yuklanmoqda"),
+        ("Чтобы посмотреть состав, отправьте", "Tarkibini ko‘rish uchun yuboring"),
+        ("Например:", "Masalan:"),
+        ("Заказов по основным статусам не найдено", "Asosiy statuslar bo‘yicha buyurtmalar topilmadi"),
+        ("Собираю общую сводку магазина", "Do‘kon bo‘yicha umumiy xulosa tayyorlanmoqda"),
+        ("остаток изменился", "qoldiq o‘zgardi"),
+        ("Показать товары с низким остатком", "Kam qoldiqdagi tovarlarni ko‘rsatish"),
+        ("Готовлю подробный Excel-отчёт", "Batafsil Excel hisobot tayyorlanmoqda"),
+        ("Это может занять 20–60 soniyaунд", "Bu 20–60 soniya vaqt olishi mumkin"),
+        ("собираю продажи, остатки и FBO-накладные", "savdolar, qoldiqlar va FBO yuk xatlari yig‘ilmoqda"),
+
+        # Уведомления / отмены
+        ("❌ <b>Уведомления об отменах</b>", "❌ <b>Bekor qilishlar xabarnomalari</b>"),
+        ("Бот отслеживает новые отмены через Finance API.", "Bot yangi bekor qilishlarni Finance API orqali kuzatadi."),
+        ("🛒 <b>Новая продажа</b>", "🛒 <b>Yangi savdo</b>"),
+
+        # Что требует внимания
+        ("Критичных проблем не видно. Можно посмотреть продажи и прибыль 30 kun uchun.", "Jiddiy muammo ko‘rinmayapti. 30 kunlik savdo va foydani ko‘rishingiz mumkin."),
+        ("Начните с товаров, которые закончились: они не смогут продаваться, пока не пополнятся остатки.", "Avval tugagan tovarlardan boshlang: qoldiq to‘ldirilmaguncha ular sotilmaydi."),
+        ("Сначала проверьте товары, которые скоро закончатся, особенно если они хорошо продаются.", "Avval tez tugaydigan tovarlarni tekshiring, ayniqsa ular yaxshi sotilayotgan bo‘lsa."),
+        ("Загрузите себестоимость через Excel, чтобы бот точнее считал прибыль и маржу.", "Bot foyda va marjani aniqroq hisoblashi uchun tannarxni Excel orqali yuklang."),
+        ("Проверьте товары с низкой маржой: возможно, цена или себестоимость указаны невыгодно.", "Past marjali tovarlarni tekshiring: narx yoki tannarx foydasiz bo‘lishi mumkin."),
+        ("Посмотрите товары без продаж: возможно, стоит изменить цену, фото или вывести товар из оборота.", "Sotilmayotgan tovarlarni ko‘ring: narxni, rasmlarni o‘zgartirish yoki tovarni chiqarish kerak bo‘lishi mumkin."),
+        ("Проверьте сегодняшние отмены и товары, по которым они произошли.", "Bugungi bekor qilishlar va ular bo‘lgan tovarlarni tekshiring."),
+        ("Ниже можете сразу открыть нужный раздел", "Quyida kerakli bo‘limni darhol ochishingiz mumkin"),
+        ("Проверяю магазин", "Do‘kon tekshirilmoqda"),
+        ("Скоро закончится", "Tez tugaydi"),
+        ("Закончились", "Tugagan"),
+        ("Без продаж", "Sotuv yo‘q"),
+        ("Без себестоимости", "Tannarx yo‘q"),
+        ("Низкая маржа", "Past marja"),
+        ("Низкая прибыль", "Past foyda"),
+        ("Отмены сегодня", "Bugungi bekor qilishlar"),
+        ("Потерянные", "Yo‘qolganlar"),
+        ("Рекомендация", "Tavsiya"),
+
+        # Excel / выгрузки
+        ("Сводка", "Xulosa"),
+        ("Показатель", "Ko‘rsatkich"),
+        ("Значение", "Qiymat"),
+        ("Дата создания отчёта", "Hisobot yaratilgan sana"),
+        ("Период продаж в деталях", "Savdolar davri batafsil"),
+        ("SKU в остатках", "Qoldiqdagi SKU"),
+        ("SKU заканчиваются", "Tugayotgan SKU"),
+        ("SKU с потерями", "Yo‘qotishli SKU"),
+        ("FBO накладных найдено", "FBO yuk xatlari topildi"),
+        ("Состав накладных загружен", "Yuk xatlari tarkibi yuklandi"),
+        ("Период", "Davr"),
+        ("Позиций", "Pozitsiyalar"),
+        ("Товаров, dona", "Tovarlar, dona"),
+        ("ID заказа/операции", "Buyurtma/operatsiya ID"),
+        ("SKU/код", "SKU/kod"),
+        ("Выведено", "Chiqarilgan"),
+        ("Сырой фрагмент", "Xom parcha"),
+        ("Код продавца", "Sotuvchi kodi"),
+        ("Категория", "Kategoriya"),
+        ("Цена", "Narx"),
+        ("Активно", "Faol"),
+        ("Потеряно", "Yo‘qolgan"),
+        ("Брак", "Yaroqsiz"),
+        ("Ожидает", "Kutilmoqda"),
+        ("Примерная so‘mма", "Taxminiy summa"),
+        ("Номер", "Raqam"),
+        ("Создана", "Yaratilgan"),
+        ("Создан", "Yaratilgan"),
+        ("Окно от", "Oyna boshi"),
+        ("Окно до", "Oyna oxiri"),
+        ("Принята", "Qabul qilingan"),
+        ("По накладной", "Yuk xati bo‘yicha"),
+        ("Закупочная цена", "Xarid narxi"),
+        ("Сумма по накладной", "Yuk xati summasi"),
+
+        # Админка — чтобы в узбекском режиме тоже не было каши, но команды оставляем как есть
+        ("👑 Админ", "👑 Admin"),
+        ("👥 Пользователи", "👥 Foydalanuvchilar"),
+        ("💳 Оплаты", "💳 To‘lovlar"),
+        ("⏳ Скоро заканчиваются", "⏳ Tugayotganlar"),
+        ("⛔ Заблокированные", "⛔ Bloklanganlar"),
+        ("📦 Бэкап базы", "📦 Baza zaxirasi"),
+        ("📢 Рассылка", "📢 Xabar yuborish"),
+        ("⬅️ Главное меню", "⬅️ Asosiy menyu"),
+        ("Чтобы отправить сообщение всем пользователям, напишите", "Barcha foydalanuvchilarga xabar yuborish uchun yozing"),
+        ("Пример", "Masalan"),
+        ("Отправляю резервную копию базы. Храните файл аккуратно — там данные пользователей.", "Baza zaxirasi yuborilmoqda. Faylni ehtiyot saqlang — unda foydalanuvchilar ma’lumotlari bor."),
+    ]
+
+    for old, new in fixes:
+        text = text.replace(old, new)
+
+    # Yakuniy normalizatsiya: eng ko‘p uchraydigan aralashmalar
+    import re
+    text = re.sub(r"(?<=\d)\s*сум\b", " so‘m", text)
+    text = re.sub(r"(?<=\d)\s*шт\.?\b", " dona", text)
+    text = text.replace("so‘mма", "summa")
+    text = text.replace("so‘mмы", "summaning")
+    text = text.replace("Tovarов", "Tovarlar")
+    text = text.replace("Qaytarilganов", "Qaytarilganlar")
+    text = text.replace("Savdo 30 kun uchun", "30 kunlik savdo")
+    text = text.replace("Savdo 7 kun uchun", "7 kunlik savdo")
+    text = text.replace("Savdo bugun uchun", "Bugungi savdo")
+    text = text.replace("Savdo kecha uchun", "Kechagi savdo")
+    text = text.replace("за bugun", "bugun uchun")
+    text = text.replace("за Kecha", "kecha uchun")
+    text = text.replace("за 7 kun", "7 kun uchun")
+    text = text.replace("за 30 kun", "30 kun uchun")
+    text = text.replace(" | 1 oy", " | 1 oy")
+    text = text.replace("soniyaунд", "soniya")
+    text = text.replace("soniyaия", "soniya")
+    text = text.replace("Holat::", "Holat:")
+    text = text.replace("Chegara::", "Chegara:")
+    text = text.replace("Tekshiruv har: ", "Tekshiruv har ")
+    text = text.replace("Tekshiruv har <b>300</b> soniya", "Tekshiruv har <b>300</b> soniyada")
+    text = text.replace("Tekshiruv har <b>1800</b> soniya", "Tekshiruv har <b>1800</b> soniyada")
+    return text
+
+
+# --- FINAL AUDIT LAYER: исправления после полной проверки примеров ---
+_AUDIT_TRANSLATE_RUNTIME_TEXT_TO_UZ = translate_runtime_text_to_uz
+
+
+def translate_runtime_text_to_uz(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+    text = _AUDIT_TRANSLATE_RUNTIME_TEXT_TO_UZ(text)
+    fixes = [
+        ("💎 <b>Obuna Uzum Seller Assistant</b>", "💎 <b>Uzum Seller Assistant obunasi</b>"),
+        ("✅ продажи FBO/FBS bugun uchun, вчера, 7 и 30 kun", "✅ bugun, kecha, 7 va 30 kunlik FBO/FBS savdolar"),
+        ("✅ продажи FBO/FBS bugun uchun, kecha, 7 va 30 kun", "✅ bugun, kecha, 7 va 30 kunlik FBO/FBS savdolar"),
+        ("продажи FBO/FBS bugun uchun, вчера, 7 и 30 kun", "bugun, kecha, 7 va 30 kunlik FBO/FBS savdolar"),
+        ("Для оплаты administratorga yozing", "To‘lov uchun administratorga yozing"),
+        ("Для оплаты", "To‘lov uchun"),
+        ("Tovarlar продано", "Sotilgan tovarlar"),
+        ("Tovarlar sotildi", "Sotilgan tovarlar"),
+        ("Sotilgan tovarlar:", "Sotilgan tovarlar:"),
+        ("✅ <b>Do‘kon уже подключён</b>", "✅ <b>Do‘kon allaqachon ulangan</b>"),
+        ("Do‘kon уже подключён", "Do‘kon allaqachon ulangan"),
+        ("Savdo bugun uchun", "Bugungi savdo"),
+        ("Savdo kecha uchun", "Kechagi savdo"),
+        ("Savdo 7 kun uchun", "7 kunlik savdo"),
+        ("Savdo 30 kun uchun", "30 kunlik savdo"),
+        ("Продажи bugun uchun", "Bugungi savdo"),
+        ("Продажи kecha uchun", "Kechagi savdo"),
+        ("Продажи 7 kun uchun", "7 kunlik savdo"),
+        ("Продажи 30 kun uchun", "30 kunlik savdo"),
+        ("Sotuvlar bugun uchun", "Bugungi savdo"),
+        ("Sotuvlar kecha uchun", "Kechagi savdo"),
+        ("Sotuvlar 7 kun uchun", "7 kunlik savdo"),
+        ("Sotuvlar 30 kun uchun", "30 kunlik savdo"),
+        ("вчера", "kecha"),
+        ("7 и 30", "7 va 30"),
+        ("и 30", "va 30"),
+        ("уже", "allaqachon"),
+        ("подключён", "ulangan"),
+        ("подключен", "ulangan"),
+        ("продано", "sotilgan"),
+        ("продажи", "savdolar"),
+        ("Продажи", "Savdolar"),
+        ("товары", "tovarlar"),
+        ("Товары", "Tovarlar"),
+        ("остатки", "qoldiqlar"),
+        ("Остатки", "Qoldiqlar"),
+        ("которые заканчиваются", "tugab borayotgan"),
+        ("уведомления", "xabarnomalar"),
+        ("Уведомления", "Xabarnomalar"),
+        ("новых", "yangi"),
+        ("несколькими магазинами", "bir nechta do‘kon"),
+        ("работа с", "ishlash:"),
+        ("потерянные", "yo‘qolgan"),
+        ("Потерянные", "Yo‘qolgan"),
+        ("если Uzum отдаёт их в API", "agar Uzum API’da bersa"),
+        ("для", "uchun"),
+        ("нового пользователя", "yangi foydalanuvchi"),
+    ]
+    for old, new in fixes:
+        text = text.replace(old, new)
+    # Последняя нормализация заголовков и фраз после всех замен
+    text = text.replace("💰 <b>Savdo bugun uchun</b>", "💰 <b>Bugungi savdo</b>")
+    text = text.replace("💰 <b>Savdo kecha uchun</b>", "💰 <b>Kechagi savdo</b>")
+    text = text.replace("💰 <b>Savdo 7 kun uchun</b>", "💰 <b>7 kunlik savdo</b>")
+    text = text.replace("💰 <b>Savdo 30 kun uchun</b>", "💰 <b>30 kunlik savdo</b>")
+    text = text.replace("💰 <b>Bugungi savdo uchun</b>", "💰 <b>Bugungi savdo</b>")
+    text = text.replace("💰 <b>Kechagi savdo uchun</b>", "💰 <b>Kechagi savdo</b>")
+    text = text.replace("savdolar FBO/FBS bugun uchun, kecha, 7 va 30 kun", "bugun, kecha, 7 va 30 kunlik FBO/FBS savdolar")
+    text = text.replace("Tovarlar sotilgan", "Sotilgan tovarlar")
+    return text
+
 async def main() -> None:
     logging.info("INTUITIVE_ATTENTION_INTERFACE_LOADED: simple sections + attention report")
     init_language_tables()
