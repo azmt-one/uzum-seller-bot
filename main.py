@@ -1168,6 +1168,56 @@ def translate_runtime_text_to_uz(text: str) -> str:
     return text
 
 
+
+# --- Дополнительная чистка узбекского перевода: магазины и уведомления ---
+_CLEAN3_TRANSLATE_RUNTIME_TEXT_TO_UZ = translate_runtime_text_to_uz
+
+
+def translate_runtime_text_to_uz(text: str) -> str:
+    if not isinstance(text, str) or not text:
+        return text
+    text = _CLEAN3_TRANSLATE_RUNTIME_TEXT_TO_UZ(text)
+
+    fixes = [
+        # Магазины
+        ("🏪 <b>Ваши do‘konlari:</b>", "🏪 <b>Do‘konlaringiz:</b>"),
+        ("🏪 <b>Ваши do‘konlar:</b>", "🏪 <b>Do‘konlaringiz:</b>"),
+        ("🏪 <b>Ваши магазины:</b>", "🏪 <b>Do‘konlaringiz:</b>"),
+        ("Текущий основной Do‘kon:", "Joriy asosiy do‘kon:"),
+        ("Текущий основной магазин:", "Joriy asosiy do‘kon:"),
+        ("Joriy основной do‘kon:", "Joriy asosiy do‘kon:"),
+        ("Чтобы выбрать:", "Tanlash uchun:"),
+        ("не выбран", "tanlanmagan"),
+
+        # Уведомления: заголовки и статусы
+        ("💸 <b>Уведомления о новых продажах</b>", "💸 <b>Yangi savdolar xabarnomalari</b>"),
+        ("💸 <b>Yangi продажа xabarnomalari</b>", "💸 <b>Yangi savdolar xabarnomalari</b>"),
+        ("🔔 <b>Уведомления</b>", "🔔 <b>Xabarnomalar</b>"),
+        ("🔔 <b>Уведомления:</b>", "🔔 <b>Xabarnomalar:</b>"),
+        ("Уведомления о новых продажах", "Yangi savdolar xabarnomalari"),
+        ("Holat: ✅ включены", "Holat: ✅ yoqilgan"),
+        ("Holat: ❌ выключены", "Holat: ❌ o‘chirilgan"),
+        ("Status: ✅ включены", "Holat: ✅ yoqilgan"),
+        ("Status: ❌ выключены", "Holat: ❌ o‘chirilgan"),
+        ("Статус: ✅ включены", "Holat: ✅ yoqilgan"),
+        ("Статус: ❌ выключены", "Holat: ❌ o‘chirilgan"),
+        ("Проверка каждые:", "Tekshiruv har:"),
+        ("Tekshiruv har: <b>", "Tekshiruv har <b>"),
+        ("сек.", "soniya"),
+        ("Состояние: продажи уже запомнены", "Holat: savdolar allaqachon eslab qolingan"),
+        ("Состояние: инициализация при следующей проверке", "Holat: keyingi tekshiruvda ishga tushadi"),
+        ("Holat: продажи уже запомнены", "Holat: savdolar allaqachon eslab qolingan"),
+        ("Holat: инициализация при следующей проверке", "Holat: keyingi tekshiruvda ishga tushadi"),
+        ("Бот смотрит Finance API bugun uchun.", "Bot bugungi savdolarni Finance API orqali tekshiradi."),
+        ("Бот смотрит Finance API за сегодня.", "Bot bugungi savdolarni Finance API orqali tekshiradi."),
+        ("Если Finance API отдаёт продажу с задержкой, уведомление тоже придёт с задержкой.", "Agar Finance API savdoni kechikib bersa, xabarnoma ham kechikib keladi."),
+        ("Bot bugungi savdolarni Finance API orqali tekshiradi. Agar Finance API savdoni kechikib bersa, xabarnoma ham kechikib keladi.", "Bot bugungi savdolarni Finance API orqali tekshiradi. Agar savdo kechikib ko‘rinsa, xabarnoma ham biroz kechikib kelishi mumkin."),
+        ("Do‘kon:", "Do‘kon:"),
+    ]
+    for old, new in fixes:
+        text = text.replace(old, new)
+    return text
+
 def language_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
