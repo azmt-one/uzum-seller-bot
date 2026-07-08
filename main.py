@@ -20,7 +20,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, Message, ReplyKeyboardMarkup
 from dotenv import load_dotenv
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from db import Database, TokenCipher
@@ -117,6 +117,7 @@ REPORT_INVOICE_PRODUCT_LIMIT = int(os.getenv("REPORT_INVOICE_PRODUCT_LIMIT", "10
 SMART_LOW_STOCK_DAYS = int(os.getenv("SMART_LOW_STOCK_DAYS", "3") or "3")
 TOP_PRODUCTS_DAYS = int(os.getenv("TOP_PRODUCTS_DAYS", "30") or "30")
 DEAD_STOCK_DAYS = int(os.getenv("DEAD_STOCK_DAYS", "30") or "30")
+LOW_MARGIN_THRESHOLD_PERCENT = float(os.getenv("LOW_MARGIN_THRESHOLD_PERCENT", "10") or "10")
 DAILY_REPORTS = (
     os.getenv("DAILY_REPORTS", "0").strip().lower()
     not in {"0", "false", "no", "off"}
@@ -1180,60 +1181,52 @@ def language_markup() -> InlineKeyboardMarkup:
 
 MAIN_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
-        [KeyboardButton(text="🔔 Уведомления"), KeyboardButton(text="📊 Отчёты")],
-        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="🔌 Подключить")],
+        [KeyboardButton(text="🔌 Подключить"), KeyboardButton(text="🎥 Видеоинструкция")],
         [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
         [KeyboardButton(text="ℹ️ Помощь")],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Выберите раздел",
+    input_field_placeholder="Сначала подключите магазин",
 )
 
 MAIN_MENU_RU_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
-        [KeyboardButton(text="🔔 Уведомления"), KeyboardButton(text="📊 Отчёты")],
-        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="🔌 Подключить")],
+        [KeyboardButton(text="🔌 Подключить"), KeyboardButton(text="🎥 Видеоинструкция")],
         [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
         [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="👑 Админ")],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Выберите раздел",
+    input_field_placeholder="Сначала подключите магазин",
 )
 
 MAIN_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
-        [KeyboardButton(text="🔔 Xabarnomalar"), KeyboardButton(text="📊 Hisobotlar")],
-        [KeyboardButton(text="🏪 Do‘konlar"), KeyboardButton(text="🔌 Ulash")],
+        [KeyboardButton(text="🔌 Ulash"), KeyboardButton(text="🎥 API ulash videosi")],
         [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
         [KeyboardButton(text="ℹ️ Yordam")],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Bo‘limni tanlang",
+    input_field_placeholder="Avval do‘konni ulang",
 )
 
 MAIN_MENU_UZ_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
-        [KeyboardButton(text="🔔 Xabarnomalar"), KeyboardButton(text="📊 Hisobotlar")],
-        [KeyboardButton(text="🏪 Do‘konlar"), KeyboardButton(text="🔌 Ulash")],
+        [KeyboardButton(text="🔌 Ulash"), KeyboardButton(text="🎥 API ulash videosi")],
         [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
         [KeyboardButton(text="ℹ️ Yordam"), KeyboardButton(text="👑 Admin")],
     ],
     resize_keyboard=True,
-    input_field_placeholder="Bo‘limni tanlang",
+    input_field_placeholder="Avval do‘konni ulang",
 )
 
-# Главное меню после подключения API: кнопку подключения убираем,
-# чтобы клиент случайно не думал, что магазин нужно подключать заново.
+# Главное меню после подключения API: простая структура по разделам.
 MAIN_MENU_RU_CONNECTED = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
-        [KeyboardButton(text="🔔 Уведомления"), KeyboardButton(text="📊 Отчёты")],
-        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="💎 Подписка")],
-        [KeyboardButton(text="🌐 Язык"), KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="🧠 Что проверить"), KeyboardButton(text="🔔 Уведомления")],
+        [KeyboardButton(text="📊 Отчёты"), KeyboardButton(text="🏪 Магазины")],
+        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
+        [KeyboardButton(text="ℹ️ Помощь")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите раздел",
@@ -1242,10 +1235,10 @@ MAIN_MENU_RU_CONNECTED = ReplyKeyboardMarkup(
 MAIN_MENU_RU_CONNECTED_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
-        [KeyboardButton(text="🔔 Уведомления"), KeyboardButton(text="📊 Отчёты")],
-        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="💎 Подписка")],
-        [KeyboardButton(text="🌐 Язык"), KeyboardButton(text="ℹ️ Помощь")],
-        [KeyboardButton(text="👑 Админ")],
+        [KeyboardButton(text="🧠 Что проверить"), KeyboardButton(text="🔔 Уведомления")],
+        [KeyboardButton(text="📊 Отчёты"), KeyboardButton(text="🏪 Магазины")],
+        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
+        [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="👑 Админ")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите раздел",
@@ -1254,9 +1247,10 @@ MAIN_MENU_RU_CONNECTED_ADMIN = ReplyKeyboardMarkup(
 MAIN_MENU_UZ_CONNECTED = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
-        [KeyboardButton(text="🔔 Xabarnomalar"), KeyboardButton(text="📊 Hisobotlar")],
-        [KeyboardButton(text="🏪 Do‘konlar"), KeyboardButton(text="💎 Obuna")],
-        [KeyboardButton(text="🌐 Til"), KeyboardButton(text="ℹ️ Yordam")],
+        [KeyboardButton(text="🧠 Tekshirish"), KeyboardButton(text="🔔 Xabarnomalar")],
+        [KeyboardButton(text="📊 Hisobotlar"), KeyboardButton(text="🏪 Do‘konlar")],
+        [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
+        [KeyboardButton(text="ℹ️ Yordam")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Bo‘limni tanlang",
@@ -1265,10 +1259,10 @@ MAIN_MENU_UZ_CONNECTED = ReplyKeyboardMarkup(
 MAIN_MENU_UZ_CONNECTED_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
-        [KeyboardButton(text="🔔 Xabarnomalar"), KeyboardButton(text="📊 Hisobotlar")],
-        [KeyboardButton(text="🏪 Do‘konlar"), KeyboardButton(text="💎 Obuna")],
-        [KeyboardButton(text="🌐 Til"), KeyboardButton(text="ℹ️ Yordam")],
-        [KeyboardButton(text="👑 Admin")],
+        [KeyboardButton(text="🧠 Tekshirish"), KeyboardButton(text="🔔 Xabarnomalar")],
+        [KeyboardButton(text="📊 Hisobotlar"), KeyboardButton(text="🏪 Do‘konlar")],
+        [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
+        [KeyboardButton(text="ℹ️ Yordam"), KeyboardButton(text="👑 Admin")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Bo‘limni tanlang",
@@ -1280,7 +1274,8 @@ SALES_MENU_RU = ReplyKeyboardMarkup(
         [KeyboardButton(text="🗓 7 дней"), KeyboardButton(text="📅 30 дней")],
         [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="🌐 Все магазины")],
         [KeyboardButton(text="🏆 Топ товаров"), KeyboardButton(text="🐢 Не продаётся")],
-        [KeyboardButton(text="🧾 Юнит-экономика")],
+        [KeyboardButton(text="🧾 Юнит-экономика"), KeyboardButton(text="💰 Прибыль")],
+        [KeyboardButton(text="📥 Себестоимость Excel")],
         [KeyboardButton(text="⬅️ Главное меню")],
     ],
     resize_keyboard=True,
@@ -1293,7 +1288,8 @@ SALES_MENU_UZ = ReplyKeyboardMarkup(
         [KeyboardButton(text="🗓 7 kun"), KeyboardButton(text="📅 30 kun")],
         [KeyboardButton(text="💰 Balans"), KeyboardButton(text="🌐 Barcha do‘konlar")],
         [KeyboardButton(text="🏆 Top tovarlar"), KeyboardButton(text="🐢 Sotilmayapti")],
-        [KeyboardButton(text="🧾 Unit iqtisodiyot")],
+        [KeyboardButton(text="🧾 Unit iqtisodiyot"), KeyboardButton(text="💰 Foyda")],
+        [KeyboardButton(text="📥 Tannarx Excel")],
         [KeyboardButton(text="⬅️ Asosiy menyu")],
     ],
     resize_keyboard=True,
@@ -1343,6 +1339,7 @@ NOTIFY_MENU_UZ = ReplyKeyboardMarkup(
 REPORT_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Excel отчёт"), KeyboardButton(text="🌙 Утренний отчёт")],
+        [KeyboardButton(text="💰 Прибыль"), KeyboardButton(text="📥 Себестоимость Excel")],
         [KeyboardButton(text="✅ Проверить подключение"), KeyboardButton(text="🔐 Безопасность")],
         [KeyboardButton(text="⬅️ Главное меню")],
     ],
@@ -1353,11 +1350,34 @@ REPORT_MENU_RU = ReplyKeyboardMarkup(
 REPORT_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Excel hisobot"), KeyboardButton(text="🌙 Ertalabki hisobot")],
+        [KeyboardButton(text="💰 Foyda"), KeyboardButton(text="📥 Tannarx Excel")],
         [KeyboardButton(text="✅ Ulanishni tekshirish"), KeyboardButton(text="🔐 Xavfsizlik")],
         [KeyboardButton(text="⬅️ Asosiy menyu")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Hisobotlar",
+)
+
+ATTENTION_MENU_RU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🔍 Проверить сейчас")],
+        [KeyboardButton(text="⚠️ Остатки"), KeyboardButton(text="🐢 Без продаж")],
+        [KeyboardButton(text="🧾 Нет себестоимости"), KeyboardButton(text="📉 Низкая прибыль")],
+        [KeyboardButton(text="❌ Отмены"), KeyboardButton(text="⬅️ Главное меню")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Что проверить",
+)
+
+ATTENTION_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🔍 Hozir tekshirish")],
+        [KeyboardButton(text="⚠️ Qoldiqlar"), KeyboardButton(text="🐢 Sotuv yo‘q")],
+        [KeyboardButton(text="🧾 Tannarx yo‘q"), KeyboardButton(text="📉 Past foyda")],
+        [KeyboardButton(text="❌ Bekor qilishlar"), KeyboardButton(text="⬅️ Asosiy menyu")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Nimani tekshiramiz",
 )
 
 ADMIN_PANEL_MENU_RU = ReplyKeyboardMarkup(
@@ -1437,6 +1457,10 @@ def report_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
     return REPORT_MENU_UZ if get_user_language(telegram_id) == "uz" else REPORT_MENU_RU
 
 
+def attention_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
+    return ATTENTION_MENU_UZ if get_user_language(telegram_id) == "uz" else ATTENTION_MENU_RU
+
+
 def _message_user_id(message: Message) -> int | None:
     try:
         return message.from_user.id if message.from_user else None
@@ -1458,6 +1482,10 @@ def notify_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
 
 def report_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
     return report_menu_for_user(_message_user_id(message))
+
+
+def attention_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
+    return attention_menu_for_user(_message_user_id(message))
 
 
 def menu_for_message(message: Message) -> ReplyKeyboardMarkup:
@@ -1570,6 +1598,10 @@ def subscription_full_text(telegram_id: int) -> str:
 class ConnectStates(StatesGroup):
     waiting_for_token = State()
     waiting_for_shop_id = State()
+
+
+class CostImportStates(StatesGroup):
+    waiting_for_file = State()
 
 
 def get_tg_id(message: Message) -> int:
@@ -1769,12 +1801,20 @@ async def require_connection(message: Message) -> tuple[int, UzumClient, int] | 
     shop_id = db.get_default_shop_id(telegram_id)
 
     if client is None:
-        await message.answer(
-            "Сначала подключите магазин.\n\n"
-            "Проще: <code>/connect_shop</code> — добавить сотрудника и отправить ID магазина.\n"
-            "Запасной способ: <code>/connect</code> — подключить API-ключ.",
-            reply_markup=menu_for_message(message),
-        )
+        lang = get_user_language(telegram_id)
+        if lang == "uz":
+            text = (
+                "Avval do‘konni ulang.\n\n"
+                "<code>/connect</code> buyrug‘ini bosing va Uzum Seller API-kalitingizni yuboring.\n"
+                "Videoqo‘llanma: <code>/video</code>"
+            )
+        else:
+            text = (
+                "Сначала подключите магазин.\n\n"
+                "Нажмите <code>/connect</code> и отправьте API-ключ из кабинета Uzum Seller.\n"
+                "Видеоинструкция: <code>/video</code>"
+            )
+        await message.answer(text, reply_markup=menu_for_message(message))
         return None
 
     if shop_id is None:
@@ -5934,6 +5974,143 @@ async def stock_change_notify_status(message: Message) -> None:
     )
 
 
+
+# --- Умный раздел: что требует внимания ---
+def _attention_recommendation_ru(low_count: int, zero_count: int, dead_count: int, missing_cost: int, low_margin: int, cancels_today: int) -> str:
+    if zero_count > 0:
+        return "Начните с товаров, которые закончились: они не смогут продаваться, пока не пополнятся остатки."
+    if low_count > 0:
+        return "Сначала проверьте товары, которые скоро закончатся, особенно если они хорошо продаются."
+    if missing_cost > 0:
+        return "Загрузите себестоимость через Excel, чтобы бот точнее считал прибыль и маржу."
+    if low_margin > 0:
+        return "Проверьте товары с низкой маржой: возможно, цена или себестоимость указаны невыгодно."
+    if dead_count > 0:
+        return "Посмотрите товары без продаж: возможно, стоит изменить цену, фото или вывести товар из оборота."
+    if cancels_today > 0:
+        return "Проверьте сегодняшние отмены и товары, по которым они произошли."
+    return "Критичных проблем не видно. Можно посмотреть продажи и прибыль за 30 дней."
+
+
+def _attention_recommendation_uz(low_count: int, zero_count: int, dead_count: int, missing_cost: int, low_margin: int, cancels_today: int) -> str:
+    if zero_count > 0:
+        return "Avval qoldig‘i tugagan tovarlarni tekshiring: qoldiq bo‘lmasa, savdo ham bo‘lmaydi."
+    if low_count > 0:
+        return "Avval tez tugayotgan tovarlarni tekshiring, ayniqsa ular yaxshi sotilayotgan bo‘lsa."
+    if missing_cost > 0:
+        return "Foyda va marjani aniq hisoblash uchun tannarxni Excel orqali yuklang."
+    if low_margin > 0:
+        return "Past marjali tovarlarni tekshiring: narx yoki tannarx foydasiz bo‘lishi mumkin."
+    if dead_count > 0:
+        return "30 kun sotilmagan tovarlarni ko‘rib chiqing: narx, rasm yoki aylanmani tekshirish kerak."
+    if cancels_today > 0:
+        return "Bugungi bekor qilishlarni tekshiring."
+    return "Jiddiy muammo ko‘rinmayapti. 30 kunlik savdo va foydani ko‘rishingiz mumkin."
+
+
+async def _build_attention_summary(message: Message) -> str | None:
+    req = await require_connection(message)
+    if req is None:
+        return None
+    telegram_id, client, shop_id = req
+    lang = get_user_language(telegram_id)
+
+    # 1) Остатки
+    stock_rows = await load_sku_rows(client, shop_id, max_pages=50)
+    low_count = 0
+    zero_count = 0
+    for row in stock_rows:
+        total = _stock_row_total(row)
+        if total <= 0:
+            zero_count += 1
+        elif total <= LOW_STOCK_THRESHOLD:
+            low_count += 1
+
+    # 2) Потерянные товары по quantityMissing
+    try:
+        products = await load_products(client, shop_id, max_pages=50, page_size=100)
+        missing_count = sum(1 for p in products if isinstance(p, dict) and _product_missing_qty(p) > 0)
+    except Exception:
+        missing_count = 0
+
+    # 3) Продажи/отмены сегодня и товары без продаж за DEAD_STOCK_DAYS
+    date_today_from, date_today_to = _today_range_ms()
+    today_rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_today_from, date_to_ms=date_today_to, max_pages=3, page_size=100)
+    cancels_today = sum(1 for item in today_rows if _is_cancelled_status(_finance_status(item)))
+
+    date_from, date_to = _days_range_ms(DEAD_STOCK_DAYS)
+    sales_rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=5, page_size=100)
+    sold_keys: set[str] = set()
+    for item in sales_rows:
+        if not _is_cancelled_status(_finance_status(item)):
+            sold_keys.update(_sale_match_keys(item))
+    dead_count = 0
+    for row in stock_rows:
+        if _stock_row_total(row) <= 0:
+            continue
+        keys = _stock_match_keys(row)
+        if keys and not keys.intersection(sold_keys):
+            dead_count += 1
+
+    # 4) Юнит-экономика: нет себестоимости и низкая маржа
+    try:
+        unit_rows, _stats, _saved_costs = await _unit_economy_for_shop(client, telegram_id, shop_id, days=30)
+    except Exception:
+        unit_rows = []
+    missing_cost = sum(1 for r in unit_rows if r.get("cost_per_unit") is None)
+    low_margin = sum(
+        1
+        for r in unit_rows
+        if r.get("cost_per_unit") is not None
+        and r.get("profit") is not None
+        and float(r.get("margin") or 0) < LOW_MARGIN_THRESHOLD_PERCENT
+    )
+
+    if lang == "uz":
+        rec = _attention_recommendation_uz(low_count, zero_count, dead_count, missing_cost, low_margin, cancels_today)
+        return (
+            "🧠 <b>Nimani tekshirish kerak</b>\n\n"
+            f"🏪 Do‘kon: <code>{shop_id}</code>\n\n"
+            f"⚠️ Tez tugayotgan tovarlar: <b>{low_count}</b>\n"
+            f"❌ Qoldig‘i tugagan: <b>{zero_count}</b>\n"
+            f"🐢 {DEAD_STOCK_DAYS} kun sotilmagan: <b>{dead_count}</b>\n"
+            f"🧾 Tannarxi kiritilmagan: <b>{missing_cost}</b>\n"
+            f"📉 Past marja: <b>{low_margin}</b>\n"
+            f"❌ Bugungi bekor qilishlar: <b>{cancels_today}</b>\n"
+            f"🧭 Yo‘qolganlar: <b>{missing_count}</b>\n\n"
+            f"💡 <b>Tavsiya:</b> {escape(rec)}\n\n"
+            "Pastdagi tugmalar orqali kerakli bo‘limni oching 👇"
+        )
+
+    rec = _attention_recommendation_ru(low_count, zero_count, dead_count, missing_cost, low_margin, cancels_today)
+    return (
+        "🧠 <b>Что требует внимания</b>\n\n"
+        f"🏪 Магазин: <code>{shop_id}</code>\n\n"
+        f"⚠️ Скоро закончится: <b>{low_count}</b>\n"
+        f"❌ Закончились: <b>{zero_count}</b>\n"
+        f"🐢 Без продаж {DEAD_STOCK_DAYS} дней: <b>{dead_count}</b>\n"
+        f"🧾 Без себестоимости: <b>{missing_cost}</b>\n"
+        f"📉 Низкая маржа: <b>{low_margin}</b>\n"
+        f"❌ Отмены сегодня: <b>{cancels_today}</b>\n"
+        f"🧭 Потерянные: <b>{missing_count}</b>\n\n"
+        f"💡 <b>Рекомендация:</b> {escape(rec)}\n\n"
+        "Ниже можете сразу открыть нужный раздел 👇"
+    )
+
+
+@dp.message(Command("attention", "check_attention", "what_check"))
+async def attention_report(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    wait_text = "⌛ Do‘konni tekshiryapman..." if lang == "uz" else "⌛ Проверяю магазин..."
+    await message.answer(wait_text, reply_markup=attention_menu_for_message(message))
+    try:
+        text = await _build_attention_summary(message)
+        if text:
+            await message.answer(text, reply_markup=attention_menu_for_message(message))
+    except Exception as e:
+        await send_api_error(message, e)
+
 # --- Главное меню в стиле Noorza Bot ---
 @dp.message(F.text == "👑 Admin")
 @dp.message(F.text == "👑 Админ")
@@ -5965,7 +6142,6 @@ async def button_admin_blocked(message: Message) -> None:
     await admin_blocked_users(message)
 
 
-@dp.message(F.text == "📦 Baza zaxirasi")
 @dp.message(F.text == "💰 Savdo")
 @dp.message(F.text == "💰 Продажи")
 async def button_sales_section_simple(message: Message) -> None:
@@ -5998,8 +6174,68 @@ async def button_notifications_section_simple(message: Message) -> None:
 async def button_reports_section_simple(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     lang = get_user_language(telegram_id)
-    text = "📊 <b>Hisobotlar</b>\nExcel, ertalabki hisobot yoki ulanish tekshiruvi 👇" if lang == "uz" else "📊 <b>Отчёты</b>\nExcel, утренний отчёт и проверка подключения 👇"
+    text = "📊 <b>Hisobotlar</b>\nExcel, foyda va tayyor hisobotlar 👇" if lang == "uz" else "📊 <b>Отчёты</b>\nExcel, прибыль и готовые отчёты 👇"
     await message.answer(text, reply_markup=report_menu_for_message(message))
+
+
+@dp.message(F.text == "🧠 Tekshirish")
+@dp.message(F.text == "🧠 Что проверить")
+async def button_attention_section(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    if lang == "uz":
+        text = (
+            "🧠 <b>Nimani tekshirish kerak</b>\n\n"
+            "Bot do‘koningizdagi muhim joylarni tekshiradi:\n"
+            "⚠️ tez tugayotgan qoldiqlar, 🐢 sotilmayotgan tovarlar, "
+            "🧾 tannarxi kiritilmagan SKU va 📉 past marja.\n\n"
+            "Boshlash uchun <b>🔍 Hozir tekshirish</b> tugmasini bosing 👇"
+        )
+    else:
+        text = (
+            "🧠 <b>Что проверить</b>\n\n"
+            "Бот быстро покажет, где есть проблемы:\n"
+            "⚠️ заканчивающиеся остатки, 🐢 товары без продаж, "
+            "🧾 SKU без себестоимости и 📉 низкую маржу.\n\n"
+            "Чтобы начать, нажмите <b>🔍 Проверить сейчас</b> 👇"
+        )
+    await message.answer(text, reply_markup=attention_menu_for_message(message))
+
+
+@dp.message(F.text == "🔍 Hozir tekshirish")
+@dp.message(F.text == "🔍 Проверить сейчас")
+async def button_attention_now(message: Message) -> None:
+    await attention_report(message)
+
+
+@dp.message(F.text == "⚠️ Qoldiqlar")
+@dp.message(F.text == "⚠️ Остатки")
+async def button_attention_stock(message: Message) -> None:
+    await smart_lowstock(message)
+
+
+@dp.message(F.text == "🐢 Sotuv yo‘q")
+@dp.message(F.text == "🐢 Без продаж")
+async def button_attention_dead_stock(message: Message) -> None:
+    await dead_stock(message)
+
+
+@dp.message(F.text == "🧾 Tannarx yo‘q")
+@dp.message(F.text == "🧾 Нет себестоимости")
+async def button_attention_missing_cost(message: Message) -> None:
+    await unit_economy(message)
+
+
+@dp.message(F.text == "📉 Past foyda")
+@dp.message(F.text == "📉 Низкая прибыль")
+async def button_attention_low_margin(message: Message) -> None:
+    await profit_report(message)
+
+
+@dp.message(F.text == "❌ Bekor qilishlar")
+@dp.message(F.text == "❌ Отмены")
+async def button_attention_cancel(message: Message) -> None:
+    await sales_30(message)
 
 
 @dp.message(F.text == "🔐 Xavfsizlik")
@@ -6028,6 +6264,7 @@ async def button_status_uz(message: Message) -> None:
     await status(message)
 
 
+@dp.message(F.text == "📦 Baza zaxirasi")
 @dp.message(F.text == "📦 Бэкап базы")
 async def button_admin_backup(message: Message) -> None:
     await admin_backup_db(message)
@@ -6964,6 +7201,299 @@ async def delete_cost_command(message: Message) -> None:
         await message.answer("✅ Удалено" if ok else "Не найдено", reply_markup=menu_for_message(message))
 
 
+
+def _build_cost_template(path: str, lang: str = "ru") -> None:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Себестоимость" if lang != "uz" else "Tannarx"
+    headers = ["SKU", "Себестоимость", "Название (необязательно)"] if lang != "uz" else ["SKU", "Tannarx", "Nomi (ixtiyoriy)"]
+    ws.append(headers)
+    ws.append(["NOORZA-NR751-BEJEV-XXL", 60000, "Пример товара" if lang != "uz" else "Tovar namunasi"])
+    ws.append(["NOORZA-KOR101-SERIY", 45000, ""])
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.fill = PatternFill("solid", fgColor="D9EAF7")
+        cell.alignment = Alignment(horizontal="center")
+    ws.column_dimensions["A"].width = 34
+    ws.column_dimensions["B"].width = 18
+    ws.column_dimensions["C"].width = 38
+    ws.freeze_panes = "A2"
+    wb.save(path)
+
+
+def _normalize_header(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("ё", "е")
+    text = text.replace(" ", "_").replace("-", "_")
+    return text
+
+
+def _parse_excel_cost_value(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) if float(value) >= 0 else None
+    s = str(value).strip()
+    if not s:
+        return None
+    s = s.replace("сум", "").replace("so'm", "").replace("so‘m", "").replace("uzs", "")
+    s = s.replace(" ", "").replace("\u00a0", "").replace(",", ".")
+    try:
+        val = float(s)
+        return val if val >= 0 else None
+    except Exception:
+        return None
+
+
+def _detect_cost_columns(ws) -> tuple[int, int, int | None, int]:
+    header_values = [cell.value for cell in ws[1]]
+    normalized = [_normalize_header(v) for v in header_values]
+    sku_col = cost_col = title_col = None
+    for idx, h in enumerate(normalized, start=1):
+        if h in {"sku", "артикул", "sku_id", "sku_title", "шк", "barcode", "offerid", "offer_id"}:
+            sku_col = idx
+        if h in {"себестоимость", "sebestoimost", "tannarx", "cost", "purchase_price", "закуп", "закупочная_цена", "tan_narx"}:
+            cost_col = idx
+        if h in {"название", "name", "title", "nomi", "товар", "product", "product_title", "название_(необязательно)", "nomi_(ixtiyoriy)"}:
+            title_col = idx
+    if sku_col and cost_col:
+        return sku_col, cost_col, title_col, 2
+    return 1, 2, 3, 1
+
+
+def _parse_costs_workbook(path: str) -> tuple[list[dict[str, Any]], list[str]]:
+    wb = load_workbook(path, data_only=True, read_only=True)
+    ws = wb.active
+    sku_col, cost_col, title_col, start_row = _detect_cost_columns(ws)
+    imported: list[dict[str, Any]] = []
+    errors: list[str] = []
+    seen: set[str] = set()
+    for row_idx, row in enumerate(ws.iter_rows(min_row=start_row, values_only=True), start=start_row):
+        sku_val = row[sku_col - 1] if len(row) >= sku_col else None
+        cost_val = row[cost_col - 1] if len(row) >= cost_col else None
+        title_val = row[title_col - 1] if title_col and len(row) >= title_col else ""
+        sku = str(sku_val or "").strip()
+        if not sku:
+            continue
+        cost = _parse_excel_cost_value(cost_val)
+        if cost is None:
+            errors.append(f"Строка {row_idx}: неверная себестоимость для {sku}")
+            continue
+        key = _unit_sku_key(sku)
+        if not key:
+            errors.append(f"Строка {row_idx}: неверный SKU")
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        imported.append({"sku": sku, "cost": float(cost), "title": str(title_val or "").strip()})
+    return imported, errors
+
+
+@dp.message(Command("cost_template", "costs_template", "template_costs"))
+async def cost_template_command(message: Message, state: FSMContext | None = None) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    if state is not None:
+        await state.set_state(CostImportStates.waiting_for_file)
+    filename = f"unit_costs_template_{telegram_id}.xlsx"
+    file_path = str(Path(tempfile.gettempdir()) / filename)
+    _build_cost_template(file_path, lang=lang)
+    if lang == "uz":
+        text = (
+            "📥 <b>Tannarxlarni Excel orqali yuklash</b>\n\n"
+            "1. Shablonni yuklab oling.\n"
+            "2. SKU va tannarxlarni to‘ldiring.\n"
+            "3. Tayyor Excel faylni shu chatga yuboring.\n\n"
+            "Ustunlar: <b>SKU</b> va <b>Tannarx</b>.\n"
+            "Bekor qilish: <code>/cancel</code>"
+        )
+    else:
+        text = (
+            "📥 <b>Загрузка себестоимости через Excel</b>\n\n"
+            "1. Скачайте шаблон.\n"
+            "2. Заполните SKU и себестоимость.\n"
+            "3. Отправьте готовый Excel-файл сюда в чат.\n\n"
+            "Обязательные колонки: <b>SKU</b> и <b>Себестоимость</b>.\n"
+            "Отмена: <code>/cancel</code>"
+        )
+    await message.answer(text, reply_markup=menu_for_message(message))
+    await message.answer_document(FSInputFile(file_path, filename="unit_costs_template.xlsx"))
+
+
+@dp.message(Command("import_costs", "upload_costs"))
+async def import_costs_command(message: Message, state: FSMContext) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    await state.set_state(CostImportStates.waiting_for_file)
+    text = (
+        "📥 Excel faylni yuboring. Shablon kerak bo‘lsa: <code>/cost_template</code>\nBekor qilish: <code>/cancel</code>"
+        if lang == "uz"
+        else "📥 Отправьте Excel-файл с себестоимостью. Шаблон: <code>/cost_template</code>\nОтмена: <code>/cancel</code>"
+    )
+    await message.answer(text, reply_markup=menu_for_message(message))
+
+
+@dp.message(CostImportStates.waiting_for_file, F.document)
+async def receive_costs_excel(message: Message, state: FSMContext) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    req = await require_connection(message)
+    if req is None:
+        return
+    _, _, shop_id = req
+    document = message.document
+    if document is None:
+        return
+    filename = (document.file_name or "").lower()
+    if not (filename.endswith(".xlsx") or filename.endswith(".xlsm")):
+        await message.answer(
+            "Excel fayl .xlsx formatida bo‘lishi kerak." if lang == "uz" else "Нужен Excel-файл в формате .xlsx.",
+            reply_markup=menu_for_message(message),
+        )
+        return
+    tmp_path = str(Path(tempfile.gettempdir()) / f"costs_{telegram_id}_{int(datetime.now().timestamp())}.xlsx")
+    try:
+        await bot.download(document, destination=tmp_path)
+        items, errors = _parse_costs_workbook(tmp_path)
+        if not items:
+            await message.answer(
+                "Faylda saqlash uchun SKU va tannarx topilmadi." if lang == "uz" else "В файле не нашёл SKU и себестоимость для сохранения.",
+                reply_markup=menu_for_message(message),
+            )
+            return
+        for item in items:
+            save_unit_cost(telegram_id, int(shop_id), item["sku"], float(item["cost"]), title=item.get("title") or item["sku"])
+        await state.clear()
+        preview = "\n".join([f"• <code>{escape(i['sku'])}</code> — <b>{_format_money(float(i['cost']))}</b>" for i in items[:10]])
+        more = max(0, len(items) - 10)
+        if lang == "uz":
+            text = f"✅ <b>Tannarxlar saqlandi</b>\n\n🏪 Do‘kon: <code>{shop_id}</code>\n📦 Saqlandi: <b>{len(items)}</b> SKU"
+            if preview:
+                text += "\n\n" + preview
+            if more:
+                text += f"\n...yana {more} ta"
+            text += "\n\nEndi <b>🧾 Unit iqtisodiyot</b> yoki <b>💰 Foyda</b> bo‘limini tekshiring."
+        else:
+            text = f"✅ <b>Себестоимость сохранена</b>\n\n🏪 Магазин: <code>{shop_id}</code>\n📦 Сохранено: <b>{len(items)}</b> SKU"
+            if preview:
+                text += "\n\n" + preview
+            if more:
+                text += f"\n...ещё {more} шт."
+            text += "\n\nТеперь проверьте <b>🧾 Юнит-экономику</b> или <b>💰 Прибыль</b>."
+        if errors:
+            text += ("\n\n⚠️ Ошибки: " if lang != "uz" else "\n\n⚠️ Xatolar: ") + str(len(errors))
+            text += "\n" + "\n".join(escape(e) for e in errors[:5])
+        await message.answer(text, reply_markup=sales_menu_for_message(message))
+    except Exception as e:
+        await send_api_error(message, e)
+    finally:
+        try:
+            Path(tmp_path).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+@dp.message(CostImportStates.waiting_for_file)
+async def receive_costs_excel_wrong(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    await message.answer(
+        "Excel faylni yuboring yoki <code>/cancel</code> bosing." if lang == "uz" else "Отправьте Excel-файл или нажмите <code>/cancel</code>.",
+        reply_markup=menu_for_message(message),
+    )
+
+
+def _profit_summary_from_unit_rows(rows: list[dict[str, Any]], stats: dict[str, Any]) -> dict[str, Any]:
+    cost_total = sum(float(r.get("cost_total") or 0) for r in rows if r.get("cost_per_unit") is not None)
+    known_profit = sum(float(r.get("profit") or 0) for r in rows if r.get("cost_per_unit") is not None)
+    known_revenue = sum(float(r.get("revenue") or 0) for r in rows if r.get("cost_per_unit") is not None)
+    missing = [r for r in rows if r.get("cost_per_unit") is None]
+    margin = (known_profit / known_revenue * 100.0) if known_revenue > 0 else 0.0
+    return {
+        "cost_total": cost_total,
+        "profit": known_profit,
+        "margin": margin,
+        "missing_count": len(missing),
+        "known_revenue": known_revenue,
+        "missing": missing,
+    }
+
+
+def _format_profit_report(shop_id: int, rows: list[dict[str, Any]], stats: dict[str, Any], lang: str = "ru") -> str:
+    summary = _profit_summary_from_unit_rows(rows, stats)
+    top_profit = sorted([r for r in rows if r.get("cost_per_unit") is not None], key=lambda r: float(r.get("profit") or 0), reverse=True)[:10]
+    if lang == "uz":
+        lines = [
+            "💰 <b>30 kunlik foyda</b>",
+            f"🏪 Do‘kon: <code>{shop_id}</code>",
+            "",
+            f"💵 Tushum: <b>{_format_money(float(stats.get('revenue') or 0))}</b>",
+            f"🏷 Uzum komissiyasi: <b>{_format_money(float(stats.get('commission') or 0))}</b>",
+            f"🚚 Logistika: <b>{_format_money(float(stats.get('logistics') or 0))}</b>",
+            f"📦 Tannarx: <b>{_format_money(float(summary['cost_total']))}</b>",
+            "",
+            f"✅ To‘lovga: <b>{_format_money(float(stats.get('payout_total') or 0))}</b>",
+            f"💰 Sof foyda: <b>{_format_money(float(summary['profit']))}</b>",
+            f"📈 Marja: <b>{float(summary['margin']):.1f}%</b>",
+        ]
+        if summary["missing_count"]:
+            lines.append(f"\n⚠️ Tannarx kiritilmagan SKU: <b>{summary['missing_count']}</b>")
+            lines.append("Tannarx yuklash: <code>/cost_template</code>")
+        if top_profit:
+            lines.append("\n🏆 <b>Foyda bo‘yicha top tovarlar:</b>")
+            for idx, r in enumerate(top_profit, start=1):
+                lines.append(f"{idx}. {escape(_short_text(str(r.get('title') or r.get('sku') or '-'), 55))} — <b>{_format_money(float(r.get('profit') or 0))}</b>")
+        return "\n".join(lines)
+    lines = [
+        "💰 <b>Прибыль за 30 дней</b>",
+        f"🏪 Магазин: <code>{shop_id}</code>",
+        "",
+        f"💵 Выручка: <b>{_format_money(float(stats.get('revenue') or 0))}</b>",
+        f"🏷 Комиссия Uzum: <b>{_format_money(float(stats.get('commission') or 0))}</b>",
+        f"🚚 Логистика: <b>{_format_money(float(stats.get('logistics') or 0))}</b>",
+        f"📦 Себестоимость: <b>{_format_money(float(summary['cost_total']))}</b>",
+        "",
+        f"✅ К выплате: <b>{_format_money(float(stats.get('payout_total') or 0))}</b>",
+        f"💰 Чистая прибыль: <b>{_format_money(float(summary['profit']))}</b>",
+        f"📈 Маржа: <b>{float(summary['margin']):.1f}%</b>",
+    ]
+    if summary["missing_count"]:
+        lines.append(f"\n⚠️ Без себестоимости: <b>{summary['missing_count']}</b> SKU")
+        lines.append("Загрузить себестоимость: <code>/cost_template</code>")
+    if top_profit:
+        lines.append("\n🏆 <b>Топ товаров по прибыли:</b>")
+        for idx, r in enumerate(top_profit, start=1):
+            lines.append(f"{idx}. {escape(_short_text(str(r.get('title') or r.get('sku') or '-'), 55))} — <b>{_format_money(float(r.get('profit') or 0))}</b>")
+    return "\n".join(lines)
+
+
+@dp.message(Command("profit", "unit_profit", "profit_report"))
+async def profit_report(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    telegram_id, client, shop_id = req
+    lang = get_user_language(telegram_id)
+    await message.answer("⌛ Foydani hisoblayapman..." if lang == "uz" else "⌛ Считаю прибыль...", reply_markup=menu_for_message(message))
+    try:
+        rows, stats, _ = await _unit_economy_for_shop(client, telegram_id, shop_id, days=30)
+        await message.answer(_format_profit_report(shop_id, rows, stats, lang=lang), reply_markup=sales_menu_for_message(message))
+    except Exception as e:
+        await send_api_error(message, e)
+
+
+@dp.message(F.text == "💰 Foyda")
+@dp.message(F.text == "💰 Прибыль")
+async def button_profit_report_near_unit(message: Message) -> None:
+    await profit_report(message)
+
+
+@dp.message(F.text == "📥 Tannarx Excel")
+@dp.message(F.text == "📥 Себестоимость Excel")
+async def button_costs_excel_near_unit(message: Message, state: FSMContext) -> None:
+    await cost_template_command(message, state)
+
+
 @dp.message(F.text == "🧾 Unit iqtisodiyot")
 @dp.message(F.text == "🧾 Юнит-экономика")
 async def button_unit_economy(message: Message) -> None:
@@ -7587,8 +8117,49 @@ async def cancel_notify_status(message: Message) -> None:
         )
     await message.answer(text, reply_markup=main_menu_for_user(telegram_id))
 
+
+@dp.message(F.text)
+async def friendly_auto_start(message: Message, state: FSMContext) -> None:
+    """Показывает понятное стартовое меню, если новый клиент написал любое сообщение вместо /start."""
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    current_state = await state.get_state()
+
+    # Если пользователь был в процессе подключения/импорта, не сбрасываем состояние без причины.
+    if current_state:
+        if lang == "uz":
+            await message.answer(
+                "Men sizni tushundim. Agar jarayonni bekor qilmoqchi bo‘lsangiz, <code>/cancel</code> yuboring.\n"
+                "Asosiy menyu quyida 👇",
+                reply_markup=menu_for_message(message),
+            )
+        else:
+            await message.answer(
+                "Я вас понял. Если хотите отменить текущий шаг, отправьте <code>/cancel</code>.\n"
+                "Главное меню ниже 👇",
+                reply_markup=menu_for_message(message),
+            )
+        return
+
+    ensure_subscription(telegram_id)
+    if lang == "uz":
+        text = (
+            "👋 <b>Uzum Seller Assistant</b>\n\n"
+            "Botdan foydalanishni boshlash uchun pastdagi menyudan kerakli bo‘limni tanlang.\n\n"
+            "🔌 Agar do‘kon hali ulanmagan bo‘lsa — <b>Ulash</b> tugmasini bosing.\n"
+            "🎥 API ulash videosi ham menyuda bor."
+        )
+    else:
+        text = (
+            "👋 <b>Uzum Seller Assistant</b>\n\n"
+            "Чтобы начать пользоваться ботом, выберите нужный раздел в меню ниже.\n\n"
+            "🔌 Если магазин ещё не подключён — нажмите <b>Подключить</b>.\n"
+            "🎥 Видеоинструкция по API тоже есть в меню."
+        )
+    await message.answer(text, reply_markup=menu_for_message(message))
+
 async def main() -> None:
-    logging.info("API_ONLY_POLISHED_LOADED: official API-key connection, simple interface")
+    logging.info("INTUITIVE_ATTENTION_INTERFACE_LOADED: simple sections + attention report")
     init_language_tables()
     await bot.delete_webhook(drop_pending_updates=True)
     if NEW_ORDER_NOTIFICATIONS:
