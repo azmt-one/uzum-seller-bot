@@ -2559,6 +2559,161 @@ async def stock_page_callback(callback: CallbackQuery) -> None:
         await callback.answer("Не получилось открыть страницу" if lang != "uz" else "Sahifani ochib bo‘lmadi", show_alert=True)
 
 
+
+
+# --- Универсальная постраничность для длинных списков ---
+LIST_PAGE_SIZE = int(os.getenv("LIST_PAGE_SIZE", "10") or "10")
+_paged_list_cache: dict[tuple[int, str], dict[str, Any]] = {}
+
+
+def _page_size_safe(value: int | None = None) -> int:
+    raw = value or LIST_PAGE_SIZE
+    return max(5, min(20, int(raw or 10)))
+
+
+def _section_text_and_markup(section: str, telegram_id: int, lang: str) -> tuple[str, ReplyKeyboardMarkup]:
+    if section == "sales":
+        text = "💰 <b>Savdo bo‘limi</b>\nKerakli davr yoki hisobotni tanlang 👇" if lang == "uz" else "💰 <b>Продажи</b>\nВыберите, что посмотреть 👇"
+        return text, sales_menu_for_user(telegram_id)
+    if section == "stock":
+        text = "📦 <b>Ombor</b>\nQoldiq, prognoz yoki FBO yuk xatlarini tanlang 👇" if lang == "uz" else "📦 <b>Склад</b>\nОстатки, прогноз и FBO-накладные 👇"
+        return text, stock_menu_for_user(telegram_id)
+    if section == "attention":
+        text = "🧠 <b>Nimani tekshirish kerak</b>\nKerakli bo‘limni tanlang 👇" if lang == "uz" else "🧠 <b>Что проверить</b>\nВыберите нужный раздел 👇"
+        return text, attention_menu_for_user(telegram_id)
+    if section == "reports":
+        text = "📊 <b>Hisobotlar</b>\nExcel, foyda va tayyor hisobotlar 👇" if lang == "uz" else "📊 <b>Отчёты</b>\nExcel, прибыль и готовые отчёты 👇"
+        return text, report_menu_for_user(telegram_id)
+    text = "🏠 <b>Asosiy menyu</b>" if lang == "uz" else "🏠 <b>Главное меню</b>"
+    return text, main_menu_for_user(telegram_id)
+
+
+def _paged_markup(kind: str, page: int, total_pages: int, lang: str, section: str = "main") -> InlineKeyboardMarkup | None:
+    rows: list[list[InlineKeyboardButton]] = []
+    if total_pages > 1:
+        nav: list[InlineKeyboardButton] = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="⬅️ Oldingi" if lang == "uz" else "⬅️ Назад", callback_data=f"pglist:{kind}:{page-1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="pgnoop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="Keyingi ➡️" if lang == "uz" else "След. страница ➡️", callback_data=f"pglist:{kind}:{page+1}"))
+        rows.append(nav)
+    rows.append([
+        InlineKeyboardButton(text="⬅️ Bo‘limga qaytish" if lang == "uz" else "⬅️ Назад в раздел", callback_data=f"pgsection:{section}"),
+        InlineKeyboardButton(text="🏠 Menyu" if lang == "uz" else "🏠 Меню", callback_data="pgmain"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _paged_text(session: dict[str, Any], page: int) -> str:
+    items: list[str] = session.get("items") or []
+    page_size = _page_size_safe(session.get("page_size"))
+    total = len(items)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    start_i = page * page_size
+    chunk = items[start_i:start_i + page_size]
+    start_n = start_i + 1 if total else 0
+    end_n = start_i + len(chunk)
+    lang = session.get("lang", "ru")
+    title = session.get("title", "")
+    summary = [x for x in (session.get("summary") or []) if x]
+    if lang == "uz":
+        meta = f"Ko‘rsatilmoqda: <b>{start_n}–{end_n}</b> / <b>{total}</b>\nSahifa: <b>{page + 1}/{total_pages}</b>"
+    else:
+        meta = f"Показано: <b>{start_n}–{end_n}</b> из <b>{total}</b>\nСтраница: <b>{page + 1}/{total_pages}</b>"
+    parts = [title, *summary, meta]
+    if chunk:
+        parts.append("\n\n".join(chunk))
+    return "\n\n".join(parts)
+
+
+async def send_paginated_list(
+    message: Message,
+    *,
+    kind: str,
+    title: str,
+    items: list[str],
+    summary: list[str] | None = None,
+    empty_text: str | None = None,
+    section: str = "main",
+    page_size: int | None = None,
+    reply_markup: ReplyKeyboardMarkup | None = None,
+) -> None:
+    user_id = message.from_user.id if message.from_user else 0
+    lang = get_user_language(user_id)
+    if not items:
+        await message.answer(empty_text or ("Ma’lumot topilmadi." if lang == "uz" else "Данные не найдены."), reply_markup=reply_markup or menu_for_message(message))
+        return
+    session = {
+        "title": title,
+        "summary": summary or [],
+        "items": items,
+        "lang": lang,
+        "section": section,
+        "page_size": _page_size_safe(page_size),
+    }
+    _paged_list_cache[(user_id, kind)] = session
+    total_pages = max(1, (len(items) + session["page_size"] - 1) // session["page_size"])
+    await message.answer(
+        _paged_text(session, 0),
+        reply_markup=_paged_markup(kind, 0, total_pages, lang, section),
+    )
+
+
+@dp.callback_query(F.data == "pgnoop")
+async def paged_noop_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "pgmain")
+async def paged_main_callback(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id if callback.from_user else 0
+    lang = get_user_language(uid)
+    text, markup = _section_text_and_markup("main", uid, lang)
+    if callback.message:
+        await callback.message.answer(text, reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("pgsection:"))
+async def paged_section_callback(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id if callback.from_user else 0
+    lang = get_user_language(uid)
+    section = (callback.data or "").split(":", 1)[-1]
+    text, markup = _section_text_and_markup(section, uid, lang)
+    if callback.message:
+        await callback.message.answer(text, reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("pglist:"))
+async def paged_list_callback(callback: CallbackQuery) -> None:
+    uid = callback.from_user.id if callback.from_user else 0
+    lang = get_user_language(uid)
+    try:
+        _, kind, raw_page = (callback.data or "").split(":", 2)
+        page = int(raw_page)
+    except Exception:
+        await callback.answer()
+        return
+    session = _paged_list_cache.get((uid, kind))
+    if not session:
+        await callback.answer("Ro‘yxat eskirdi. Bo‘limni qayta oching." if lang == "uz" else "Список устарел. Откройте раздел заново.", show_alert=True)
+        return
+    page_size = _page_size_safe(session.get("page_size"))
+    total_pages = max(1, (len(session.get("items") or []) + page_size - 1) // page_size)
+    page = max(0, min(page, total_pages - 1))
+    try:
+        if callback.message:
+            await callback.message.edit_text(
+                _paged_text(session, page),
+                reply_markup=_paged_markup(kind, page, total_pages, session.get("lang", lang), session.get("section", "main")),
+            )
+        await callback.answer()
+    except Exception:
+        await callback.answer("Sahifani ochib bo‘lmadi" if lang == "uz" else "Не получилось открыть страницу", show_alert=True)
+
 @dp.message(Command("stock"))
 async def stock(message: Message) -> None:
     await send_stock_list(message, mode="all")
@@ -2580,27 +2735,30 @@ async def lowstock(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
+    telegram_id = message.from_user.id if message.from_user else 0
+    lang = get_user_language(telegram_id)
     arg = parse_args(message.text or "")
-    threshold = int(arg) if arg.isdigit() else 5
+    threshold = int(arg) if arg.isdigit() else LOW_STOCK_THRESHOLD
 
     try:
-        rows = await load_sku_rows(client, shop_id, max_pages=20)
+        rows = await load_sku_rows(client, shop_id, max_pages=50)
         if not rows:
-            await message.answer("SKU-остатки не найдены.", reply_markup=menu_for_message(message))
+            await message.answer("SKU qoldiqlari topilmadi." if lang == "uz" else "SKU-остатки не найдены.", reply_markup=stock_menu_for_message(message))
             return
 
         low = [r for r in rows if r.get("total") is not None and r["total"] <= threshold]
         if not low:
-            await message.answer(f"✅ В первых {len(rows)} SKU нет общего остатка ≤ {threshold}.", reply_markup=menu_for_message(message))
+            text = f"✅ Umumiy qoldiq ≤ {threshold} bo‘lgan SKU topilmadi." if lang == "uz" else f"✅ Товаров с общим остатком ≤ {threshold} не найдено."
+            await message.answer(text, reply_markup=stock_menu_for_message(message))
             return
 
-        lines = [format_sku_stock_line(row, mode="all") for row in low[:30]]
-        await message.answer(
-            f"⚠️ <b>Низкие остатки по общему количеству ≤ {threshold}:</b>\n"
-            f"Показано: {min(len(low), 30)} из {len(low)}\n\n"
-            + "\n\n".join(lines),
-            reply_markup=menu_for_message(message),
-        )
+        items = [format_sku_stock_line(row, mode="all") for row in low]
+        title = f"⚠️ <b>Kam qoldiqdagi tovarlar</b>" if lang == "uz" else f"⚠️ <b>Низкие остатки</b>"
+        summary = [
+            f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
+            f"📉 Chegara: ≤ <b>{threshold}</b> dona" if lang == "uz" else f"📉 Порог: ≤ <b>{threshold}</b> шт.",
+        ]
+        await send_paginated_list(message, kind="lowstock", title=title, summary=summary, items=items, section="stock", reply_markup=stock_menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -3416,8 +3574,10 @@ async def lost_goods(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
+    telegram_id = message.from_user.id if message.from_user else 0
+    lang = get_user_language(telegram_id)
 
-    await message.answer("⌛ Проверяю потерянные товары...", reply_markup=menu_for_message(message))
+    await message.answer("⌛ Yo‘qolgan tovarlarni tekshiryapman..." if lang == "uz" else "⌛ Проверяю потерянные товары...", reply_markup=stock_menu_for_message(message))
     try:
         products = await load_products(client, shop_id, max_pages=50, page_size=100)
         products = [
@@ -3429,14 +3589,13 @@ async def lost_goods(message: Message) -> None:
         ]
         products.sort(key=lambda p: _product_missing_qty(p), reverse=True)
 
-        title = "🧭 <b>Потерянные товары Uzum FBO</b>"
         if not products:
-            await message.answer(
-                title
-                + "\n\nПотерянных товаров не найдено.\n"
-                + "Проверил поле <code>quantityMissing</code> в списке товаров Uzum.",
-                reply_markup=menu_for_message(message),
+            text = (
+                f"🧭 <b>Yo‘qolgan tovarlar</b>\n🏪 Do‘kon: <code>{shop_id}</code>\n\nYo‘qolgan tovarlar topilmadi."
+                if lang == "uz"
+                else f"🧭 <b>Потерянные товары</b>\n🏪 Магазин: <code>{shop_id}</code>\n\nПотерянных товаров не найдено."
             )
+            await message.answer(text, reply_markup=stock_menu_for_message(message))
             return
 
         total_missing = sum(_product_missing_qty(p) for p in products)
@@ -3445,25 +3604,14 @@ async def lost_goods(message: Message) -> None:
             * (_pick_number(p, ("price", "sellPrice", "purchasePrice", "oldPrice")) or 0)
             for p in products
         )
-
-        lines = [
-            title,
-            f"Магазин: <code>{shop_id}</code>",
-            f"SKU с потерями: <b>{len(products)}</b>",
-            f"Всего потеряно: <b>{total_missing} шт.</b>",
-            f"Примерная сумма по текущей цене: <b>{_format_money(approx_value)}</b>",
+        title = "🧭 <b>Yo‘qolgan tovarlar</b>" if lang == "uz" else "🧭 <b>Потерянные товары</b>"
+        summary = [
+            f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
+            f"SKU: <b>{len(products)}</b> | Jami yo‘qolgan: <b>{total_missing}</b> dona" if lang == "uz" else f"SKU с потерями: <b>{len(products)}</b> | Всего потеряно: <b>{total_missing}</b> шт.",
+            f"Taxminiy summa: <b>{_format_money(approx_value)}</b>" if lang == "uz" else f"Примерная сумма: <b>{_format_money(approx_value)}</b>",
         ]
-
-        for idx, product in enumerate(products[:80], start=1):
-            lines.append(_format_lost_product_line(product, idx))
-
-        if len(products) > 80:
-            lines.append(f"Показаны первые 80 SKU из {len(products)}.")
-
-        lines.append("<i>Раздел использует поле quantityMissing из Products API. Если в кабинете Uzum потери считаются по актам иначе, сумма может отличаться.</i>")
-
-        for part in _split_long_message("\n\n".join(lines)):
-            await message.answer(part, reply_markup=menu_for_message(message))
+        items = [_format_lost_product_line(product, idx) for idx, product in enumerate(products, start=1)]
+        await send_paginated_list(message, kind="lost", title=title, summary=summary, items=items, section="stock", reply_markup=stock_menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -6884,31 +7032,42 @@ async def top_products(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
+    telegram_id = message.from_user.id if message.from_user else 0
+    lang = get_user_language(telegram_id)
     days = TOP_PRODUCTS_DAYS
-    await message.answer(f"⌛ Считаю топ товаров за {days} дней...", reply_markup=menu_for_message(message))
+    await message.answer(f"⌛ {days} kunlik top tovarlarni hisoblayapman..." if lang == "uz" else f"⌛ Считаю топ товаров за {days} дней...", reply_markup=sales_menu_for_message(message))
     try:
         top, stats = await _top_products_for_shop(client, shop_id, days)
         if not top:
-            await message.answer(f"🏆 <b>Топ товаров за {days} дней</b>\nМагазин: <code>{shop_id}</code>\n\nПродаж не найдено.", reply_markup=menu_for_message(message))
+            text = f"🏆 <b>{days} kunlik top tovarlar</b>\n🏪 Do‘kon: <code>{shop_id}</code>\n\nSavdolar topilmadi." if lang == "uz" else f"🏆 <b>Топ товаров за {days} дней</b>\n🏪 Магазин: <code>{shop_id}</code>\n\nПродаж не найдено."
+            await message.answer(text, reply_markup=sales_menu_for_message(message))
             return
-        lines = [
-            f"🏆 <b>Топ товаров за {days} дней</b>",
-            f"Магазин: <code>{shop_id}</code>",
-            f"Всего продано: <b>{float(stats['units']):.0f} шт.</b>",
-            f"Выручка: <b>{_format_money(float(stats['revenue']))}</b>",
+        title = f"🏆 <b>{days} kunlik top tovarlar</b>" if lang == "uz" else f"🏆 <b>Топ товаров за {days} дней</b>"
+        summary = [
+            f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
+            f"📦 Sotilgan: <b>{float(stats['units']):.0f} dona</b>" if lang == "uz" else f"📦 Всего продано: <b>{float(stats['units']):.0f} шт.</b>",
+            f"💵 Tushum: <b>{_format_money(float(stats['revenue']))}</b>" if lang == "uz" else f"💵 Выручка: <b>{_format_money(float(stats['revenue']))}</b>",
         ]
-        for idx, item in enumerate(top[:20], start=1):
-            title = escape(_short_text(item.get("title"), 85))
+        items: list[str] = []
+        for idx, item in enumerate(top, start=1):
+            title_item = escape(_short_text(item.get("title"), 85))
             sku = escape(_short_text(item.get("sku"), 60))
-            sku_line = f"\nSKU: <code>{sku}</code>" if sku and sku != "-" else ""
-            lines.append(
-                f"{idx}. <b>{title}</b>{sku_line}\n"
-                f"Продано: <b>{float(item.get('qty') or 0):.0f} шт.</b> | "
-                f"Выручка: <b>{_format_money(float(item.get('revenue') or 0))}</b> | "
-                f"К выплате: <b>{_format_money(float(item.get('payout') or 0))}</b>"
-            )
-        for part in _split_long_message("\n\n".join(lines)):
-            await message.answer(part, reply_markup=menu_for_message(message))
+            sku_line = f"\n🔖 SKU: <code>{sku}</code>" if sku and sku != "-" else ""
+            if lang == "uz":
+                items.append(
+                    f"{idx}. <b>{title_item}</b>{sku_line}\n"
+                    f"🔢 Soni: <b>{float(item.get('qty') or 0):.0f} dona</b> | "
+                    f"💵 Tushum: <b>{_format_money(float(item.get('revenue') or 0))}</b> | "
+                    f"✅ To‘lovga: <b>{_format_money(float(item.get('payout') or 0))}</b>"
+                )
+            else:
+                items.append(
+                    f"{idx}. <b>{title_item}</b>{sku_line}\n"
+                    f"🔢 Продано: <b>{float(item.get('qty') or 0):.0f} шт.</b> | "
+                    f"💵 Выручка: <b>{_format_money(float(item.get('revenue') or 0))}</b> | "
+                    f"✅ К выплате: <b>{_format_money(float(item.get('payout') or 0))}</b>"
+                )
+        await send_paginated_list(message, kind="top", title=title, summary=summary, items=items, section="sales", reply_markup=sales_menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -6919,8 +7078,10 @@ async def dead_stock(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
+    telegram_id = message.from_user.id if message.from_user else 0
+    lang = get_user_language(telegram_id)
     days = DEAD_STOCK_DAYS
-    await message.answer(f"⌛ Ищу товары с остатком, но без продаж за {days} дней...", reply_markup=menu_for_message(message))
+    await message.answer(f"⌛ {days} kun sotilmagan tovarlarni qidiryapman..." if lang == "uz" else f"⌛ Ищу товары с остатком, но без продаж за {days} дней...", reply_markup=sales_menu_for_message(message))
     try:
         date_from, date_to = _days_range_ms(days)
         sales_rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=5, page_size=100)
@@ -6940,29 +7101,27 @@ async def dead_stock(message: Message) -> None:
                 candidates.append({"row": row, "total": total, "price": price, "value": total * price})
         candidates.sort(key=lambda x: float(x.get("value") or 0), reverse=True)
         if not candidates:
-            await message.answer(f"🐢 <b>Товары без продаж за {days} дней</b>\nМагазин: <code>{shop_id}</code>\n\nНе нашёл товаров с остатком и нулевыми продажами.", reply_markup=menu_for_message(message))
+            text = f"🐢 <b>{days} kun sotilmagan tovarlar</b>\n🏪 Do‘kon: <code>{shop_id}</code>\n\nQoldiqda turib sotilmayotgan tovarlar topilmadi." if lang == "uz" else f"🐢 <b>Товары без продаж за {days} дней</b>\n🏪 Магазин: <code>{shop_id}</code>\n\nНе нашёл товаров с остатком и нулевыми продажами."
+            await message.answer(text, reply_markup=sales_menu_for_message(message))
             return
         total_value = sum(float(x.get("value") or 0) for x in candidates)
-        lines = [
-            f"🐢 <b>Товары без продаж за {days} дней</b>",
-            f"Магазин: <code>{shop_id}</code>",
-            f"Позиций: <b>{len(candidates)}</b>",
-            f"Примерно заморожено: <b>{_format_money(total_value)}</b>",
+        title = f"🐢 <b>{days} kun sotilmagan tovarlar</b>" if lang == "uz" else f"🐢 <b>Товары без продаж за {days} дней</b>"
+        summary = [
+            f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
+            f"📦 Pozitsiyalar: <b>{len(candidates)}</b>" if lang == "uz" else f"📦 Позиций: <b>{len(candidates)}</b>",
+            f"💰 Taxminan muzlagan summa: <b>{_format_money(total_value)}</b>" if lang == "uz" else f"💰 Примерно заморожено: <b>{_format_money(total_value)}</b>",
         ]
-        for idx, item in enumerate(candidates[:30], start=1):
+        items: list[str] = []
+        for idx, item in enumerate(candidates, start=1):
             row = item["row"]
-            title = escape(_short_text(_stock_row_title(row), 85))
+            title_item = escape(_short_text(_stock_row_title(row), 85))
             sku = escape(_short_text(_stock_row_sku(row), 60))
-            sku_line = f"\nSKU: <code>{sku}</code>" if sku else ""
-            lines.append(
-                f"{idx}. <b>{title}</b>{sku_line}\n"
-                f"Остаток: <b>{int(item['total'])} шт.</b> | "
-                f"Цена: {_format_money(float(item['price']))} | "
-                f"Сумма: <b>{_format_money(float(item['value']))}</b>"
-            )
-        lines.append("<i>Расчёт примерный: бот сопоставляет продажи и остатки по SKU/названию.</i>")
-        for part in _split_long_message("\n\n".join(lines)):
-            await message.answer(part, reply_markup=menu_for_message(message))
+            sku_line = f"\n🔖 SKU: <code>{sku}</code>" if sku else ""
+            if lang == "uz":
+                items.append(f"{idx}. <b>{title_item}</b>{sku_line}\n📦 Qoldiq: <b>{int(item['total'])} dona</b> | 💵 Narx: {_format_money(float(item['price']))} | 💰 Summa: <b>{_format_money(float(item['value']))}</b>")
+            else:
+                items.append(f"{idx}. <b>{title_item}</b>{sku_line}\n📦 Остаток: <b>{int(item['total'])} шт.</b> | 💵 Цена: {_format_money(float(item['price']))} | 💰 Сумма: <b>{_format_money(float(item['value']))}</b>")
+        await send_paginated_list(message, kind="dead", title=title, summary=summary, items=items, section="sales", reply_markup=sales_menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -6973,7 +7132,9 @@ async def smart_lowstock(message: Message) -> None:
     if req is None:
         return
     _, client, shop_id = req
-    await message.answer("⌛ Считаю, на сколько дней хватит остатков...", reply_markup=menu_for_message(message))
+    telegram_id = message.from_user.id if message.from_user else 0
+    lang = get_user_language(telegram_id)
+    await message.answer("⌛ Qoldiq necha kunga yetishini hisoblayapman..." if lang == "uz" else "⌛ Считаю, на сколько дней хватит остатков...", reply_markup=stock_menu_for_message(message))
     try:
         date_from, date_to = _days_range_ms(7)
         sales_rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=5, page_size=100)
@@ -6998,32 +7159,33 @@ async def smart_lowstock(message: Message) -> None:
                 alerts.append({"row": row, "total": total, "qty_7": qty_7, "days_left": days_left})
         alerts.sort(key=lambda x: (float(x.get("days_left") or 9999), int(x.get("total") or 0)))
         if not alerts:
-            await message.answer(
-                f"⚠️ <b>Умное 'Заканчивается'</b>\nМагазин: <code>{shop_id}</code>\n\n"
-                f"Критичных товаров не нашёл. Порог: ≤ {LOW_STOCK_THRESHOLD} шт. или хватит меньше чем на {SMART_LOW_STOCK_DAYS} дня.",
-                reply_markup=menu_for_message(message),
+            text = (
+                f"⚠️ <b>Qoldiq prognozi</b>\n🏪 Do‘kon: <code>{shop_id}</code>\n\nKritik tovarlar topilmadi."
+                if lang == "uz"
+                else f"⚠️ <b>Прогноз остатков</b>\n🏪 Магазин: <code>{shop_id}</code>\n\nКритичных товаров не нашёл."
             )
+            await message.answer(text, reply_markup=stock_menu_for_message(message))
             return
-        lines = [
-            "⚠️ <b>Умное 'Заканчивается'</b>",
-            f"Магазин: <code>{shop_id}</code>",
-            f"Порог: ≤ {LOW_STOCK_THRESHOLD} шт. или хватит меньше чем на {SMART_LOW_STOCK_DAYS} дня",
+        title = "⚠️ <b>Qoldiq prognozi</b>" if lang == "uz" else "⚠️ <b>Прогноз остатков</b>"
+        summary = [
+            f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
+            f"Chegara: ≤ {LOW_STOCK_THRESHOLD} dona yoki {SMART_LOW_STOCK_DAYS} kundan kam" if lang == "uz" else f"Порог: ≤ {LOW_STOCK_THRESHOLD} шт. или хватит меньше чем на {SMART_LOW_STOCK_DAYS} дня",
         ]
-        for idx, item in enumerate(alerts[:30], start=1):
+        items: list[str] = []
+        for idx, item in enumerate(alerts, start=1):
             row = item["row"]
-            title = escape(_short_text(_stock_row_title(row), 85))
+            title_item = escape(_short_text(_stock_row_title(row), 85))
             sku = escape(_short_text(_stock_row_sku(row), 60))
             days_left = float(item["days_left"])
-            days_text = "нет продаж за 7 дней" if days_left > 9000 else f"примерно на {days_left:.1f} дн."
-            sku_line = f"\nSKU: <code>{sku}</code>" if sku else ""
-            lines.append(
-                f"{idx}. <b>{title}</b>{sku_line}\n"
-                f"Остаток: <b>{int(item['total'])} шт.</b> | "
-                f"Продажи за 7 дней: <b>{float(item['qty_7']):.0f} шт.</b> | "
-                f"Хватит: <b>{escape(days_text)}</b>"
-            )
-        for part in _split_long_message("\n\n".join(lines)):
-            await message.answer(part, reply_markup=menu_for_message(message))
+            if lang == "uz":
+                days_text = "7 kunda savdo yo‘q" if days_left > 9000 else f"taxminan {days_left:.1f} kun"
+                sku_line = f"\n🔖 SKU: <code>{sku}</code>" if sku else ""
+                items.append(f"{idx}. <b>{title_item}</b>{sku_line}\n📦 Qoldiq: <b>{int(item['total'])} dona</b> | 7 kunda sotildi: <b>{float(item['qty_7']):.0f}</b> | Yetadi: <b>{days_text}</b>")
+            else:
+                days_text = "нет продаж за 7 дней" if days_left > 9000 else f"примерно на {days_left:.1f} дн."
+                sku_line = f"\n🔖 SKU: <code>{sku}</code>" if sku else ""
+                items.append(f"{idx}. <b>{title_item}</b>{sku_line}\n📦 Остаток: <b>{int(item['total'])} шт.</b> | Продажи за 7 дней: <b>{float(item['qty_7']):.0f}</b> | Хватит: <b>{days_text}</b>")
+        await send_paginated_list(message, kind="forecast", title=title, summary=summary, items=items, section="stock", reply_markup=stock_menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -7260,12 +7422,39 @@ async def unit_economy(message: Message) -> None:
         return
     _, client, shop_id = req
     lang = get_user_language(telegram_id)
-    await message.answer("⌛ Hisoblayapman..." if lang == "uz" else "⌛ Считаю юнит-экономику...", reply_markup=menu_for_message(message))
+    await message.answer("⌛ Hisoblayapman..." if lang == "uz" else "⌛ Считаю юнит-экономику...", reply_markup=sales_menu_for_message(message))
     try:
         rows, stats, saved_costs = await _unit_economy_for_shop(client, telegram_id, shop_id, days=30)
-        text = _format_unit_economy(shop_id, 30, rows, stats, saved_costs, lang=lang)
-        for part in _split_long_message(text):
-            await message.answer(part, reply_markup=menu_for_message(message))
+        if not rows:
+            text = f"🧾 <b>Unit iqtisodiyot</b>\n🏪 Do‘kon: <code>{shop_id}</code>\n\nSavdolar topilmadi." if lang == "uz" else f"🧾 <b>Юнит-экономика</b>\n🏪 Магазин: <code>{shop_id}</code>\n\nПродаж не найдено."
+            await message.answer(text, reply_markup=sales_menu_for_message(message))
+            return
+        total_known_profit = sum(float(x.get("profit") or 0) for x in rows if x.get("profit") is not None)
+        known_items = sum(1 for x in rows if x.get("profit") is not None)
+        title = "🧾 <b>Unit iqtisodiyot — 30 kun</b>" if lang == "uz" else "🧾 <b>Юнит-экономика за 30 дней</b>"
+        summary = [
+            f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
+            f"📦 Sotilgan: <b>{float(stats.get('units') or 0):.0f} dona</b> | 💵 Tushum: <b>{_format_money(float(stats.get('revenue') or 0))}</b>" if lang == "uz" else f"📦 Продано: <b>{float(stats.get('units') or 0):.0f} шт.</b> | 💵 Выручка: <b>{_format_money(float(stats.get('revenue') or 0))}</b>",
+            f"💾 Tannarxlar: <b>{saved_costs}</b>" if lang == "uz" else f"💾 Себестоимостей: <b>{saved_costs}</b>",
+        ]
+        if known_items:
+            summary.append(f"💰 Taxminiy sof foyda: <b>{_format_money(total_known_profit)}</b>" if lang == "uz" else f"💰 Примерная чистая прибыль: <b>{_format_money(total_known_profit)}</b>")
+        items: list[str] = []
+        for idx, item in enumerate(rows, start=1):
+            sku = escape(_short_text(item.get("sku"), 55))
+            title_item = escape(_short_text(item.get("title"), 70))
+            cost = item.get("cost_per_unit")
+            if cost is None:
+                hint = f"\n⚠️ Tannarx kiritilmagan: <code>/cost {sku} 60000</code>" if lang == "uz" else f"\n⚠️ Себестоимость не указана: <code>/cost {sku} 60000</code>"
+            else:
+                profit = float(item.get("profit") or 0)
+                margin = float(item.get("margin") or 0)
+                hint = f"\n🧾 Tannarx: <b>{_format_money(float(cost))}</b> | 💰 Foyda: <b>{_format_money(profit)}</b> | 📈 Marja: <b>{margin:.1f}%</b>" if lang == "uz" else f"\n🧾 Себестоимость: <b>{_format_money(float(cost))}</b> | 💰 Прибыль: <b>{_format_money(profit)}</b> | 📈 Маржа: <b>{margin:.1f}%</b>"
+            if lang == "uz":
+                items.append(f"{idx}. <b>{title_item}</b>\n🔖 SKU: <code>{sku}</code>\n🔢 Soni: <b>{float(item.get('qty') or 0):.0f} dona</b> | 💵 Tushum: <b>{_format_money(float(item.get('revenue') or 0))}</b> | ✅ To‘lovga: <b>{_format_money(float(item.get('payout') or 0))}</b>{hint}")
+            else:
+                items.append(f"{idx}. <b>{title_item}</b>\n🔖 SKU: <code>{sku}</code>\n🔢 Кол-во: <b>{float(item.get('qty') or 0):.0f} шт.</b> | 💵 Выручка: <b>{_format_money(float(item.get('revenue') or 0))}</b> | ✅ К выплате: <b>{_format_money(float(item.get('payout') or 0))}</b>{hint}")
+        await send_paginated_list(message, kind="unit", title=title, summary=summary, items=items, section="sales", reply_markup=sales_menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -7607,10 +7796,29 @@ async def profit_report(message: Message) -> None:
         return
     telegram_id, client, shop_id = req
     lang = get_user_language(telegram_id)
-    await message.answer("⌛ Foydani hisoblayapman..." if lang == "uz" else "⌛ Считаю прибыль...", reply_markup=menu_for_message(message))
+    await message.answer("⌛ Foydani hisoblayapman..." if lang == "uz" else "⌛ Считаю прибыль...", reply_markup=sales_menu_for_message(message))
     try:
         rows, stats, _ = await _unit_economy_for_shop(client, telegram_id, shop_id, days=30)
-        await message.answer(_format_profit_report(shop_id, rows, stats, lang=lang), reply_markup=sales_menu_for_message(message))
+        summary_stats = _profit_summary_from_unit_rows(rows, stats)
+        known = sorted([r for r in rows if r.get("cost_per_unit") is not None], key=lambda r: float(r.get("profit") or 0), reverse=True)
+        title = "💰 <b>30 kunlik foyda</b>" if lang == "uz" else "💰 <b>Прибыль за 30 дней</b>"
+        summary = [
+            f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
+            f"💵 Tushum: <b>{_format_money(float(stats.get('revenue') or 0))}</b> | 📦 Tannarx: <b>{_format_money(float(summary_stats['cost_total']))}</b>" if lang == "uz" else f"💵 Выручка: <b>{_format_money(float(stats.get('revenue') or 0))}</b> | 📦 Себестоимость: <b>{_format_money(float(summary_stats['cost_total']))}</b>",
+            f"💰 Sof foyda: <b>{_format_money(float(summary_stats['profit']))}</b> | 📈 Marja: <b>{float(summary_stats['margin']):.1f}%</b>" if lang == "uz" else f"💰 Чистая прибыль: <b>{_format_money(float(summary_stats['profit']))}</b> | 📈 Маржа: <b>{float(summary_stats['margin']):.1f}%</b>",
+        ]
+        if summary_stats["missing_count"]:
+            summary.append(f"⚠️ Tannarx kiritilmagan SKU: <b>{summary_stats['missing_count']}</b>" if lang == "uz" else f"⚠️ Без себестоимости: <b>{summary_stats['missing_count']}</b> SKU")
+        items: list[str] = []
+        for idx, r in enumerate(known, start=1):
+            title_item = escape(_short_text(str(r.get("title") or r.get("sku") or "-"), 70))
+            sku = escape(_short_text(str(r.get("sku") or ""), 55))
+            profit = float(r.get("profit") or 0)
+            margin = float(r.get("margin") or 0)
+            items.append((f"{idx}. <b>{title_item}</b>\n🔖 SKU: <code>{sku}</code>\n💰 Foyda: <b>{_format_money(profit)}</b> | 📈 Marja: <b>{margin:.1f}%</b>" if lang == "uz" else f"{idx}. <b>{title_item}</b>\n🔖 SKU: <code>{sku}</code>\n💰 Прибыль: <b>{_format_money(profit)}</b> | 📈 Маржа: <b>{margin:.1f}%</b>"))
+        if not items:
+            items = ["Tannarx kiritilgan savdolar hali yo‘q. Tannarx yuklash: /cost_template" if lang == "uz" else "Пока нет продаж с указанной себестоимостью. Загрузите себестоимость: /cost_template"]
+        await send_paginated_list(message, kind="profit", title=title, summary=summary, items=items, section="sales", reply_markup=sales_menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
 
@@ -8752,5 +8960,6 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
