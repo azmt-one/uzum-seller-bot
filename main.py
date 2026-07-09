@@ -38,7 +38,8 @@ from formatters import (
     safe,
     status_display,
 )
-from uzum_client import UzumClient
+from uzum_client import UzumClien
+from review_ai_integration import setup_review_ai_handlers
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -8956,7 +8957,19 @@ async def main() -> None:
     if SUBSCRIPTION_REMINDERS:
         asyncio.create_task(subscription_reminder_loop())
     await dp.start_polling(bot)
-
+# --- AI-ответы на отзывы покупателей ---
+# Команды:
+# /ai_review текст отзыва
+# /ai_review_uz текст отзыва
+# /ai_review_short текст отзыва
+# /ai_review_original текст отзыва
+setup_review_ai_handlers(
+    dp,
+    menu_for_message=menu_for_message if "menu_for_message" in globals() else None,
+    get_user_language=get_user_language if "get_user_language" in globals() else None,
+    require_active_subscription=require_active_subscription if "require_active_subscription" in globals() else None,
+    upsert_from_message=upsert_from_message if "upsert_from_message" in globals() else None,
+)
 
 if __name__ == "__main__":
     asyncio.run(main())
