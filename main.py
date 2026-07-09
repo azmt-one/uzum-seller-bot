@@ -1157,6 +1157,13 @@ def translate_runtime_text_to_uz(text: str) -> str:
         ("Принято", "Qabul qilingan"),
         ("К поставке", "Yetkazishga"),
         ("Накладная", "Yuk xati"),
+        ("Отзывы", "Sharhlar"),
+        ("Последние отзывы", "Oxirgi sharhlar"),
+        ("Новый отзыв", "Yangi sharh"),
+        ("Отзыв", "Sharh"),
+        ("Оценка", "Baho"),
+        ("Клиент", "Mijoz"),
+        ("Ответ продавца", "Sotuvchi javobi"),
     ]
     for old, new in fixes:
         text = text.replace(old, new)
@@ -1390,7 +1397,8 @@ REPORT_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Excel отчёт"), KeyboardButton(text="🌙 Утренний отчёт")],
         [KeyboardButton(text="💰 Прибыль"), KeyboardButton(text="📥 Себестоимость Excel")],
-        [KeyboardButton(text="✅ Проверить подключение"), KeyboardButton(text="🔐 Безопасность")],
+        [KeyboardButton(text="⭐ Отзывы"), KeyboardButton(text="✅ Проверить подключение")],
+        [KeyboardButton(text="🔐 Безопасность")],
         [KeyboardButton(text="⬅️ Главное меню")],
     ],
     resize_keyboard=True,
@@ -1401,7 +1409,8 @@ REPORT_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Excel hisobot"), KeyboardButton(text="🌙 Ertalabki hisobot")],
         [KeyboardButton(text="💰 Foyda"), KeyboardButton(text="📥 Tannarx Excel")],
-        [KeyboardButton(text="✅ Ulanishni tekshirish"), KeyboardButton(text="🔐 Xavfsizlik")],
+        [KeyboardButton(text="⭐ Sharhlar"), KeyboardButton(text="✅ Ulanishni tekshirish")],
+        [KeyboardButton(text="🔐 Xavfsizlik")],
         [KeyboardButton(text="⬅️ Asosiy menyu")],
     ],
     resize_keyboard=True,
@@ -4224,6 +4233,11 @@ REVIEWS_LIST_PATH = os.getenv("REVIEWS_LIST_PATH", "").strip()
 REVIEWS_REPLY_PATH = os.getenv("REVIEWS_REPLY_PATH", "").strip()
 REVIEWS_REPLY_METHOD = os.getenv("REVIEWS_REPLY_METHOD", "POST").strip().upper() or "POST"
 REVIEWS_REPLY_BODY_FIELD = os.getenv("REVIEWS_REPLY_BODY_FIELD", "text").strip() or "text"
+REVIEW_NOTIFICATIONS = (
+    os.getenv("REVIEW_NOTIFICATIONS", "0").strip().lower()
+    in {"1", "true", "yes", "on", "да"}
+)
+REVIEW_CHECK_INTERVAL_SECONDS = int(os.getenv("REVIEW_CHECK_INTERVAL_SECONDS", "600") or "600")
 
 
 def _format_endpoint_template(template: str, *, shop_id: int, review_id: str = "", page: int = 0, size: int = 10) -> str:
@@ -4445,6 +4459,182 @@ async def reply_review(message: Message) -> None:
         f"Последняя ошибка:\n<code>{escape(errors[-1] if errors else '—')}</code>",
         reply_markup=menu_for_message(message),
     )
+
+
+@dp.message(Command("reviews_check"))
+async def reviews_check(message: Message) -> None:
+    """Проверить, доступен ли endpoint отзывов для текущего API-ключа."""
+    req = await require_connection(message)
+    if req is None:
+        return
+    telegram_id, client, shop_id = req
+    lang = get_user_language(telegram_id)
+    items, path, error = await get_reviews_from_uzum(client, shop_id, page=0, size=5)
+    if not error:
+        if lang == "uz":
+            await message.answer(
+                "✅ <b>Sharhlar API tekshiruvi</b>\n\n"
+                f"Do‘kon: <code>{shop_id}</code>\n"
+                f"Ishlagan yo‘l: <code>{escape(str(path))}</code>\n"
+                f"Topilgan sharhlar: <b>{len(items)}</b>\n\n"
+                "Endi <code>/reviews</code> orqali sharhlarni ko‘rish mumkin.",
+                reply_markup=menu_for_message(message),
+            )
+        else:
+            await message.answer(
+                "✅ <b>Проверка отзывов</b>\n\n"
+                f"Магазин: <code>{shop_id}</code>\n"
+                f"Рабочий путь: <code>{escape(str(path))}</code>\n"
+                f"Найдено отзывов: <b>{len(items)}</b>\n\n"
+                "Теперь можно смотреть отзывы через <code>/reviews</code>.",
+                reply_markup=menu_for_message(message),
+            )
+        return
+
+    if lang == "uz":
+        await message.answer(
+            "⚠️ <b>Sharhlar API hozircha ishlamadi</b>\n\n"
+            "Uzum Seller OpenAPI sizning kalitingiz bilan sharhlarni bermayapti. "
+            "Bu odatda endpoint yopiq yoki huquq yetarli emasligini bildiradi.\n\n"
+            f"Oxirgi yo‘l: <code>{escape(str(path))}</code>\n"
+            f"Xatolik: <code>{escape(str(error)[:1000])}</code>\n\n"
+            "Agar Uzum aniq sharhlar endpointini bersa, bothost’da "
+            "<code>REVIEWS_LIST_PATH</code> o‘zgaruvchisini qo‘shamiz.",
+            reply_markup=menu_for_message(message),
+        )
+    else:
+        await message.answer(
+            "⚠️ <b>Отзывы пока не удалось получить</b>\n\n"
+            "Uzum Seller OpenAPI не отдаёт отзывы по текущему API-ключу. "
+            "Обычно это значит, что endpoint закрыт или не хватает прав.\n\n"
+            f"Последний путь: <code>{escape(str(path))}</code>\n"
+            f"Ошибка: <code>{escape(str(error)[:1000])}</code>\n\n"
+            "Если Uzum даст точный endpoint отзывов, добавим в bothost "
+            "переменную <code>REVIEWS_LIST_PATH</code>.",
+            reply_markup=menu_for_message(message),
+        )
+
+
+@dp.message(Command("reviews_notify_status"))
+async def reviews_notify_status(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    if lang == "uz":
+        text = (
+            "⭐ <b>Sharhlar xabarnomalari</b>\n\n"
+            f"Holat: {'✅ yoqilgan' if REVIEW_NOTIFICATIONS else '❌ o‘chirilgan'}\n"
+            f"Tekshiruv har <b>{REVIEW_CHECK_INTERVAL_SECONDS}</b> soniya\n\n"
+            "Ishlashi uchun <code>/reviews_check</code> tekshiruvi muvaffaqiyatli bo‘lishi kerak."
+        )
+    else:
+        text = (
+            "⭐ <b>Уведомления о новых отзывах</b>\n\n"
+            f"Статус: {'✅ включены' if REVIEW_NOTIFICATIONS else '❌ выключены'}\n"
+            f"Проверка каждые <b>{REVIEW_CHECK_INTERVAL_SECONDS}</b> сек.\n\n"
+            "Будет работать только если <code>/reviews_check</code> найдёт рабочий метод отзывов."
+        )
+    await message.answer(text, reply_markup=menu_for_message(message))
+
+
+def _review_seen_key(review: Any) -> str:
+    rid = _review_id(review)
+    if rid and rid != "—":
+        return "id:" + str(rid)
+    raw = json.dumps(review, ensure_ascii=False, sort_keys=True, default=str)
+    return "hash:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
+
+
+def build_review_notification(review: Any, shop_id: int, lang: str = "ru") -> str:
+    lang = normalize_lang(lang)
+    review_id = escape(_review_id(review))
+    product = safe(pick(review, "productTitle", "productName", "title", "name", "skuTitle", default="—"))
+    rating = safe(pick(review, "rating", "stars", "mark", "grade", "score", default="—"))
+    author = safe(pick(review, "customerName", "userName", "buyerName", "clientName", "author", default="—"))
+    created = safe(pick(review, "createdAt", "date", "createdDate", "publishedAt", default="—"))
+    text = safe(pick(review, "text", "comment", "review", "content", "message", "description", default="—"))
+    if len(text) > 700:
+        text = text[:700] + "..."
+    if lang == "uz":
+        return (
+            "⭐ <b>Yangi sharh</b>\n\n"
+            f"🏪 Do‘kon: <code>{shop_id}</code>\n"
+            f"📦 Tovar: <b>{product}</b>\n"
+            f"⭐ Baho: <b>{rating}</b>\n"
+            f"👤 Mijoz: {author}\n"
+            f"🕒 Sana: {created}\n\n"
+            f"💬 Sharh:\n{text}\n\n"
+            f"ID: <code>{review_id}</code>\n"
+            "Javob berish: <code>/reply ID matn</code>"
+        )
+    return (
+        "⭐ <b>Новый отзыв</b>\n\n"
+        f"🏪 Магазин: <code>{shop_id}</code>\n"
+        f"📦 Товар: <b>{product}</b>\n"
+        f"⭐ Оценка: <b>{rating}</b>\n"
+        f"👤 Клиент: {author}\n"
+        f"🕒 Дата: {created}\n\n"
+        f"💬 Отзыв:\n{text}\n\n"
+        f"ID: <code>{review_id}</code>\n"
+        "Ответить: <code>/reply ID текст</code>"
+    )
+
+
+_seen_review_keys_by_user: dict[int, set[str]] = {}
+_reviews_watch_initialized: set[int] = set()
+
+
+async def check_new_reviews_once() -> None:
+    for group in connected_watch_groups():
+        shop_id = int(group["shop_id"])
+        encrypted_token = group["uzum_token_encrypted"]
+        telegram_ids = [int(x) for x in group["telegram_ids"]]
+        try:
+            token = cipher.decrypt(encrypted_token)
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            items, path, error = await get_reviews_from_uzum(client, shop_id, page=0, size=20)
+            if error and not items:
+                logging.warning("Reviews watcher: no access shop=%s path=%s error=%s", shop_id, path, str(error)[:300])
+                await asyncio.sleep(2)
+                continue
+        except Exception:
+            logging.exception("Reviews watcher: failed to check shop=%s users=%s", shop_id, telegram_ids)
+            await asyncio.sleep(3)
+            continue
+
+        keys_now = [_review_seen_key(item) for item in items]
+        for telegram_id in telegram_ids:
+            known = _seen_review_keys_by_user.setdefault(telegram_id, set())
+            if telegram_id not in _reviews_watch_initialized:
+                known.update(keys_now)
+                _reviews_watch_initialized.add(telegram_id)
+                logging.info("Reviews watcher initialized for user=%s shop=%s reviews=%s", telegram_id, shop_id, len(keys_now))
+                continue
+
+            new_items = [item for item, key in zip(items, keys_now) if key not in known]
+            known.update(keys_now)
+            if len(known) > 2000:
+                _seen_review_keys_by_user[telegram_id] = set(keys_now)
+            for item in new_items[:10]:
+                try:
+                    await bot.send_message(
+                        telegram_id,
+                        build_review_notification(item, shop_id=shop_id, lang=get_user_language(telegram_id)),
+                        reply_markup=main_menu_for_user(telegram_id),
+                    )
+                    await asyncio.sleep(0.15)
+                except Exception:
+                    logging.exception("Reviews watcher: failed to send notification to %s", telegram_id)
+        await asyncio.sleep(0.5)
+
+
+async def reviews_watch_loop() -> None:
+    logging.info("Reviews watcher started. Interval: %s seconds. Enabled: %s", REVIEW_CHECK_INTERVAL_SECONDS, REVIEW_NOTIFICATIONS)
+    while True:
+        try:
+            await check_new_reviews_once()
+        except Exception:
+            logging.exception("Reviews watcher crashed")
+        await asyncio.sleep(max(60, REVIEW_CHECK_INTERVAL_SECONDS))
 
 
 @dp.message(Command("subscribe"))
@@ -6707,6 +6897,7 @@ async def section_settings(message: Message) -> None:
 
 
 @dp.message(F.text == "⭐ Отзывы")
+@dp.message(F.text == "⭐ Sharhlar")
 async def button_reviews(message: Message) -> None:
     await reviews(message)
 
@@ -8955,8 +9146,11 @@ async def main() -> None:
         asyncio.create_task(daily_report_loop())
     if SUBSCRIPTION_REMINDERS:
         asyncio.create_task(subscription_reminder_loop())
+    if REVIEW_NOTIFICATIONS:
+        asyncio.create_task(reviews_watch_loop())
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
