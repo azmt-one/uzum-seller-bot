@@ -1,11 +1,11 @@
 """
-AI-ответы на отзывы покупателей для Telegram-бота Uzum Seller Assistant.
+AI-ответы на отзывы покупателей для Uzum Seller Assistant.
 
-Файл самостоятельный: его нужно положить рядом с main.py.
-Требуется переменная окружения:
-    OPENAI_API_KEY=...
-Дополнительно можно задать:
-    OPENAI_MODEL=gpt-5.4-mini
+Положите файл рядом с main.py.
+
+Переменные окружения:
+    OPENAI_API_KEY=sk-...
+    OPENAI_MODEL=gpt-5.4-mini   # необязательно
 """
 
 from __future__ import annotations
@@ -19,7 +19,6 @@ from openai import AsyncOpenAI
 
 ReviewLanguage = Literal["ru", "uz"]
 ReviewTone = Literal["polite", "short", "warm", "protect_original", "apology"]
-
 
 DEFAULT_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini"
 
@@ -37,7 +36,7 @@ def _get_client() -> AsyncOpenAI:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError(
-            "OPENAI_API_KEY не задан. Добавьте переменную окружения OPENAI_API_KEY в BotHost."
+            "OPENAI_API_KEY не задан. Добавьте OPENAI_API_KEY в переменные окружения BotHost."
         )
     return AsyncOpenAI(api_key=api_key)
 
@@ -49,17 +48,19 @@ def _language_name(language: ReviewLanguage) -> str:
 
 
 def _tone_rules(tone: ReviewTone) -> str:
-    rules = {
-        "polite": "Ответ должен быть вежливым, спокойным и нейтральным.",
-        "short": "Ответ должен быть очень коротким: 1-2 предложения.",
-        "warm": "Ответ должен быть тёплым, дружелюбным, с заботой о клиенте.",
-        "protect_original": (
+    if tone == "short":
+        return "Ответ должен быть очень коротким: 1-2 предложения."
+    if tone == "warm":
+        return "Ответ должен быть тёплым, дружелюбным и заботливым."
+    if tone == "protect_original":
+        return (
             "Если клиент сомневается в оригинальности, аккуратно объясни, что продавец "
-            "работает с оригинальным товаром/проверенными поставщиками. Не спорь и не обвиняй клиента."
-        ),
-        "apology": "Сделай акцент на извинении и готовности проверить ситуацию.",
-    }
-    return rules.get(tone, rules["polite"])
+            "работает с оригинальным товаром или проверенными поставщиками. "
+            "Не спорь и не обвиняй клиента."
+        )
+    if tone == "apology":
+        return "Сделай акцент на извинении и готовности проверить ситуацию."
+    return "Ответ должен быть вежливым, спокойным и нейтральным."
 
 
 def _clean_review_text(text: str) -> str:
@@ -70,11 +71,6 @@ def _clean_review_text(text: str) -> str:
 
 
 async def generate_review_reply(data: ReviewReplyInput) -> str:
-    """
-    Генерирует готовый ответ продавца на отзыв.
-
-    Возвращает только текст ответа, без кавычек и без пояснений.
-    """
     review_text = _clean_review_text(data.review_text)
     if not review_text:
         raise ValueError("Пустой текст отзыва.")
@@ -84,10 +80,10 @@ async def generate_review_reply(data: ReviewReplyInput) -> str:
 
     instructions = (
         "Ты помощник продавца на маркетплейсе Uzum. "
-        "Твоя задача — писать готовые ответы на отзывы покупателей. "
+        "Пиши готовые ответы на отзывы покупателей. "
         "Не пиши, что ты искусственный интеллект. "
         "Не обещай возврат денег, скидку, замену, компенсацию или действия, которые продавец не подтвердил. "
-        "Не обвиняй клиента. Не спорь с клиентом. "
+        "Не обвиняй клиента и не спорь с ним. "
         "Если отзыв негативный, извинись и скажи, что продавец проверит ситуацию. "
         "Если отзыв положительный, поблагодари за покупку. "
         "Ответ должен быть 2-4 предложения, без заголовка. "
@@ -108,7 +104,6 @@ async def generate_review_reply(data: ReviewReplyInput) -> str:
 """.strip()
 
     client = _get_client()
-
     response = await client.responses.create(
         model=DEFAULT_MODEL,
         instructions=instructions,
@@ -122,7 +117,6 @@ async def generate_review_reply(data: ReviewReplyInput) -> str:
     if not text:
         raise RuntimeError("OpenAI вернул пустой ответ.")
 
-    # Telegram/маркетплейсу обычно не нужен слишком длинный ответ.
     if len(text) > 1000:
         text = text[:1000].rsplit(" ", 1)[0].strip() + "..."
 
