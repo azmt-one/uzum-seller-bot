@@ -1,6 +1,7 @@
 from __future__ import annotations
-import os
+
 import json
+import os
 import sqlite3
 from datetime import datetime, timezone
 from typing import Any
@@ -15,11 +16,9 @@ def now_iso() -> str:
 class Database:
     def __init__(self, path: str = "bot.db") -> None:
         self.path = path
-
         folder = os.path.dirname(self.path)
         if folder:
             os.makedirs(folder, exist_ok=True)
-
         self._init()
 
     def connect(self) -> sqlite3.Connection:
@@ -84,9 +83,9 @@ class Database:
                 INSERT INTO users (telegram_id, username, first_name, created_at, updated_at)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(telegram_id) DO UPDATE SET
-                    username=excluded.username,
-                    first_name=excluded.first_name,
-                    updated_at=excluded.updated_at
+                    username = excluded.username,
+                    first_name = excluded.first_name,
+                    updated_at = excluded.updated_at
                 """,
                 (telegram_id, username, first_name, ts, ts),
             )
@@ -99,7 +98,6 @@ class Database:
     def save_connection(self, telegram_id: int, encrypted_token: str, shops: list[dict[str, Any]]) -> int | None:
         ts = now_iso()
         default_shop_id: int | None = None
-
         normalized_shops: list[tuple[int, str, str]] = []
         for shop in shops:
             shop_id = extract_shop_id(shop)
@@ -114,10 +112,7 @@ class Database:
             conn.execute(
                 """
                 UPDATE users
-                SET uzum_token_encrypted = ?,
-                    token_connected_at = ?,
-                    default_shop_id = ?,
-                    updated_at = ?
+                SET uzum_token_encrypted = ?, token_connected_at = ?, default_shop_id = ?, updated_at = ?
                 WHERE telegram_id = ?
                 """,
                 (encrypted_token, ts, default_shop_id, ts, telegram_id),
@@ -131,23 +126,18 @@ class Database:
                 [(telegram_id, shop_id, title, raw, ts) for shop_id, title, raw in normalized_shops],
             )
             conn.commit()
-
         return default_shop_id
 
     def get_encrypted_token(self, telegram_id: int) -> str | None:
         row = self.get_user(telegram_id)
-        if not row:
-            return None
-        return row["uzum_token_encrypted"]
+        return row["uzum_token_encrypted"] if row else None
 
     def has_uzum_connection(self, telegram_id: int) -> bool:
         return bool(self.get_encrypted_token(telegram_id))
 
     def get_default_shop_id(self, telegram_id: int) -> int | None:
         row = self.get_user(telegram_id)
-        if not row:
-            return None
-        return row["default_shop_id"]
+        return row["default_shop_id"] if row else None
 
     def set_default_shop_id(self, telegram_id: int, shop_id: int) -> bool:
         with self.connect() as conn:
@@ -162,7 +152,7 @@ class Database:
                 (shop_id, now_iso(), telegram_id),
             )
             conn.commit()
-            return True
+        return True
 
     def list_shops(self, telegram_id: int) -> list[sqlite3.Row]:
         with self.connect() as conn:
@@ -212,13 +202,11 @@ def extract_shop_id(shop: dict[str, Any]) -> int | None:
                 return int(value)
             except Exception:
                 pass
-
     for value in shop.values():
         if isinstance(value, dict):
             nested = extract_shop_id(value)
             if nested is not None:
                 return nested
-
     return None
 
 
@@ -227,11 +215,9 @@ def extract_shop_title(shop: dict[str, Any]) -> str:
         value = shop.get(key)
         if value:
             return str(value)
-
     for value in shop.values():
         if isinstance(value, dict):
             nested = extract_shop_title(value)
             if nested and nested != "—":
                 return nested
-
     return "—"

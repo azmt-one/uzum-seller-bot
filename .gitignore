@@ -1,10 +1,13 @@
 .env
+*.env
 .venv/
+venv/
 __pycache__/
 *.pyc
 *.log
 *.xlsx
 *.db
 bot.db
+data/
 .idea/
 .vscode/

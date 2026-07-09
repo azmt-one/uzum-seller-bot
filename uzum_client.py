@@ -15,7 +15,6 @@ class UzumClient:
             raise ValueError("Uzum API token is empty")
         self.base_url = base_url.rstrip("/")
         self.headers = {
-            # Uzum Seller OpenAPI: token goes to Authorization header without "Bearer".
             "Authorization": token,
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -24,17 +23,14 @@ class UzumClient:
     async def _request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = f"{self.base_url}{path}"
         timeout = httpx.Timeout(30.0, connect=10.0)
-
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.request(method, url, headers=self.headers, **kwargs)
-
         if response.status_code >= 400:
             try:
                 body = response.json()
             except Exception:
                 body = response.text[:1000]
             raise UzumApiError(f"Uzum API error {response.status_code}: {body}")
-
         content_type = response.headers.get("content-type", "")
         if "application/json" in content_type or response.text.startswith(("{", "[")):
             return response.json()
@@ -74,7 +70,7 @@ class UzumClient:
         scheme: str | None = None,
     ) -> Any:
         params: dict[str, Any] = {
-            "shopIds": [shop_id],
+            "shopIds": shop_id,
             "status": status,
             "page": page,
             "size": size,
@@ -84,27 +80,15 @@ class UzumClient:
         return await self._request("GET", "/v2/fbs/orders", params=params)
 
     async def count_fbs_orders(self, shop_id: int, *, status: str = "CREATED") -> Any:
-        params = {
-            "shopIds": [shop_id],
-            "status": status,
-        }
+        params = {"shopIds": shop_id, "status": status}
         return await self._request("GET", "/v2/fbs/orders/count", params=params)
 
-
     async def get_fbs_sku_stocks(self, *, page: int = 0, size: int = 50) -> Any:
-        """Get exact FBS/DBS SKU stock quantities.
-
-        Uzum OpenAPI v3 endpoint is paginated and is not tied to a shop_id in the
-        public schema; it returns SKU stocks available for this seller token.
-        """
-        params = {
-            "page": page,
-            "size": size,
-        }
+        params = {"page": page, "size": size}
         return await self._request("GET", "/v3/fbs/sku/stocks", params=params)
 
     async def get_expenses(self, *, shop_id: int | None = None, page: int = 0, size: int = 20) -> Any:
         params: dict[str, Any] = {"page": page, "size": size}
         if shop_id is not None:
-            params["shopIds"] = [shop_id]
+            params["shopIds"] = shop_id
         return await self._request("GET", "/v1/finance/expenses", params=params)
