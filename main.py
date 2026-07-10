@@ -129,6 +129,13 @@ SUBSCRIPTION_REMINDERS = (
 )
 SUBSCRIPTION_REMINDER_DAYS = int(os.getenv("SUBSCRIPTION_REMINDER_DAYS", "1") or "1")
 
+# Печать SKU-этикеток через официальный Uzum Seller OpenAPI.
+# Swagger разрешает до 100 SKU и до 100 этикеток на один SKU.
+BARCODE_MAX_SKUS = min(100, max(1, int(os.getenv("BARCODE_MAX_SKUS", "100") or "100")))
+BARCODE_MAX_AMOUNT_PER_SKU = 100
+# Дополнительный безопасный лимит, чтобы PDF не получился слишком большим для Telegram.
+BARCODE_MAX_TOTAL_LABELS = min(5000, max(1, int(os.getenv("BARCODE_MAX_TOTAL_LABELS", "1000") or "1000")))
+
 def _parse_admin_ids() -> set[int]:
     values: list[str] = []
     for key in ("ADMIN_IDS", "OWNER_TELEGRAM_ID", "OWNER_ID"):
@@ -1357,6 +1364,7 @@ STOCK_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📦 Остатки"), KeyboardButton(text="⚠️ Прогноз остатков")],
         [KeyboardButton(text="🧭 Потерянные"), KeyboardButton(text="📄 Накладные FBO")],
+        [KeyboardButton(text="🏷 Этикетки SKU")],
         [KeyboardButton(text="⬅️ Главное меню")],
     ],
     resize_keyboard=True,
@@ -1367,6 +1375,7 @@ STOCK_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📦 Qoldiq"), KeyboardButton(text="⚠️ Qoldiq prognozi")],
         [KeyboardButton(text="🧭 Yo‘qolganlar"), KeyboardButton(text="📄 FBO yuk xatlari")],
+        [KeyboardButton(text="🏷 SKU etiketkalari")],
         [KeyboardButton(text="⬅️ Asosiy menyu")],
     ],
     resize_keyboard=True,
@@ -1661,6 +1670,10 @@ class ConnectStates(StatesGroup):
 
 class CostImportStates(StatesGroup):
     waiting_for_file = State()
+
+
+class BarcodePrintStates(StatesGroup):
+    waiting_for_items = State()
 
 
 def get_tg_id(message: Message) -> int:
@@ -6771,6 +6784,349 @@ async def button_main_menu(message: Message) -> None:
     await message.answer(tr_user(upsert_from_message(message), "main_menu"), reply_markup=menu_for_message(message))
 
 
+
+# --- Печать SKU-этикеток ---------------------------------------------------
+# Официальные методы Swagger:
+# GET  /v1/product/barcodes/types
+# POST /v1/product/shop/{shopId}/barcodes/print
+
+
+def _barcode_types_from_response(data: Any) -> list[dict[str, Any]]:
+    """Извлекает справочник размеров этикеток из прямого или обёрнутого ответа API."""
+    found: list[dict[str, Any]] = []
+
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            direct = value.get("barcodeLabelTypes")
+            if isinstance(direct, list):
+                for item in direct:
+                    if isinstance(item, dict) and item.get("id") is not None:
+                        found.append(item)
+            for key in ("payload", "data", "result", "content"):
+                nested = value.get(key)
+                if isinstance(nested, (dict, list)):
+                    walk(nested)
+        elif isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    if item.get("id") is not None and any(k in item for k in ("title", "printType")):
+                        found.append(item)
+                    else:
+                        walk(item)
+
+    walk(data)
+    unique: list[dict[str, Any]] = []
+    seen: set[int] = set()
+    for item in found:
+        try:
+            type_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if type_id in seen:
+            continue
+        seen.add(type_id)
+        unique.append(item)
+    return unique
+
+
+def _barcode_type_markup(types: list[dict[str, Any]], lang: str) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for item in types:
+        try:
+            type_id = int(item.get("id"))
+        except (TypeError, ValueError):
+            continue
+        title = str(item.get("title") or item.get("printType") or f"ID {type_id}").strip()
+        print_type = str(item.get("printType") or "").strip()
+        label = title if not print_type or print_type.lower() in title.lower() else f"{title} — {print_type}"
+        rows.append([InlineKeyboardButton(text=f"🏷 {label}"[:60], callback_data=f"barcode_type:{type_id}")])
+    rows.append([
+        InlineKeyboardButton(
+            text="❌ Bekor qilish" if normalize_lang(lang) == "uz" else "❌ Отмена",
+            callback_data="barcode_cancel",
+        )
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _parse_barcode_items(raw: str) -> tuple[list[dict[str, int]], str | None]:
+    """Принимает строки вида `SKU_ID количество`; одинаковые SKU объединяет."""
+    import re
+
+    raw = (raw or "").strip()
+    if not raw:
+        return [], "empty"
+
+    # Поддерживаем несколько строк, а также разделитель `;`.
+    lines = [part.strip() for part in raw.replace(";", "\n").splitlines() if part.strip()]
+    if len(lines) > BARCODE_MAX_SKUS:
+        return [], "too_many_skus"
+
+    merged: dict[int, int] = {}
+    for line in lines:
+        # Допустимо: 123456 10, 123456:10, 123456,10
+        parts = [p for p in re.split(r"[\s,:=]+", line.strip()) if p]
+        if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+            return [], f"bad_line:{line}"
+        sku_id = int(parts[0])
+        amount = int(parts[1])
+        if sku_id <= 0:
+            return [], f"bad_sku:{line}"
+        if amount < 1 or amount > BARCODE_MAX_AMOUNT_PER_SKU:
+            return [], f"bad_amount:{line}"
+        merged[sku_id] = merged.get(sku_id, 0) + amount
+        if merged[sku_id] > BARCODE_MAX_AMOUNT_PER_SKU:
+            return [], f"bad_amount:{line}"
+
+    if len(merged) > BARCODE_MAX_SKUS:
+        return [], "too_many_skus"
+    total = sum(merged.values())
+    if total > BARCODE_MAX_TOTAL_LABELS:
+        return [], f"too_many_total:{total}"
+
+    return [{"skuId": sku_id, "amount": amount} for sku_id, amount in merged.items()], None
+
+
+async def _download_product_barcodes_pdf(
+    client: UzumClient,
+    shop_id: int,
+    data: list[dict[str, int]],
+) -> bytes:
+    """Делает бинарный POST и возвращает PDF; Accept специально меняется на application/pdf."""
+    import httpx
+
+    url = f"{client.base_url}/v1/product/shop/{int(shop_id)}/barcodes/print"
+    headers = dict(getattr(client, "headers", {}) or {})
+    headers["Accept"] = "application/pdf"
+    headers["Content-Type"] = "application/json"
+    timeout = httpx.Timeout(120.0, connect=15.0)
+
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as http:
+        response = await http.post(url, headers=headers, json={"data": data})
+
+    if response.status_code >= 400:
+        try:
+            body: Any = response.json()
+            body_text = json.dumps(body, ensure_ascii=False, default=str)
+        except Exception:
+            body_text = response.text[:1500]
+        raise RuntimeError(f"Uzum API error {response.status_code}: {body_text}")
+
+    content = response.content
+    content_type = (response.headers.get("content-type") or "").lower()
+    if not content:
+        raise RuntimeError("Uzum API вернул пустой файл этикеток")
+    if not content.startswith(b"%PDF") and "application/pdf" not in content_type:
+        preview = content[:1200].decode("utf-8", errors="replace")
+        raise RuntimeError(f"Uzum API вернул не PDF: {preview}")
+    return content
+
+
+@dp.message(Command("labels", "barcodes", "sku_labels"))
+async def sku_labels_start(message: Message, state: FSMContext) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    telegram_id, client, shop_id = req
+    lang = get_user_language(telegram_id)
+    await state.clear()
+
+    try:
+        raw_types = await client._request("GET", "/v1/product/barcodes/types")
+        types = _barcode_types_from_response(raw_types)
+        if not types:
+            text = (
+                "⚠️ Uzum API etiketka o‘lchamlarini qaytarmadi. Keyinroq qayta urinib ko‘ring."
+                if normalize_lang(lang) == "uz"
+                else "⚠️ Uzum API не вернул доступные размеры этикеток. Попробуйте позже."
+            )
+            await message.answer(text, reply_markup=stock_menu_for_message(message))
+            return
+
+        await state.update_data(barcode_shop_id=shop_id)
+        if normalize_lang(lang) == "uz":
+            text = (
+                "🏷 <b>SKU etiketkalarini chop etish</b>\n\n"
+                f"Do‘kon: <code>{shop_id}</code>\n"
+                "Avval etiketka o‘lchamini tanlang 👇"
+            )
+        else:
+            text = (
+                "🏷 <b>Печать этикеток SKU</b>\n\n"
+                f"Магазин: <code>{shop_id}</code>\n"
+                "Сначала выберите размер этикетки 👇"
+            )
+        await message.answer(text, reply_markup=_barcode_type_markup(types, lang))
+    except Exception as error:
+        await state.clear()
+        await send_api_error(message, error)
+
+
+@dp.callback_query(F.data == "barcode_cancel")
+async def sku_labels_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await callback.answer()
+    if callback.message:
+        lang = get_user_language(callback.from_user.id)
+        text = "Amal bekor qilindi." if normalize_lang(lang) == "uz" else "Печать этикеток отменена."
+        await callback.message.answer(text, reply_markup=main_menu_for_user(callback.from_user.id))
+
+
+@dp.callback_query(F.data.startswith("barcode_type:"))
+async def sku_label_type_selected(callback: CallbackQuery, state: FSMContext) -> None:
+    telegram_id = callback.from_user.id
+    lang = get_user_language(telegram_id)
+    try:
+        type_id = int((callback.data or "").split(":", 1)[1])
+    except (IndexError, TypeError, ValueError):
+        await callback.answer("Неверный размер этикетки", show_alert=True)
+        return
+
+    client = get_uzum_for_user(telegram_id)
+    shop_id = db.get_default_shop_id(telegram_id)
+    if client is None or shop_id is None:
+        await state.clear()
+        await callback.answer("Сначала подключите магазин", show_alert=True)
+        return
+    if not has_active_subscription(telegram_id):
+        await state.clear()
+        await callback.answer("Подписка закончилась", show_alert=True)
+        return
+
+    await state.set_state(BarcodePrintStates.waiting_for_items)
+    await state.update_data(barcode_type_id=type_id, barcode_shop_id=int(shop_id))
+    await callback.answer()
+    if not callback.message:
+        return
+
+    if normalize_lang(lang) == "uz":
+        text = (
+            "✅ O‘lcham tanlandi.\n\n"
+            "Har bir qatorda <b>SKU ID va etiketkalar sonini</b> yuboring:\n"
+            "<code>12345678 10</code>\n"
+            "<code>87654321 5</code>\n\n"
+            "Bir SKU uchun 1–100 dona. Bir nechta SKU alohida qatorda.\n"
+            "Bekor qilish: <code>/cancel</code>"
+        )
+    else:
+        text = (
+            "✅ Размер выбран.\n\n"
+            "Отправьте <b>ID SKU и количество этикеток</b>, каждую позицию с новой строки:\n"
+            "<code>12345678 10</code>\n"
+            "<code>87654321 5</code>\n\n"
+            "Для одного SKU — от 1 до 100 этикеток.\n"
+            "Отмена: <code>/cancel</code>"
+        )
+    await callback.message.answer(text)
+
+
+@dp.message(BarcodePrintStates.waiting_for_items)
+async def sku_label_items_received(message: Message, state: FSMContext) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    items, error = _parse_barcode_items(message.text or "")
+    if error:
+        if normalize_lang(lang) == "uz":
+            if error == "too_many_skus":
+                reason = f"Bir so‘rovda ko‘pi bilan {BARCODE_MAX_SKUS} ta SKU mumkin."
+            elif error.startswith("too_many_total:"):
+                total = error.split(":", 1)[1]
+                reason = f"Jami {total} ta etiketka juda ko‘p. Bir martada ko‘pi bilan {BARCODE_MAX_TOTAL_LABELS} ta yuboring."
+            elif error.startswith("bad_amount:"):
+                reason = "Har bir SKU uchun son 1 dan 100 gacha bo‘lishi kerak."
+            else:
+                reason = "Format noto‘g‘ri. Har qatorda faqat SKU ID va son bo‘lishi kerak."
+            text = (
+                f"⚠️ {reason}\n\n"
+                "To‘g‘ri misol:\n<code>12345678 10\n87654321 5</code>\n\n"
+                "Bekor qilish: <code>/cancel</code>"
+            )
+        else:
+            if error == "too_many_skus":
+                reason = f"За один запрос можно отправить максимум {BARCODE_MAX_SKUS} SKU."
+            elif error.startswith("too_many_total:"):
+                total = error.split(":", 1)[1]
+                reason = f"Всего указано {total} этикеток. Отправьте не более {BARCODE_MAX_TOTAL_LABELS} за один раз."
+            elif error.startswith("bad_amount:"):
+                reason = "Количество для каждого SKU должно быть от 1 до 100."
+            else:
+                reason = "Неверный формат. В каждой строке должны быть только ID SKU и количество."
+            text = (
+                f"⚠️ {reason}\n\n"
+                "Правильный пример:\n<code>12345678 10\n87654321 5</code>\n\n"
+                "Отмена: <code>/cancel</code>"
+            )
+        await message.answer(text)
+        return
+
+    saved = await state.get_data()
+    try:
+        barcode_type_id = int(saved.get("barcode_type_id"))
+    except (TypeError, ValueError):
+        await state.clear()
+        await message.answer(
+            "Размер этикетки потерян. Запустите <code>/labels</code> ещё раз.",
+            reply_markup=stock_menu_for_message(message),
+        )
+        return
+
+    req = await require_connection(message)
+    if req is None:
+        await state.clear()
+        return
+    _, client, shop_id = req
+    payload = [
+        {
+            "skuId": int(item["skuId"]),
+            "amount": int(item["amount"]),
+            "barcodeTypeId": barcode_type_id,
+        }
+        for item in items
+    ]
+    total_labels = sum(int(item["amount"]) for item in items)
+
+    wait_text = (
+        f"⏳ {total_labels} ta etiketkali PDF tayyorlanmoqda..."
+        if normalize_lang(lang) == "uz"
+        else f"⏳ Формирую PDF на {total_labels} этикеток..."
+    )
+    await message.answer(wait_text)
+
+    path: str | None = None
+    try:
+        pdf = await _download_product_barcodes_pdf(client, shop_id, payload)
+        with tempfile.NamedTemporaryFile(prefix=f"uzum_labels_{shop_id}_", suffix=".pdf", delete=False) as tmp:
+            tmp.write(pdf)
+            path = tmp.name
+
+        caption = (
+            f"🏷 SKU etiketkalari tayyor\nDo‘kon: <code>{shop_id}</code>\nSKU: <b>{len(items)}</b> | Etiketka: <b>{total_labels}</b>"
+            if normalize_lang(lang) == "uz"
+            else f"🏷 Этикетки SKU готовы\nМагазин: <code>{shop_id}</code>\nSKU: <b>{len(items)}</b> | Этикеток: <b>{total_labels}</b>"
+        )
+        await message.answer_document(
+            FSInputFile(path, filename=f"uzum_sku_labels_{shop_id}.pdf"),
+            caption=caption,
+            reply_markup=stock_menu_for_message(message),
+        )
+        await state.clear()
+    except Exception as error:
+        # Оставляем выбранный размер и состояние: пользователь может исправить SKU и повторить.
+        await send_api_error(message, error)
+    finally:
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+@dp.message(F.text == "🏷 Этикетки SKU")
+@dp.message(F.text == "🏷 SKU etiketkalari")
+async def button_sku_labels(message: Message, state: FSMContext) -> None:
+    await sku_labels_start(message, state)
+
+
 @dp.message(F.text == "💰 Balans")
 @dp.message(F.text == "💰 Баланс")
 async def button_balance(message: Message) -> None:
@@ -6847,6 +7203,7 @@ async def button_help(message: Message) -> None:
             "Foydali buyruqlar:\n"
             "• <code>/api_token</code> — API-kalit bo‘yicha yozma yo‘riqnoma\n"
             "• <code>/check</code> — ulanishni tekshirish\n"
+            "• <code>/labels</code> — SKU etiketkalarini PDF qilib olish\n"
             "• <code>/support</code> — yordam va administrator bilan aloqa"
         )
     else:
@@ -6859,6 +7216,7 @@ async def button_help(message: Message) -> None:
             "Полезные команды:\n"
             "• <code>/api_token</code> — текстовая инструкция по API-ключу\n"
             "• <code>/check</code> — проверить подключение\n"
+            "• <code>/labels</code> — получить PDF с этикетками SKU\n"
             "• <code>/support</code> — поддержка и связь с администратором"
         )
     await message.answer(text, reply_markup=help_links_markup(lang) or menu_for_message(message))
@@ -9129,6 +9487,7 @@ def translate_runtime_text_to_uz(text: str) -> str:
     return text
 
 async def main() -> None:
+    logging.info("SKU_LABELS_INTERFACE_LOADED: official barcode types + PDF SKU labels")
     logging.info("INTUITIVE_ATTENTION_INTERFACE_LOADED: simple sections + attention report + full stock list")
     init_language_tables()
     await bot.delete_webhook(drop_pending_updates=True)
@@ -9153,4 +9512,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
