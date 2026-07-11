@@ -87,14 +87,14 @@ STOCK_CHANGE_CHECK_INTERVAL_SECONDS = int(
     os.getenv("STOCK_CHANGE_CHECK_INTERVAL_SECONDS", "900") or "900"
 )
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "3") or "3")
-SUBSCRIPTION_PRICE_TEXT = os.getenv("SUBSCRIPTION_PRICE_TEXT", "250 000 сум / 1 месяц").strip()
+SUBSCRIPTION_PRICE_TEXT = os.getenv("SUBSCRIPTION_PRICE_TEXT", "300 000 сум / 1 месяц").strip()
 PAYMENT_TEXT = os.getenv(
     "PAYMENT_TEXT",
     "Нажмите кнопку ниже, напишите администратору и отправьте чек. После проверки доступ будет продлён."
 ).strip()
 SUBSCRIPTION_PLANS_TEXT = os.getenv(
     "SUBSCRIPTION_PLANS_TEXT",
-    "1 месяц — 250 000 сум\n3 месяца — 650 000 сум\n6 месяцев — 1 200 000 сум\n\nБез ограничений по количеству магазинов продавца"
+    "1 месяц — 300 000 сум\n3 месяца — 800 000 сум\n6 месяцев — 1 500 000 сум\n\nБез ограничений по количеству магазинов продавца"
 ).strip()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "azmt_one").strip().lstrip("@")
 ADMIN_CONTACT_URL = os.getenv("ADMIN_CONTACT_URL", "").strip()
@@ -4861,9 +4861,9 @@ async def admin_panel(message: Message) -> None:
         f"💰 Оплаты сегодня: <b>{money_today}</b> сум\n"
         f"💰 Оплаты за 30 дней: <b>{money_30}</b> сум\n\n"
         "Быстрые команды:\n"
-        "• <code>/paid1 ID</code> — 1 месяц / 250 000 сум\n"
-        "• <code>/paid3 ID</code> — 3 месяца / 650 000 сум\n"
-        "• <code>/paid6 ID</code> — 6 месяцев / 1 200 000 сум\n"
+        "• <code>/paid1 ID</code> — 1 месяц / 300 000 сум\n"
+        "• <code>/paid3 ID</code> — 3 месяца / 800 000 сум\n"
+        "• <code>/paid6 ID</code> — 6 месяцев / 1 500 000 сум\n"
         "• <code>/expiring</code> — кто скоро заканчивается\n"
         "• <code>/backup_db</code> — скачать базу",
         reply_markup=admin_menu_for_message(message),
@@ -5048,7 +5048,7 @@ async def admin_paid(message: Message) -> None:
     if len(parts) < 3 or not parts[0].isdigit() or not parts[1].replace("_", "").isdigit() or not parts[2].isdigit():
         await message.answer(
             "Напишите так: <code>/paid TELEGRAM_ID СУММА ДНИ комментарий</code>\n"
-            "Пример: <code>/paid 123456789 250000 30 чек Click</code>",
+            "Пример: <code>/paid 123456789 300000 30 чек Click</code>",
             reply_markup=menu_for_message(message),
         )
         return
@@ -5091,8 +5091,8 @@ async def admin_paid_1_month(message: Message) -> None:
         return
     target = int(arg[0])
     new_until = extend_subscription_days(target, 30)
-    payment_id = record_payment(target, 250000, 30, admin_id, "1 месяц")
-    await message.answer(f"✅ Оплата #{payment_id}: 250 000 сум. Доступ для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=menu_for_message(message))
+    payment_id = record_payment(target, 300000, 30, admin_id, "1 месяц")
+    await message.answer(f"✅ Оплата #{payment_id}: 300 000 сум. Доступ для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=menu_for_message(message))
     try:
         await bot.send_message(target, f"✅ Оплата подтверждена. Подписка продлена на 1 месяц. Доступ до: <b>{_fmt_dt(new_until)}</b>", reply_markup=main_menu_for_user(target))
     except Exception:
@@ -5110,8 +5110,8 @@ async def admin_paid_3_months(message: Message) -> None:
         return
     target = int(arg[0])
     new_until = extend_subscription_days(target, 90)
-    payment_id = record_payment(target, 650000, 90, admin_id, "3 месяца")
-    await message.answer(f"✅ Оплата #{payment_id}: 650 000 сум. Доступ для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=menu_for_message(message))
+    payment_id = record_payment(target, 800000, 90, admin_id, "3 месяца")
+    await message.answer(f"✅ Оплата #{payment_id}: 800 000 сум. Доступ для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=menu_for_message(message))
     try:
         await bot.send_message(target, f"✅ Оплата подтверждена. Подписка продлена на 3 месяца. Доступ до: <b>{_fmt_dt(new_until)}</b>", reply_markup=main_menu_for_user(target))
     except Exception:
@@ -5129,8 +5129,8 @@ async def admin_paid_6_months(message: Message) -> None:
         return
     target = int(arg[0])
     new_until = extend_subscription_days(target, 180)
-    payment_id = record_payment(target, 1200000, 180, admin_id, "6 месяцев")
-    await message.answer(f"✅ Оплата #{payment_id}: 1 200 000 сум. Доступ для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=menu_for_message(message))
+    payment_id = record_payment(target, 1500000, 180, admin_id, "6 месяцев")
+    await message.answer(f"✅ Оплата #{payment_id}: 1 500 000 сум. Доступ для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=menu_for_message(message))
     try:
         await bot.send_message(target, f"✅ Оплата подтверждена. Подписка продлена на 6 месяцев. Доступ до: <b>{_fmt_dt(new_until)}</b>", reply_markup=main_menu_for_user(target))
     except Exception:
@@ -9088,7 +9088,7 @@ def translate_runtime_text_to_uz(text: str) -> str:
         ("1 месяц", "1 oy"),
         ("3 месяца", "3 oy"),
         ("6 месяцев", "6 oy"),
-        ("1 oy — 250 000 so‘m | 3 oy — 650 000 so‘m | 6 oy — 1 200 000 so‘m | Без ограничений по количеству магазинов", "1 oy — 250 000 so‘m | 3 oy — 650 000 so‘m | 6 oy — 1 200 000 so‘m | Do‘konlar soni cheklanmagan"),
+        ("1 oy — 300 000 so‘m | 3 oy — 800 000 so‘m | 6 oy — 1 500 000 so‘m | Без ограничений по количеству магазинов", "1 oy — 300 000 so‘m | 3 oy — 800 000 so‘m | 6 oy — 1 500 000 so‘m | Do‘konlar soni cheklanmagan"),
         ("Без ограничений по количеству магазинов", "Do‘konlar soni cheklanmagan"),
         ("Без ограничений по количеству do‘konlar", "Do‘konlar soni cheklanmagan"),
         ("To‘lov uchun administratorga yozing:", "To‘lov uchun administratorga yozing:"),
