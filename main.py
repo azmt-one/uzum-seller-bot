@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import hmac
 import json
 import logging
 import os
 import tempfile
+import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from html import escape
 from urllib.parse import urlencode
@@ -99,6 +104,12 @@ SUBSCRIPTION_PLANS_TEXT = os.getenv(
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "azmt_one").strip().lstrip("@")
 ADMIN_CONTACT_URL = os.getenv("ADMIN_CONTACT_URL", "").strip()
 VIDEO_INSTRUCTION_URL = os.getenv("VIDEO_INSTRUCTION_URL", "https://t.me/uzum_assist_bot/2").strip()
+
+# Telegram ↔ веб-кабинет.
+# WEB_SYNC_SECRET должен полностью совпадать с BOT_SYNC_SECRET на сайте.
+WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip().rstrip("/")
+WEB_SYNC_SECRET = os.getenv("WEB_SYNC_SECRET", "").strip()
+WEB_SYNC_TIMEOUT_SECONDS = max(5, min(60, int(os.getenv("WEB_SYNC_TIMEOUT_SECONDS", "25") or "25")))
 
 # Подключение через сотрудника было экспериментом и отключено.
 # Основной официальный способ: API-ключ продавца через /connect.
@@ -1245,6 +1256,7 @@ def language_markup() -> InlineKeyboardMarkup:
 
 MAIN_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🌐 Веб-кабинет")],
         [KeyboardButton(text="🔌 Подключить"), KeyboardButton(text="🎥 Видеоинструкция")],
         [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
         [KeyboardButton(text="ℹ️ Помощь")],
@@ -1255,6 +1267,7 @@ MAIN_MENU_RU = ReplyKeyboardMarkup(
 
 MAIN_MENU_RU_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🌐 Веб-кабинет")],
         [KeyboardButton(text="🔌 Подключить"), KeyboardButton(text="🎥 Видеоинструкция")],
         [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
         [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="👑 Админ")],
@@ -1265,6 +1278,7 @@ MAIN_MENU_RU_ADMIN = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🌐 Veb-kabinet")],
         [KeyboardButton(text="🔌 Ulash"), KeyboardButton(text="🎥 API ulash videosi")],
         [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
         [KeyboardButton(text="ℹ️ Yordam")],
@@ -1275,6 +1289,7 @@ MAIN_MENU_UZ = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🌐 Veb-kabinet")],
         [KeyboardButton(text="🔌 Ulash"), KeyboardButton(text="🎥 API ulash videosi")],
         [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
         [KeyboardButton(text="ℹ️ Yordam"), KeyboardButton(text="👑 Admin")],
@@ -1286,6 +1301,7 @@ MAIN_MENU_UZ_ADMIN = ReplyKeyboardMarkup(
 # Главное меню после подключения API: простая структура по разделам.
 MAIN_MENU_RU_CONNECTED = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🌐 Веб-кабинет")],
         [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
         [KeyboardButton(text="🧠 Что проверить"), KeyboardButton(text="🔔 Уведомления")],
         [KeyboardButton(text="📊 Отчёты"), KeyboardButton(text="🏪 Магазины")],
@@ -1298,6 +1314,7 @@ MAIN_MENU_RU_CONNECTED = ReplyKeyboardMarkup(
 
 MAIN_MENU_RU_CONNECTED_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🌐 Веб-кабинет")],
         [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
         [KeyboardButton(text="🧠 Что проверить"), KeyboardButton(text="🔔 Уведомления")],
         [KeyboardButton(text="📊 Отчёты"), KeyboardButton(text="🏪 Магазины")],
@@ -1310,6 +1327,7 @@ MAIN_MENU_RU_CONNECTED_ADMIN = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ_CONNECTED = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🌐 Veb-kabinet")],
         [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
         [KeyboardButton(text="🧠 Tekshirish"), KeyboardButton(text="🔔 Xabarnomalar")],
         [KeyboardButton(text="📊 Hisobotlar"), KeyboardButton(text="🏪 Do‘konlar")],
@@ -1322,6 +1340,7 @@ MAIN_MENU_UZ_CONNECTED = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ_CONNECTED_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🌐 Veb-kabinet")],
         [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
         [KeyboardButton(text="🧠 Tekshirish"), KeyboardButton(text="🔔 Xabarnomalar")],
         [KeyboardButton(text="📊 Hisobotlar"), KeyboardButton(text="🏪 Do‘konlar")],
@@ -2074,6 +2093,246 @@ async def set_language_callback(callback: CallbackQuery) -> None:
     await callback.answer("OK")
     if callback.message:
         await callback.message.answer(tr(lang, "language_set"), reply_markup=main_menu_for_user(telegram_id))
+
+
+
+# ---------------------------------------------------------------------------
+# Telegram ↔ Seller Assistant Web (встроенная интеграция)
+# ---------------------------------------------------------------------------
+def _web_row_value(row: Any, name: str, default: Any = None) -> Any:
+    if row is None:
+        return default
+    if isinstance(row, dict):
+        return row.get(name, default)
+    try:
+        return row[name]
+    except Exception:
+        return getattr(row, name, default)
+
+
+def _web_iso(value: Any) -> str | None:
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return str(value)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat()
+
+
+def _web_subscription_payload(telegram_id: int) -> tuple[str, str | None]:
+    try:
+        subscription = get_subscription_row(telegram_id)
+    except Exception:
+        logging.exception("WEB_BRIDGE: не удалось прочитать подписку")
+        subscription = None
+    if not subscription:
+        return "unknown", None
+
+    blocked = bool(int(_web_row_value(subscription, "blocked", 0) or 0))
+    parsed: list[datetime] = []
+    for field in ("subscription_until", "trial_until"):
+        value = _web_row_value(subscription, field)
+        if not value:
+            continue
+        try:
+            dt = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            parsed.append(dt.astimezone(timezone.utc))
+        except (TypeError, ValueError):
+            continue
+
+    until = max(parsed) if parsed else None
+    if blocked:
+        state = "blocked"
+    elif until and until > datetime.now(timezone.utc):
+        state = "active"
+    else:
+        state = "expired"
+    return state, _web_iso(until)
+
+
+def _web_cost_rows(telegram_id: int, shop_id: int | None) -> list[dict[str, Any]]:
+    if not shop_id:
+        return []
+    try:
+        values = get_unit_cost_map(telegram_id, int(shop_id)) or {}
+    except Exception:
+        logging.exception("WEB_BRIDGE: не удалось прочитать себестоимость")
+        return []
+
+    rows: list[dict[str, Any]] = []
+    if isinstance(values, dict):
+        for sku, row in values.items():
+            rows.append(
+                {
+                    "sku_id": str(sku),
+                    "product_name": str(_web_row_value(row, "title", "") or ""),
+                    "unit_cost": float(_web_row_value(row, "cost", 0) or 0),
+                }
+            )
+            if len(rows) >= 3000:
+                break
+    return rows
+
+
+def _web_payload_for(message: Message, *, sensitive: bool) -> dict[str, Any]:
+    if not message.from_user:
+        raise RuntimeError("Telegram не передал данные пользователя")
+
+    telegram_id = int(message.from_user.id)
+    db.upsert_user(telegram_id, message.from_user.username, message.from_user.first_name)
+    try:
+        user = db.get_user(telegram_id)
+    except Exception:
+        logging.exception("WEB_BRIDGE: не удалось прочитать пользователя")
+        user = None
+
+    locale = "uz" if get_user_language(telegram_id).lower().startswith("uz") else "ru"
+    subscription_state, subscription_until = _web_subscription_payload(telegram_id)
+    default_shop_id = _web_row_value(user, "default_shop_id")
+    default_shop_id = int(default_shop_id) if str(default_shop_id or "").isdigit() else None
+
+    payload: dict[str, Any] = {
+        "telegram_id": telegram_id,
+        "first_name": message.from_user.first_name or "",
+        "last_name": message.from_user.last_name or "",
+        "username": message.from_user.username or "",
+        "locale": locale,
+        "subscription_until": subscription_until,
+        "subscription_state": subscription_state,
+        "default_shop_id": default_shop_id,
+        "iat": int(time.time()),
+    }
+
+    if sensitive:
+        encrypted_token = _web_row_value(user, "uzum_token_encrypted", "") or _web_row_value(user, "encrypted_token", "")
+        # Fallback for Database implementations that expose a dedicated getter.
+        if not encrypted_token and hasattr(db, "get_encrypted_token"):
+            try:
+                encrypted_token = db.get_encrypted_token(telegram_id) or ""
+            except Exception:
+                logging.exception("WEB_BRIDGE: не удалось прочитать зашифрованный Uzum-токен")
+        payload["encrypted_token"] = str(encrypted_token or "")
+        payload["costs"] = _web_cost_rows(telegram_id, default_shop_id)
+
+    return payload
+
+
+def _web_validate_settings() -> None:
+    if not WEB_APP_URL:
+        raise RuntimeError("добавьте WEB_APP_URL в переменные BotHost бота")
+    if not WEB_APP_URL.startswith("https://"):
+        raise RuntimeError("WEB_APP_URL должен начинаться с https://")
+    if len(WEB_SYNC_SECRET) < 32:
+        raise RuntimeError("WEB_SYNC_SECRET должен содержать не менее 32 символов")
+
+
+def _web_signed_url(message: Message) -> str:
+    _web_validate_settings()
+    raw = json.dumps(
+        _web_payload_for(message, sensitive=False),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    payload = base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+    signature = hmac.new(
+        WEB_SYNC_SECRET.encode("utf-8"),
+        payload.encode("ascii"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{WEB_APP_URL}/auth/telegram/bridge?payload={payload}&sig={signature}"
+
+
+def _web_sync_request(payload: dict[str, Any]) -> None:
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    signature = hmac.new(WEB_SYNC_SECRET.encode("utf-8"), raw, hashlib.sha256).hexdigest()
+    request = urllib.request.Request(
+        f"{WEB_APP_URL}/api/integrations/telegram/sync",
+        data=raw,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-Seller-Signature": signature,
+            "User-Agent": "uzum-seller-assistant-bot/builtin-web-bridge",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=WEB_SYNC_TIMEOUT_SECONDS) as response:
+            body = response.read()
+            if response.status >= 300:
+                raise RuntimeError(f"сайт вернул HTTP {response.status}: {body[:300].decode('utf-8', 'replace')}")
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read(500).decode("utf-8", "replace")
+        except Exception:
+            detail = ""
+        raise RuntimeError(f"сайт вернул HTTP {exc.code}: {detail or exc.reason}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"сайт недоступен: {exc.reason}") from exc
+
+
+async def sync_to_web_cabinet(message: Message) -> None:
+    _web_validate_settings()
+    await asyncio.to_thread(_web_sync_request, _web_payload_for(message, sensitive=True))
+
+
+def web_cabinet_markup(message: Message) -> InlineKeyboardMarkup:
+    locale = _web_payload_for(message, sensitive=False).get("locale")
+    label = "🌐 Veb-kabinetni ochish" if locale == "uz" else "🌐 Открыть веб-кабинет"
+    # URL-кнопка надёжнее WebApp-кнопки: не требует предварительной настройки
+    # домена через BotFather, но всё равно выполняет безопасный вход через Telegram.
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text=label, url=_web_signed_url(message))]]
+    )
+
+
+@dp.message(Command("site", "web", "cabinet"))
+async def open_web_cabinet_command(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    locale = get_user_language(telegram_id)
+    try:
+        # Сначала передаём сайт-сайту зашифрованный Uzum-токен, подписку,
+        # выбранный магазин и себестоимость. В URL секретные данные не попадают.
+        await sync_to_web_cabinet(message)
+        markup = web_cabinet_markup(message)
+    except Exception as exc:
+        logging.exception("WEB_BRIDGE: ошибка синхронизации")
+        if locale == "uz":
+            await message.answer(
+                f"⚠️ Veb-kabinet hozircha sozlanmagan:\n<code>{escape(str(exc))}</code>"
+            )
+        else:
+            await message.answer(
+                f"⚠️ Веб-кабинет пока не настроен:\n<code>{escape(str(exc))}</code>"
+            )
+        return
+
+    if locale == "uz":
+        text = (
+            "🌐 <b>Seller Assistant veb-kabineti</b>\n\n"
+            "Bot va sayt bitta akkauntda ishlaydi. Til, obuna, do‘kon, "
+            "Uzum ulanishi va tannarxlar sinxronlandi."
+        )
+    else:
+        text = (
+            "🌐 <b>Веб-кабинет Seller Assistant</b>\n\n"
+            "Бот и сайт работают под одним аккаунтом. Язык, подписка, магазин, "
+            "подключение Uzum и себестоимость синхронизированы."
+        )
+    await message.answer(text, reply_markup=markup)
+
+
+@dp.message(F.text.in_({"🌐 Веб-кабинет", "🌐 Открыть сайт", "🌐 Veb-kabinet"}))
+async def open_web_cabinet_button(message: Message) -> None:
+    await open_web_cabinet_command(message)
 
 
 @dp.message(Command("start", "help"))
@@ -9512,3 +9771,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
