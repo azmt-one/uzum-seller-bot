@@ -30,7 +30,6 @@ from openpyxl.styles import Alignment, Font, PatternFill
 
 from db import Database, TokenCipher
 from formatters import (
-    clean_num,
     compact_json_preview,
     excel_value,
     extract_items,
@@ -110,6 +109,7 @@ VIDEO_INSTRUCTION_URL = os.getenv("VIDEO_INSTRUCTION_URL", "https://t.me/uzum_as
 WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip().rstrip("/")
 WEB_SYNC_SECRET = os.getenv("WEB_SYNC_SECRET", "").strip()
 WEB_SYNC_TIMEOUT_SECONDS = max(5, min(60, int(os.getenv("WEB_SYNC_TIMEOUT_SECONDS", "25") or "25")))
+BOT_VERSION = "3.2.0-release-candidate"
 
 # Подключение через сотрудника было экспериментом и отключено.
 # Основной официальный способ: API-ключ продавца через /connect.
@@ -1598,7 +1598,7 @@ def admin_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
 
 
 # Переопределяем тексты подписки после инициализации языка, чтобы /my_subscription был на выбранном языке.
-def subscription_status_text(telegram_id: int) -> str:
+def subscription_status_text(telegram_id: int) -> str:  # noqa: F811
     row = ensure_subscription(telegram_id)
     lang = get_user_language(telegram_id)
     if is_admin(telegram_id):
@@ -1616,7 +1616,7 @@ def subscription_status_text(telegram_id: int) -> str:
     return "⛔ Obuna muddati tugagan" if lang == "uz" else "⛔ Подписка закончилась"
 
 
-def subscription_full_text(telegram_id: int) -> str:
+def subscription_full_text(telegram_id: int) -> str:  # noqa: F811
     row = ensure_subscription(telegram_id)
     status = subscription_status_text(telegram_id)
     lang = get_user_language(telegram_id)
@@ -2221,7 +2221,16 @@ def _web_payload_for(message: Message, *, sensitive: bool) -> dict[str, Any]:
                 encrypted_token = db.get_encrypted_token(telegram_id) or ""
             except Exception:
                 logging.exception("WEB_BRIDGE: не удалось прочитать зашифрованный Uzum-токен")
-        payload["encrypted_token"] = str(encrypted_token or "")
+        # The sync request is HTTPS + HMAC signed. Decrypt locally and let the
+        # website encrypt with its own ENCRYPTION_KEY. This removes the fragile
+        # requirement that the bot and website use the same Fernet key.
+        if encrypted_token:
+            try:
+                payload["uzum_token"] = cipher.decrypt(str(encrypted_token))
+            except Exception as exc:
+                raise RuntimeError("не удалось расшифровать сохранённый Uzum API-ключ") from exc
+        else:
+            payload["uzum_token"] = ""
         payload["costs"] = _web_cost_rows(telegram_id, default_shop_id)
 
     return payload
@@ -2294,6 +2303,45 @@ def web_cabinet_markup(message: Message) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text=label, url=_web_signed_url(message))]]
     )
+
+
+@dp.message(Command("diagnostics"))
+async def diagnostics_command(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    if not is_admin(telegram_id):
+        await message.answer(tr_user(telegram_id, "admin_only"))
+        return
+
+    db_path = Path(DB_PATH).expanduser()
+    parent = db_path.parent if str(db_path.parent) else Path(".")
+    checks: list[tuple[str, bool, str]] = []
+    try:
+        with db.connect() as conn:
+            conn.execute("SELECT 1").fetchone()
+        checks.append(("База данных", True, str(db_path)))
+    except Exception as exc:
+        checks.append(("База данных", False, type(exc).__name__))
+    checks.append(("Папка базы доступна для записи", parent.exists() and os.access(parent, os.W_OK), str(parent)))
+    checks.append(("Шифрование Uzum-токенов", bool(ENCRYPTION_KEY), "настроено" if ENCRYPTION_KEY else "ENCRYPTION_KEY отсутствует"))
+    checks.append(("Адрес веб-кабинета", WEB_APP_URL.startswith("https://"), WEB_APP_URL or "WEB_APP_URL отсутствует"))
+    checks.append(("Секрет синхронизации", len(WEB_SYNC_SECRET) >= 32, "настроен" if len(WEB_SYNC_SECRET) >= 32 else "WEB_SYNC_SECRET короче 32 символов"))
+    checks.append(("Уведомления о продажах", SALE_NOTIFICATIONS, f"интервал {SALE_CHECK_INTERVAL_SECONDS} сек."))
+    checks.append(("Уведомления об остатках", LOW_STOCK_NOTIFICATIONS, f"интервал {LOW_STOCK_CHECK_INTERVAL_SECONDS} сек."))
+
+    failures = sum(1 for _, ok, _ in checks if not ok)
+    lines = [
+        "🩺 <b>Диагностика Seller Assistant Bot</b>",
+        "",
+        f"Версия: <code>{BOT_VERSION}</code>",
+        f"Статус: {'✅ готов' if failures == 0 else f'⚠️ проблем: {failures}'}",
+        "",
+    ]
+    for name, ok, detail in checks:
+        lines.append(f"{'✅' if ok else '❌'} <b>{escape(name)}</b> — {escape(detail)}")
+    if WEB_SYNC_SECRET:
+        lines.extend(["", f"Отпечаток синхронизации: <code>{hashlib.sha256(WEB_SYNC_SECRET.encode()).hexdigest()[:12]}</code>"])
+    lines.append("\nСекреты и API-ключи в отчёте не показываются.")
+    await message.answer("\n".join(lines))
 
 
 @dp.message(Command("site", "web", "cabinet"))
@@ -3036,7 +3084,7 @@ async def lowstock(message: Message) -> None:
             return
 
         items = [format_sku_stock_line(row, mode="all") for row in low]
-        title = f"⚠️ <b>Kam qoldiqdagi tovarlar</b>" if lang == "uz" else f"⚠️ <b>Низкие остатки</b>"
+        title = "⚠️ <b>Kam qoldiqdagi tovarlar</b>" if lang == "uz" else "⚠️ <b>Низкие остатки</b>"
         summary = [
             f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
             f"📉 Chegara: ≤ <b>{threshold}</b> dona" if lang == "uz" else f"📉 Порог: ≤ <b>{threshold}</b> шт.",
@@ -5135,7 +5183,6 @@ async def admin_panel(message: Message) -> None:
 async def check_connection(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     ensure_subscription(telegram_id)
-    user = db.get_user(telegram_id)
     client = get_uzum_for_user(telegram_id)
     shop_id = db.get_default_shop_id(telegram_id)
     lines = [
@@ -8863,7 +8910,7 @@ def connected_watch_groups() -> list[dict[str, Any]]:
     return list(groups.values())
 
 
-async def check_new_orders_once() -> None:
+async def check_new_orders_once() -> None:  # noqa: F811
     for group in connected_watch_groups():
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
@@ -8916,7 +8963,7 @@ async def check_new_orders_once() -> None:
         await asyncio.sleep(0.5)
 
 
-async def check_low_stock_once() -> None:
+async def check_low_stock_once() -> None:  # noqa: F811
     threshold = max(0, LOW_STOCK_THRESHOLD)
     for group in connected_watch_groups():
         shop_id = int(group["shop_id"])
@@ -8970,7 +9017,7 @@ async def check_low_stock_once() -> None:
         await asyncio.sleep(0.5)
 
 
-async def check_out_of_stock_once() -> None:
+async def check_out_of_stock_once() -> None:  # noqa: F811
     for group in connected_watch_groups():
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
@@ -9022,7 +9069,7 @@ async def check_out_of_stock_once() -> None:
         await asyncio.sleep(0.5)
 
 
-async def check_new_sales_once() -> None:
+async def check_new_sales_once() -> None:  # noqa: F811
     date_from, date_to = _today_range_ms()
     for group in connected_watch_groups():
         shop_id = int(group["shop_id"])
@@ -9083,7 +9130,7 @@ async def check_new_sales_once() -> None:
         await asyncio.sleep(0.5)
 
 
-async def check_stock_change_once() -> None:
+async def check_stock_change_once() -> None:  # noqa: F811
     for group in connected_watch_groups():
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
@@ -9181,7 +9228,6 @@ def build_cancel_message(item: dict[str, Any], shop_id: int | None = None, lang:
     unit_price = _deep_pick_number(item, ("sellPrice", "soldPrice", "price", "skuPrice", "productPrice"))
     status = escape(_finance_status(item))
     order_id = escape(_finance_order_id(item))
-    sale_id = escape(_finance_sale_id(item))
     date_text = escape(_format_finance_date(_finance_date_value(item)))
 
     if lang == "uz":
@@ -9215,7 +9261,7 @@ def build_cancel_message(item: dict[str, Any], shop_id: int | None = None, lang:
 
 
 # Переопределяем watcher продаж: теперь он присылает и новые продажи, и новые отмены.
-async def check_new_sales_once() -> None:
+async def check_new_sales_once() -> None:  # noqa: F811
     date_from, date_to = _today_range_ms()
     for group in connected_watch_groups():
         shop_id = int(group["shop_id"])
@@ -9817,6 +9863,7 @@ def translate_runtime_text_to_uz(text: str) -> str:
     return text
 
 async def main() -> None:
+    logging.info("Seller Assistant Bot version=%s", BOT_VERSION)
     logging.info("SKU_LABELS_INTERFACE_LOADED: official barcode types + PDF SKU labels")
     logging.info("INTUITIVE_ATTENTION_INTERFACE_LOADED: simple sections + attention report + full stock list")
     init_language_tables()
