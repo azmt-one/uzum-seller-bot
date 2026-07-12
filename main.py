@@ -109,7 +109,7 @@ VIDEO_INSTRUCTION_URL = os.getenv("VIDEO_INSTRUCTION_URL", "https://t.me/uzum_as
 WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip().rstrip("/")
 WEB_SYNC_SECRET = os.getenv("WEB_SYNC_SECRET", "").strip()
 WEB_SYNC_TIMEOUT_SECONDS = max(5, min(60, int(os.getenv("WEB_SYNC_TIMEOUT_SECONDS", "25") or "25")))
-BOT_VERSION = "3.2.0-release-candidate"
+BOT_VERSION = "3.2.1-admin-sync-hotfix"
 
 # Подключение через сотрудника было экспериментом и отключено.
 # Основной официальный способ: API-ключ продавца через /connect.
@@ -2128,6 +2128,10 @@ def _web_iso(value: Any) -> str | None:
 
 
 def _web_subscription_payload(telegram_id: int) -> tuple[str, str | None]:
+    # Administrators must never be blocked by trial/subscription dates.
+    # The website receives this state through an HMAC-signed bridge payload.
+    if is_admin(telegram_id):
+        return "active", None
     try:
         subscription = get_subscription_row(telegram_id)
     except Exception:
@@ -2209,6 +2213,7 @@ def _web_payload_for(message: Message, *, sensitive: bool) -> dict[str, Any]:
         "locale": locale,
         "subscription_until": subscription_until,
         "subscription_state": subscription_state,
+        "is_admin": is_admin(telegram_id),
         "default_shop_id": default_shop_id,
         "iat": int(time.time()),
     }
@@ -9889,5 +9894,6 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
