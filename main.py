@@ -1256,10 +1256,10 @@ def language_markup() -> InlineKeyboardMarkup:
 
 MAIN_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🌐 Веб-кабинет")],
         [KeyboardButton(text="🔌 Подключить"), KeyboardButton(text="🎥 Видеоинструкция")],
         [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
         [KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="🌐 Веб-кабинет")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Сначала подключите магазин",
@@ -1267,10 +1267,10 @@ MAIN_MENU_RU = ReplyKeyboardMarkup(
 
 MAIN_MENU_RU_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🌐 Веб-кабинет")],
         [KeyboardButton(text="🔌 Подключить"), KeyboardButton(text="🎥 Видеоинструкция")],
         [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
         [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="👑 Админ")],
+        [KeyboardButton(text="🌐 Веб-кабинет")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Сначала подключите магазин",
@@ -1278,10 +1278,10 @@ MAIN_MENU_RU_ADMIN = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🌐 Veb-kabinet")],
         [KeyboardButton(text="🔌 Ulash"), KeyboardButton(text="🎥 API ulash videosi")],
         [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
         [KeyboardButton(text="ℹ️ Yordam")],
+        [KeyboardButton(text="🌐 Veb-kabinet")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Avval do‘konni ulang",
@@ -1289,10 +1289,10 @@ MAIN_MENU_UZ = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🌐 Veb-kabinet")],
         [KeyboardButton(text="🔌 Ulash"), KeyboardButton(text="🎥 API ulash videosi")],
         [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
         [KeyboardButton(text="ℹ️ Yordam"), KeyboardButton(text="👑 Admin")],
+        [KeyboardButton(text="🌐 Veb-kabinet")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Avval do‘konni ulang",
@@ -1301,12 +1301,12 @@ MAIN_MENU_UZ_ADMIN = ReplyKeyboardMarkup(
 # Главное меню после подключения API: простая структура по разделам.
 MAIN_MENU_RU_CONNECTED = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🌐 Веб-кабинет")],
         [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
         [KeyboardButton(text="🧠 Что проверить"), KeyboardButton(text="🔔 Уведомления")],
         [KeyboardButton(text="📊 Отчёты"), KeyboardButton(text="🏪 Магазины")],
         [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
         [KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="🌐 Веб-кабинет")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите раздел",
@@ -1314,12 +1314,12 @@ MAIN_MENU_RU_CONNECTED = ReplyKeyboardMarkup(
 
 MAIN_MENU_RU_CONNECTED_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🌐 Веб-кабинет")],
         [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
         [KeyboardButton(text="🧠 Что проверить"), KeyboardButton(text="🔔 Уведомления")],
         [KeyboardButton(text="📊 Отчёты"), KeyboardButton(text="🏪 Магазины")],
         [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
         [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="👑 Админ")],
+        [KeyboardButton(text="🌐 Веб-кабинет")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите раздел",
@@ -1327,12 +1327,12 @@ MAIN_MENU_RU_CONNECTED_ADMIN = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ_CONNECTED = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🌐 Veb-kabinet")],
         [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
         [KeyboardButton(text="🧠 Tekshirish"), KeyboardButton(text="🔔 Xabarnomalar")],
         [KeyboardButton(text="📊 Hisobotlar"), KeyboardButton(text="🏪 Do‘konlar")],
         [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
         [KeyboardButton(text="ℹ️ Yordam")],
+        [KeyboardButton(text="🌐 Veb-kabinet")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Bo‘limni tanlang",
@@ -1340,12 +1340,12 @@ MAIN_MENU_UZ_CONNECTED = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ_CONNECTED_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🌐 Veb-kabinet")],
         [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
         [KeyboardButton(text="🧠 Tekshirish"), KeyboardButton(text="🔔 Xabarnomalar")],
         [KeyboardButton(text="📊 Hisobotlar"), KeyboardButton(text="🏪 Do‘konlar")],
         [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
         [KeyboardButton(text="ℹ️ Yordam"), KeyboardButton(text="👑 Admin")],
+        [KeyboardButton(text="🌐 Veb-kabinet")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Bo‘limni tanlang",
@@ -1469,7 +1469,8 @@ ATTENTION_MENU_UZ = ReplyKeyboardMarkup(
 
 ADMIN_PANEL_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="💳 Оплаты")],
+        [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="🔑 Подключение API")],
+        [KeyboardButton(text="💳 Оплаты")],
         [KeyboardButton(text="⏳ Скоро заканчиваются"), KeyboardButton(text="⛔ Заблокированные")],
         [KeyboardButton(text="✅ Проверить подключение"), KeyboardButton(text="🎥 Видеоинструкция")],
         [KeyboardButton(text="📦 Бэкап базы")],
@@ -1481,7 +1482,8 @@ ADMIN_PANEL_MENU_RU = ReplyKeyboardMarkup(
 
 ADMIN_PANEL_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="👥 Foydalanuvchilar"), KeyboardButton(text="💳 To‘lovlar")],
+        [KeyboardButton(text="👥 Foydalanuvchilar"), KeyboardButton(text="🔑 API ulanishi")],
+        [KeyboardButton(text="💳 To‘lovlar")],
         [KeyboardButton(text="⏳ Tugayotganlar"), KeyboardButton(text="⛔ Bloklanganlar")],
         [KeyboardButton(text="✅ Ulanishni tekshirish"), KeyboardButton(text="🎥 API ulash videosi")],
         [KeyboardButton(text="📦 Baza zaxirasi")],
@@ -5219,6 +5221,75 @@ async def staff_connections_admin(message: Message) -> None:
 @dp.message(F.text == "🔌 Xodim orqali")
 async def staff_connections_button(message: Message) -> None:
     await staff_connections_admin(message)
+
+
+
+@dp.message(F.text.in_({"🔑 Подключение API", "🔑 API ulanishi"}))
+async def admin_api_connections(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    if not admin_only(telegram_id):
+        await message.answer(tr_user(telegram_id, "admin_only"))
+        return
+
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT u.telegram_id, u.username, u.first_name, u.default_shop_id,
+                   u.uzum_token_encrypted,
+                   s.trial_until, s.subscription_until, s.blocked
+            FROM users u
+            LEFT JOIN subscriptions s ON s.telegram_id = u.telegram_id
+            ORDER BY CASE WHEN u.uzum_token_encrypted IS NOT NULL THEN 0 ELSE 1 END,
+                     u.updated_at DESC
+            """
+        ).fetchall()
+
+    connected = [dict(r) for r in rows if r["uzum_token_encrypted"]]
+    not_connected = [dict(r) for r in rows if not r["uzum_token_encrypted"]]
+
+    lines = [
+        "🔑 <b>Подключение Uzum API</b>",
+        "",
+        f"👥 Всего пользователей: <b>{len(rows)}</b>",
+        f"✅ Подключили API: <b>{len(connected)}</b>",
+        f"❌ Не подключили API: <b>{len(not_connected)}</b>",
+        "",
+        "✅ <b>API подключён</b>",
+    ]
+
+    def user_line(row: dict[str, Any], ok: bool) -> str:
+        username = str(row.get("username") or "").strip()
+        name = str(row.get("first_name") or "").strip()
+        label = f"@{username}" if username else (name or "без имени")
+        shop = row.get("default_shop_id")
+        shop_text = str(shop) if shop else "магазин не выбран"
+        return (
+            f"{'✅' if ok else '❌'} <code>{int(row['telegram_id'])}</code> — "
+            f"{escape(label)} | 🏪 {escape(shop_text)}"
+        )
+
+    if connected:
+        lines.extend(user_line(row, True) for row in connected)
+    else:
+        lines.append("— пока никого")
+
+    lines.extend(["", "❌ <b>API не подключён</b>"])
+    if not_connected:
+        lines.extend(user_line(row, False) for row in not_connected)
+    else:
+        lines.append("— все подключили API")
+
+    # Telegram ограничивает одно сообщение примерно 4096 символами.
+    chunk = ""
+    for line in lines:
+        candidate = f"{chunk}\n{line}" if chunk else line
+        if len(candidate) > 3800:
+            await message.answer(chunk, reply_markup=ADMIN_PANEL_MENU_RU)
+            chunk = line
+        else:
+            chunk = candidate
+    if chunk:
+        await message.answer(chunk, reply_markup=ADMIN_PANEL_MENU_RU)
 
 
 @dp.message(Command("users"))
@@ -9771,4 +9842,5 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
