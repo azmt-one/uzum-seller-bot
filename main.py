@@ -30,6 +30,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 
 from db import Database, TokenCipher
 from formatters import (
+    clean_num,
     compact_json_preview,
     excel_value,
     extract_items,
@@ -109,7 +110,6 @@ VIDEO_INSTRUCTION_URL = os.getenv("VIDEO_INSTRUCTION_URL", "https://t.me/uzum_as
 WEB_APP_URL = os.getenv("WEB_APP_URL", "").strip().rstrip("/")
 WEB_SYNC_SECRET = os.getenv("WEB_SYNC_SECRET", "").strip()
 WEB_SYNC_TIMEOUT_SECONDS = max(5, min(60, int(os.getenv("WEB_SYNC_TIMEOUT_SECONDS", "25") or "25")))
-BOT_VERSION = "3.2.1-admin-sync-hotfix"
 
 # Подключение через сотрудника было экспериментом и отключено.
 # Основной официальный способ: API-ключ продавца через /connect.
@@ -1598,7 +1598,7 @@ def admin_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
 
 
 # Переопределяем тексты подписки после инициализации языка, чтобы /my_subscription был на выбранном языке.
-def subscription_status_text(telegram_id: int) -> str:  # noqa: F811
+def subscription_status_text(telegram_id: int) -> str:
     row = ensure_subscription(telegram_id)
     lang = get_user_language(telegram_id)
     if is_admin(telegram_id):
@@ -1616,7 +1616,7 @@ def subscription_status_text(telegram_id: int) -> str:  # noqa: F811
     return "⛔ Obuna muddati tugagan" if lang == "uz" else "⛔ Подписка закончилась"
 
 
-def subscription_full_text(telegram_id: int) -> str:  # noqa: F811
+def subscription_full_text(telegram_id: int) -> str:
     row = ensure_subscription(telegram_id)
     status = subscription_status_text(telegram_id)
     lang = get_user_language(telegram_id)
@@ -2128,10 +2128,6 @@ def _web_iso(value: Any) -> str | None:
 
 
 def _web_subscription_payload(telegram_id: int) -> tuple[str, str | None]:
-    # Administrators must never be blocked by trial/subscription dates.
-    # The website receives this state through an HMAC-signed bridge payload.
-    if is_admin(telegram_id):
-        return "active", None
     try:
         subscription = get_subscription_row(telegram_id)
     except Exception:
@@ -2213,7 +2209,6 @@ def _web_payload_for(message: Message, *, sensitive: bool) -> dict[str, Any]:
         "locale": locale,
         "subscription_until": subscription_until,
         "subscription_state": subscription_state,
-        "is_admin": is_admin(telegram_id),
         "default_shop_id": default_shop_id,
         "iat": int(time.time()),
     }
@@ -2226,16 +2221,7 @@ def _web_payload_for(message: Message, *, sensitive: bool) -> dict[str, Any]:
                 encrypted_token = db.get_encrypted_token(telegram_id) or ""
             except Exception:
                 logging.exception("WEB_BRIDGE: не удалось прочитать зашифрованный Uzum-токен")
-        # The sync request is HTTPS + HMAC signed. Decrypt locally and let the
-        # website encrypt with its own ENCRYPTION_KEY. This removes the fragile
-        # requirement that the bot and website use the same Fernet key.
-        if encrypted_token:
-            try:
-                payload["uzum_token"] = cipher.decrypt(str(encrypted_token))
-            except Exception as exc:
-                raise RuntimeError("не удалось расшифровать сохранённый Uzum API-ключ") from exc
-        else:
-            payload["uzum_token"] = ""
+        payload["encrypted_token"] = str(encrypted_token or "")
         payload["costs"] = _web_cost_rows(telegram_id, default_shop_id)
 
     return payload
@@ -2310,45 +2296,6 @@ def web_cabinet_markup(message: Message) -> InlineKeyboardMarkup:
     )
 
 
-@dp.message(Command("diagnostics"))
-async def diagnostics_command(message: Message) -> None:
-    telegram_id = upsert_from_message(message)
-    if not is_admin(telegram_id):
-        await message.answer(tr_user(telegram_id, "admin_only"))
-        return
-
-    db_path = Path(DB_PATH).expanduser()
-    parent = db_path.parent if str(db_path.parent) else Path(".")
-    checks: list[tuple[str, bool, str]] = []
-    try:
-        with db.connect() as conn:
-            conn.execute("SELECT 1").fetchone()
-        checks.append(("База данных", True, str(db_path)))
-    except Exception as exc:
-        checks.append(("База данных", False, type(exc).__name__))
-    checks.append(("Папка базы доступна для записи", parent.exists() and os.access(parent, os.W_OK), str(parent)))
-    checks.append(("Шифрование Uzum-токенов", bool(ENCRYPTION_KEY), "настроено" if ENCRYPTION_KEY else "ENCRYPTION_KEY отсутствует"))
-    checks.append(("Адрес веб-кабинета", WEB_APP_URL.startswith("https://"), WEB_APP_URL or "WEB_APP_URL отсутствует"))
-    checks.append(("Секрет синхронизации", len(WEB_SYNC_SECRET) >= 32, "настроен" if len(WEB_SYNC_SECRET) >= 32 else "WEB_SYNC_SECRET короче 32 символов"))
-    checks.append(("Уведомления о продажах", SALE_NOTIFICATIONS, f"интервал {SALE_CHECK_INTERVAL_SECONDS} сек."))
-    checks.append(("Уведомления об остатках", LOW_STOCK_NOTIFICATIONS, f"интервал {LOW_STOCK_CHECK_INTERVAL_SECONDS} сек."))
-
-    failures = sum(1 for _, ok, _ in checks if not ok)
-    lines = [
-        "🩺 <b>Диагностика Seller Assistant Bot</b>",
-        "",
-        f"Версия: <code>{BOT_VERSION}</code>",
-        f"Статус: {'✅ готов' if failures == 0 else f'⚠️ проблем: {failures}'}",
-        "",
-    ]
-    for name, ok, detail in checks:
-        lines.append(f"{'✅' if ok else '❌'} <b>{escape(name)}</b> — {escape(detail)}")
-    if WEB_SYNC_SECRET:
-        lines.extend(["", f"Отпечаток синхронизации: <code>{hashlib.sha256(WEB_SYNC_SECRET.encode()).hexdigest()[:12]}</code>"])
-    lines.append("\nСекреты и API-ключи в отчёте не показываются.")
-    await message.answer("\n".join(lines))
-
-
 @dp.message(Command("site", "web", "cabinet"))
 async def open_web_cabinet_command(message: Message) -> None:
     telegram_id = upsert_from_message(message)
@@ -2401,31 +2348,6 @@ async def start(message: Message) -> None:
     sub_line = subscription_status_text(telegram_id)
 
     admin_part = ""
-    if is_admin(telegram_id):
-        if lang == "uz":
-            admin_part = (
-                "\n👑 <b>Admin buyruqlari</b>\n"
-                "• <code>/admin</code> — admin panel\n"
-                "• <code>/users</code> — foydalanuvchilar\n"
-                "• <code>/extend ID 30</code> — kirishni uzaytirish\n"
-                "• <code>/block ID</code> / <code>/unblock ID</code> — bloklash\n"
-                "• <code>/paid ID summa kun</code> — to‘lovni yozish va uzaytirish\n"
-                "• <code>/payments</code> — to‘lovlar tarixi\n"
-                "• <code>/backup_db</code> — baza zaxirasi\n"
-                "• <code>/broadcast matn</code> — hammaga xabar yuborish\n"
-            )
-        else:
-            admin_part = (
-                "\n👑 <b>Админ-команды</b>\n"
-                "• <code>/admin</code> — админ-панель\n"
-                "• <code>/users</code> — список пользователей\n"
-                "• <code>/extend ID 30</code> — продлить доступ\n"
-                "• <code>/block ID</code> / <code>/unblock ID</code> — блокировка\n"
-                "• <code>/paid ID сумма дни</code> — записать оплату и продлить\n"
-                "• <code>/payments</code> — история оплат\n"
-                "• <code>/backup_db</code> — резервная копия базы\n"
-                "• <code>/broadcast текст</code> — рассылка\n"
-            )
 
     if lang == "uz":
         text = (
@@ -2689,39 +2611,151 @@ async def ping_uzum(message: Message) -> None:
         await send_api_error(message, e)
 
 
+
+
+def shop_selection_markup(
+    shops_list: list[dict[str, Any]],
+    current_shop_id: int | None,
+    lang: str = "ru",
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    for shop in shops_list[:30]:
+        shop_id = _shop_id_from_obj(shop)
+        if shop_id is None:
+            continue
+
+        name = ""
+        for key in ("title", "name", "shopName", "storeName", "displayName"):
+            value = shop.get(key)
+            if value not in (None, ""):
+                name = str(value).strip()
+                break
+
+        if not name:
+            name = f"Do‘kon {shop_id}" if normalize_lang(lang) == "uz" else f"Магазин {shop_id}"
+
+        name = name[:42]
+        marker = "✅" if current_shop_id and int(current_shop_id) == int(shop_id) else "▫️"
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{marker} {name} · {shop_id}",
+                callback_data=f"shop_select:{shop_id}",
+            )
+        ])
+
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data.startswith("shop_select:"))
+async def select_shop_callback(callback: CallbackQuery) -> None:
+    import re
+    user = callback.from_user
+    if not user:
+        await callback.answer("Не удалось определить пользователя", show_alert=True)
+        return
+
+    db.upsert_user(user.id, user.username, user.first_name)
+    raw_shop_id = str(callback.data or "").split(":", 1)[-1]
+    if not raw_shop_id.isdigit():
+        await callback.answer("Некорректный магазин", show_alert=True)
+        return
+
+    shop_id = int(raw_shop_id)
+    if not db.set_default_shop_id(user.id, shop_id):
+        lang = get_user_language(user.id)
+        error_text = (
+            "Bu do‘kon topilmadi. Do‘konlar ro‘yxatini qayta oching."
+            if lang == "uz"
+            else "Этот магазин не найден. Откройте список магазинов заново."
+        )
+        await callback.answer(error_text, show_alert=True)
+        return
+
+    try:
+        if callback.message and callback.message.reply_markup:
+            new_rows: list[list[InlineKeyboardButton]] = []
+            for row in callback.message.reply_markup.inline_keyboard:
+                new_row: list[InlineKeyboardButton] = []
+                for button in row:
+                    button_data = str(button.callback_data or "")
+                    label = str(button.text or "")
+                    label = re.sub(r"^(✅|▫️)\s*", "", label)
+                    selected = button_data == f"shop_select:{shop_id}"
+                    new_row.append(
+                        InlineKeyboardButton(
+                            text=f"{'✅' if selected else '▫️'} {label}",
+                            callback_data=button.callback_data,
+                        )
+                    )
+                new_rows.append(new_row)
+            await callback.message.edit_reply_markup(
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=new_rows)
+            )
+    except Exception:
+        logging.exception("Failed to refresh shop selection keyboard")
+
+    lang = get_user_language(user.id)
+    await callback.answer("Do‘kon tanlandi" if lang == "uz" else "Магазин выбран")
+
+    if callback.message:
+        confirmation = (
+            f"✅ Asosiy do‘kon tanlandi: <code>{shop_id}</code>"
+            if lang == "uz"
+            else f"✅ Основной магазин выбран: <code>{shop_id}</code>"
+        )
+        await callback.message.answer(
+            confirmation,
+            reply_markup=main_menu_for_user(user.id),
+        )
+
+
 @dp.message(Command("shops"))
 async def shops(message: Message) -> None:
     telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
     client = get_uzum_for_user(telegram_id)
     if client is None:
-        await message.answer("Сначала подключите Uzum API-токен: <code>/connect</code>", reply_markup=menu_for_message(message))
+        text_no_api = (
+            "Avval Uzum API-kalitini ulang: <code>/connect</code>"
+            if lang == "uz"
+            else "Сначала подключите Uzum API-ключ: <code>/connect</code>"
+        )
+        await message.answer(text_no_api, reply_markup=menu_for_message(message))
         return
 
     try:
         data = await client.get_shops()
         items = extract_items(data)
         if not items:
-            await message.answer(
-                "Ответ получен, но список магазинов не найден:\n<code>"
-                + escape(compact_json_preview(data))
-                + "</code>",
-                reply_markup=menu_for_message(message),
+            no_shops_text = (
+                "API javob berdi, lekin do‘konlar topilmadi."
+                if lang == "uz"
+                else "API ответил, но магазины не найдены."
             )
+            await message.answer(no_shops_text, reply_markup=menu_for_message(message))
             return
 
         encrypted = db.get_encrypted_token(telegram_id)
         if encrypted:
             db.save_connection(telegram_id, encrypted, items)
+
         current = db.get_default_shop_id(telegram_id)
-        lines = [format_shop_line(item) for item in items[:30]]
-        await message.answer(
-            "🏪 <b>Ваши магазины:</b>\n\n"
-            + "\n".join(lines)
-            + "\n\nТекущий основной магазин: "
-            + (f"<code>{current}</code>" if current else "не выбран")
-            + "\n\nЧтобы выбрать: <code>/setshop SHOP_ID</code>",
-            reply_markup=menu_for_message(message),
-        )
+        markup = shop_selection_markup(items, current, lang)
+
+        if lang == "uz":
+            screen_text = (
+                "🏪 <b>Do‘konlaringiz</b>\n\n"
+                "Kerakli do‘konni pastdagi tugma orqali tanlang.\n"
+                "✅ belgisi hozirgi asosiy do‘konni ko‘rsatadi."
+            )
+        else:
+            screen_text = (
+                "🏪 <b>Ваши магазины</b>\n\n"
+                "Выберите нужный магазин кнопкой ниже.\n"
+                "✅ отмечен текущий основной магазин."
+            )
+
+        await message.answer(screen_text, reply_markup=markup)
     except Exception as e:
         await send_api_error(message, e)
 
@@ -3089,7 +3123,7 @@ async def lowstock(message: Message) -> None:
             return
 
         items = [format_sku_stock_line(row, mode="all") for row in low]
-        title = "⚠️ <b>Kam qoldiqdagi tovarlar</b>" if lang == "uz" else "⚠️ <b>Низкие остатки</b>"
+        title = f"⚠️ <b>Kam qoldiqdagi tovarlar</b>" if lang == "uz" else f"⚠️ <b>Низкие остатки</b>"
         summary = [
             f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
             f"📉 Chegara: ≤ <b>{threshold}</b> dona" if lang == "uz" else f"📉 Порог: ≤ <b>{threshold}</b> шт.",
@@ -5188,6 +5222,7 @@ async def admin_panel(message: Message) -> None:
 async def check_connection(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     ensure_subscription(telegram_id)
+    user = db.get_user(telegram_id)
     client = get_uzum_for_user(telegram_id)
     shop_id = db.get_default_shop_id(telegram_id)
     lines = [
@@ -8132,7 +8167,6 @@ async def _build_morning_report_text(telegram_id: int, client: UzumClient) -> st
         "🌙 <b>Утренний отчёт Uzum</b>\n"
         f"За вчера: <b>{start.strftime('%d.%m.%Y')}</b>\n\n"
         + _format_all_shops_balance("за вчера", shops_count, stats, per_shop).replace("🌐 <b>Баланс по всем магазинам за вчера</b>\n\n", "")
-        + "\n\n<i>Автоотчёт можно включить переменной DAILY_REPORTS=1.</i>"
     )
 
 
@@ -8915,7 +8949,7 @@ def connected_watch_groups() -> list[dict[str, Any]]:
     return list(groups.values())
 
 
-async def check_new_orders_once() -> None:  # noqa: F811
+async def check_new_orders_once() -> None:
     for group in connected_watch_groups():
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
@@ -8968,7 +9002,7 @@ async def check_new_orders_once() -> None:  # noqa: F811
         await asyncio.sleep(0.5)
 
 
-async def check_low_stock_once() -> None:  # noqa: F811
+async def check_low_stock_once() -> None:
     threshold = max(0, LOW_STOCK_THRESHOLD)
     for group in connected_watch_groups():
         shop_id = int(group["shop_id"])
@@ -9022,7 +9056,7 @@ async def check_low_stock_once() -> None:  # noqa: F811
         await asyncio.sleep(0.5)
 
 
-async def check_out_of_stock_once() -> None:  # noqa: F811
+async def check_out_of_stock_once() -> None:
     for group in connected_watch_groups():
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
@@ -9074,7 +9108,7 @@ async def check_out_of_stock_once() -> None:  # noqa: F811
         await asyncio.sleep(0.5)
 
 
-async def check_new_sales_once() -> None:  # noqa: F811
+async def check_new_sales_once() -> None:
     date_from, date_to = _today_range_ms()
     for group in connected_watch_groups():
         shop_id = int(group["shop_id"])
@@ -9135,7 +9169,7 @@ async def check_new_sales_once() -> None:  # noqa: F811
         await asyncio.sleep(0.5)
 
 
-async def check_stock_change_once() -> None:  # noqa: F811
+async def check_stock_change_once() -> None:
     for group in connected_watch_groups():
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
@@ -9233,6 +9267,7 @@ def build_cancel_message(item: dict[str, Any], shop_id: int | None = None, lang:
     unit_price = _deep_pick_number(item, ("sellPrice", "soldPrice", "price", "skuPrice", "productPrice"))
     status = escape(_finance_status(item))
     order_id = escape(_finance_order_id(item))
+    sale_id = escape(_finance_sale_id(item))
     date_text = escape(_format_finance_date(_finance_date_value(item)))
 
     if lang == "uz":
@@ -9266,7 +9301,7 @@ def build_cancel_message(item: dict[str, Any], shop_id: int | None = None, lang:
 
 
 # Переопределяем watcher продаж: теперь он присылает и новые продажи, и новые отмены.
-async def check_new_sales_once() -> None:  # noqa: F811
+async def check_new_sales_once() -> None:
     date_from, date_to = _today_range_ms()
     for group in connected_watch_groups():
         shop_id = int(group["shop_id"])
@@ -9867,8 +9902,203 @@ def translate_runtime_text_to_uz(text: str) -> str:
     text = text.replace("Tovarlar sotilgan", "Sotilgan tovarlar")
     return text
 
+
+# --- Надёжный watcher отмен: хранит статусы в БД и проверяет последние 7 дней ---
+# Причина: память Python очищается при SIGTERM/перезапуске BotHost. Без БД отмена,
+# произошедшая во время перезапуска, могла быть принята за исходное состояние и не отправлялась.
+def init_sale_status_watch_table() -> None:
+    with db.connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sale_status_watch (
+                telegram_id INTEGER NOT NULL,
+                shop_id INTEGER NOT NULL,
+                identity_key TEXT NOT NULL,
+                status TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (telegram_id, shop_id, identity_key)
+            )
+            """
+        )
+        conn.commit()
+
+
+def load_saved_sale_statuses(telegram_id: int, shop_id: int) -> dict[str, str]:
+    init_sale_status_watch_table()
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT identity_key, status
+            FROM sale_status_watch
+            WHERE telegram_id = ? AND shop_id = ?
+            """,
+            (int(telegram_id), int(shop_id)),
+        ).fetchall()
+    return {str(row["identity_key"]): str(row["status"] or "") for row in rows}
+
+
+def save_sale_statuses(telegram_id: int, shop_id: int, statuses: dict[str, str]) -> None:
+    if not statuses:
+        return
+    init_sale_status_watch_table()
+    now_text = _dt_to_db(_utc_now()) or ""
+    with db.connect() as conn:
+        conn.executemany(
+            """
+            INSERT INTO sale_status_watch
+                (telegram_id, shop_id, identity_key, status, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_id, shop_id, identity_key) DO UPDATE SET
+                status = excluded.status,
+                updated_at = excluded.updated_at
+            """,
+            [
+                (int(telegram_id), int(shop_id), str(identity), str(status), now_text)
+                for identity, status in statuses.items()
+            ],
+        )
+        conn.commit()
+
+
+init_sale_status_watch_table()
+
+
+# Финальное переопределение. sales_watch_loop использует именно эту версию.
+async def check_new_sales_once() -> None:
+    now = _utc_now()
+    # Проверяем не только сегодня: покупатель может отменить вчерашний или более старый заказ.
+    date_from = int((now - timedelta(days=7)).timestamp() * 1000)
+    date_to = int(now.timestamp() * 1000)
+
+    for group in connected_watch_groups():
+        shop_id = int(group["shop_id"])
+        encrypted_token = group["uzum_token_encrypted"]
+        telegram_ids = [int(x) for x in group["telegram_ids"]]
+
+        try:
+            token = cipher.decrypt(encrypted_token)
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            rows, _ = await _load_finance_orders(
+                client,
+                shop_id,
+                date_from_ms=date_from,
+                date_to_ms=date_to,
+                max_pages=10,
+                page_size=100,
+            )
+        except Exception:
+            logging.exception(
+                "Sales/cancel watcher: failed to check shop=%s users=%s",
+                shop_id,
+                telegram_ids,
+            )
+            await asyncio.sleep(3)
+            continue
+
+        keys_now = [sale_key(item) for item in rows]
+        identity_status_now = {
+            finance_identity_key(item): _finance_status(item)
+            for item in rows
+        }
+
+        for telegram_id in telegram_ids:
+            known = _seen_sale_keys_by_user.setdefault(telegram_id, set())
+            status_memory = _sale_status_by_user.setdefault(telegram_id, {})
+
+            # Загружаем статусы из SQLite. Они не пропадают после SIGTERM.
+            saved_statuses = load_saved_sale_statuses(telegram_id, shop_id)
+            if saved_statuses:
+                status_memory.update(saved_statuses)
+
+            first_ever_snapshot = not saved_statuses and telegram_id not in _sales_watch_initialized
+
+            cancel_rows: list[dict[str, Any]] = []
+            if CANCEL_NOTIFICATIONS and not first_ever_snapshot:
+                for item in rows:
+                    ident = finance_identity_key(item)
+                    current_status = _finance_status(item)
+                    previous_status = status_memory.get(ident)
+
+                    # Уведомляем только о реальном переходе известной строки в отмену.
+                    if (
+                        previous_status is not None
+                        and _is_cancelled_status(current_status)
+                        and not _is_cancelled_status(str(previous_status))
+                    ):
+                        cancel_rows.append(item)
+
+            # Новые продажи по-прежнему отслеживаем, но отменённые как продажу не отправляем.
+            if telegram_id not in _sales_watch_initialized:
+                known.update(keys_now)
+                _sales_watch_initialized.add(telegram_id)
+                logging.info(
+                    "Sales watcher initialized for user=%s shop=%s sales_rows=%s saved_statuses=%s",
+                    telegram_id,
+                    shop_id,
+                    len(keys_now),
+                    len(saved_statuses),
+                )
+                new_rows: list[dict[str, Any]] = []
+            else:
+                new_rows = [
+                    item for item, key in zip(rows, keys_now)
+                    if key not in known and not _is_cancelled_status(_finance_status(item))
+                ]
+                known.update(keys_now)
+
+            status_memory.update(identity_status_now)
+            save_sale_statuses(telegram_id, shop_id, identity_status_now)
+
+            if len(known) > 5000:
+                _seen_sale_keys_by_user[telegram_id] = set(keys_now)
+
+            for item in new_rows[:10]:
+                try:
+                    await bot.send_message(
+                        telegram_id,
+                        build_new_sale_message(
+                            item,
+                            shop_id=shop_id,
+                            lang=get_user_language(telegram_id),
+                        ),
+                        reply_markup=main_menu_for_user(telegram_id),
+                    )
+                    await asyncio.sleep(0.15)
+                except Exception:
+                    logging.exception(
+                        "Sales watcher: failed to send sale notification to %s",
+                        telegram_id,
+                    )
+
+            for item in cancel_rows[:10]:
+                try:
+                    await bot.send_message(
+                        telegram_id,
+                        build_cancel_message(
+                            item,
+                            shop_id=shop_id,
+                            lang=get_user_language(telegram_id),
+                        ),
+                        reply_markup=main_menu_for_user(telegram_id),
+                    )
+                    logging.info(
+                        "Cancel notification sent user=%s shop=%s order=%s status=%s",
+                        telegram_id,
+                        shop_id,
+                        _finance_order_id(item),
+                        _finance_status(item),
+                    )
+                    await asyncio.sleep(0.15)
+                except Exception:
+                    logging.exception(
+                        "Sales watcher: failed to send cancel notification to %s",
+                        telegram_id,
+                    )
+
+        await asyncio.sleep(0.5)
+
+
 async def main() -> None:
-    logging.info("Seller Assistant Bot version=%s", BOT_VERSION)
     logging.info("SKU_LABELS_INTERFACE_LOADED: official barcode types + PDF SKU labels")
     logging.info("INTUITIVE_ATTENTION_INTERFACE_LOADED: simple sections + attention report + full stock list")
     init_language_tables()
@@ -9894,6 +10124,8 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+
+
 
 
 
