@@ -29,6 +29,11 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, PatternFill
 
 from db import Database, TokenCipher
+from subscription_automation import (
+    build_reminder_draft,
+    parse_reminder_days,
+    select_milestone,
+)
 from formatters import (
     clean_num,
     compact_json_preview,
@@ -101,6 +106,10 @@ SUBSCRIPTION_PLANS_TEXT = os.getenv(
     "SUBSCRIPTION_PLANS_TEXT",
     "1 месяц — 300 000 сум\n3 месяца — 800 000 сум\n6 месяцев — 1 500 000 сум\n\nБез ограничений по количеству магазинов продавца"
 ).strip()
+SUBSCRIPTION_PLANS_TEXT_UZ = os.getenv(
+    "SUBSCRIPTION_PLANS_TEXT_UZ",
+    "1 oy — 300 000 so‘m\n3 oy — 800 000 so‘m\n6 oy — 1 500 000 so‘m\n\nSotuvchining do‘konlari soni cheklanmagan"
+).strip()
 ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "azmt_one").strip().lstrip("@")
 ADMIN_CONTACT_URL = os.getenv("ADMIN_CONTACT_URL", "").strip()
 VIDEO_INSTRUCTION_URL = os.getenv("VIDEO_INSTRUCTION_URL", "https://t.me/uzum_assist_bot/2").strip()
@@ -138,7 +147,15 @@ SUBSCRIPTION_REMINDERS = (
     os.getenv("SUBSCRIPTION_REMINDERS", "1").strip().lower()
     not in {"0", "false", "no", "off"}
 )
-SUBSCRIPTION_REMINDER_DAYS = int(os.getenv("SUBSCRIPTION_REMINDER_DAYS", "1") or "1")
+SUBSCRIPTION_REMINDER_DAYS = parse_reminder_days(
+    os.getenv("SUBSCRIPTION_REMINDER_DAYS", "7,3,1")
+)
+SUBSCRIPTION_EXPIRED_QUEUE_DAYS = max(
+    1, int(os.getenv("SUBSCRIPTION_EXPIRED_QUEUE_DAYS", "7") or "7")
+)
+SUBSCRIPTION_ADMIN_DIGEST_HOUR_UZT = max(
+    0, min(23, int(os.getenv("SUBSCRIPTION_ADMIN_DIGEST_HOUR_UZT", "9") or "9"))
+)
 
 # Печать SKU-этикеток через официальный Uzum Seller OpenAPI.
 # Swagger разрешает до 100 SKU и до 100 этикеток на один SKU.
@@ -302,6 +319,7 @@ def subscription_full_text(telegram_id: int) -> str:
             "Trial и дата оплаты для администратора не важны — доступ всегда открыт.\n\n"
             "Команды администратора:\n"
             "• <code>/users</code> — пользователи\n"
+            "• <code>/renewals</code> — очередь продлений и черновики\n"
             "• <code>/extend ID 30</code> — продлить доступ\n"
             "• <code>/block ID</code> — заблокировать\n"
             "• <code>/unblock ID</code> — разблокировать\n"
@@ -449,6 +467,47 @@ def init_business_tables() -> None:
                 admin_id INTEGER,
                 comment TEXT,
                 created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.commit()
+
+
+def init_subscription_automation_tables() -> None:
+    with db.connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS subscription_reminder_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                active_until TEXT NOT NULL,
+                subscription_kind TEXT NOT NULL,
+                milestone TEXT NOT NULL,
+                days_remaining INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'pending',
+                draft_text TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                reviewed_by INTEGER,
+                reviewed_at TEXT,
+                sent_at TEXT,
+                last_error TEXT,
+                UNIQUE (telegram_id, active_until, milestone)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_subscription_reminder_queue_status
+            ON subscription_reminder_queue (status, active_until)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS subscription_automation_state (
+                state_key TEXT PRIMARY KEY,
+                state_value TEXT,
+                updated_at TEXT NOT NULL
             )
             """
         )
@@ -708,6 +767,311 @@ def list_expiring_users(days: int = 3, limit: int = 50) -> list[dict[str, Any]]:
     return result
 
 
+def _subscription_kind_and_until(row: dict[str, Any]) -> tuple[str, datetime | None]:
+    trial_until = _dt_from_db(row.get("trial_until"))
+    paid_until = _dt_from_db(row.get("subscription_until"))
+    dates = [value for value in (trial_until, paid_until) if value is not None]
+    if not dates:
+        return "trial", None
+    active_until = max(dates)
+    kind = "paid" if paid_until and paid_until == active_until else "trial"
+    return kind, active_until
+
+
+def refresh_subscription_reminder_queue(now: datetime | None = None) -> dict[str, int]:
+    """Create reviewable drafts without sending or changing subscriptions."""
+    init_subscription_automation_tables()
+    now = now or _utc_now()
+    now_text = _dt_to_db(now) or ""
+    created = 0
+
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.telegram_id, s.trial_until, s.subscription_until, s.blocked
+            FROM subscriptions s
+            ORDER BY s.telegram_id
+            """
+        ).fetchall()
+
+    for raw_row in rows:
+        row = dict(raw_row)
+        telegram_id = int(row.get("telegram_id") or 0)
+        kind, active_until = _subscription_kind_and_until(row)
+
+        if not telegram_id or is_admin(telegram_id) or int(row.get("blocked") or 0) == 1 or not active_until:
+            with db.connect() as conn:
+                conn.execute(
+                    """
+                    UPDATE subscription_reminder_queue
+                    SET status = 'superseded', updated_at = ?
+                    WHERE telegram_id = ? AND status = 'pending'
+                    """,
+                    (now_text, telegram_id),
+                )
+                conn.commit()
+            continue
+
+        active_until_text = _dt_to_db(active_until) or ""
+        milestone = select_milestone(
+            active_until,
+            now,
+            SUBSCRIPTION_REMINDER_DAYS,
+            SUBSCRIPTION_EXPIRED_QUEUE_DAYS,
+        )
+
+        with db.connect() as conn:
+            # Оплата или ручное продление меняют дату. Старые черновики больше не актуальны.
+            conn.execute(
+                """
+                UPDATE subscription_reminder_queue
+                SET status = 'superseded', updated_at = ?
+                WHERE telegram_id = ? AND status = 'pending' AND active_until <> ?
+                """,
+                (now_text, telegram_id, active_until_text),
+            )
+
+            if milestone is None:
+                if active_until <= now:
+                    conn.execute(
+                        """
+                        UPDATE subscription_reminder_queue
+                        SET status = 'superseded', updated_at = ?
+                        WHERE telegram_id = ? AND status = 'pending'
+                        """,
+                        (now_text, telegram_id),
+                    )
+                conn.commit()
+                continue
+
+            lang = get_user_language(telegram_id)
+            plans_text = SUBSCRIPTION_PLANS_TEXT_UZ if lang == "uz" else SUBSCRIPTION_PLANS_TEXT
+            draft_text = build_reminder_draft(
+                lang=lang,
+                active_until_text=_fmt_dt(active_until),
+                subscription_kind=kind,
+                milestone=milestone,
+                plans_text=escape(plans_text),
+            )
+            cursor = conn.execute(
+                """
+                INSERT OR IGNORE INTO subscription_reminder_queue
+                (telegram_id, active_until, subscription_kind, milestone, days_remaining,
+                 status, draft_text, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+                """,
+                (
+                    telegram_id,
+                    active_until_text,
+                    kind,
+                    milestone.key,
+                    milestone.days_remaining,
+                    draft_text,
+                    now_text,
+                    now_text,
+                ),
+            )
+            created += max(0, int(cursor.rowcount or 0))
+            conn.execute(
+                """
+                UPDATE subscription_reminder_queue
+                SET draft_text = ?, days_remaining = ?, updated_at = ?, last_error = NULL
+                WHERE telegram_id = ? AND active_until = ? AND milestone = ? AND status = 'pending'
+                """,
+                (
+                    draft_text,
+                    milestone.days_remaining,
+                    now_text,
+                    telegram_id,
+                    active_until_text,
+                    milestone.key,
+                ),
+            )
+            # На экране действий оставляем только самый свежий этап для одной даты.
+            conn.execute(
+                """
+                UPDATE subscription_reminder_queue
+                SET status = 'superseded', updated_at = ?
+                WHERE telegram_id = ? AND active_until = ? AND status = 'pending' AND milestone <> ?
+                """,
+                (now_text, telegram_id, active_until_text, milestone.key),
+            )
+            conn.commit()
+
+    pending_rows = list_pending_subscription_reminders(500)
+    summary = {"created": created, "pending": len(pending_rows), "d7": 0, "d3": 0, "d1": 0, "expired": 0}
+    for row in pending_rows:
+        key = str(row.get("milestone") or "")
+        summary[key] = int(summary.get(key, 0)) + 1
+    return summary
+
+
+def list_pending_subscription_reminders(limit: int = 100) -> list[dict[str, Any]]:
+    init_subscription_automation_tables()
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT q.*, u.username, u.first_name, u.default_shop_id
+            FROM subscription_reminder_queue q
+            LEFT JOIN users u ON u.telegram_id = q.telegram_id
+            WHERE q.status = 'pending'
+            ORDER BY
+                CASE q.milestone
+                    WHEN 'expired' THEN 0
+                    WHEN 'd1' THEN 1
+                    WHEN 'd3' THEN 2
+                    WHEN 'd7' THEN 3
+                    ELSE 4
+                END,
+                q.active_until ASC,
+                q.id ASC
+            LIMIT ?
+            """,
+            (max(1, int(limit)),),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_subscription_reminder(queue_id: int, pending_only: bool = False) -> dict[str, Any] | None:
+    init_subscription_automation_tables()
+    where_pending = "AND q.status = 'pending'" if pending_only else ""
+    with db.connect() as conn:
+        row = conn.execute(
+            f"""
+            SELECT q.*, u.username, u.first_name, u.default_shop_id
+            FROM subscription_reminder_queue q
+            LEFT JOIN users u ON u.telegram_id = q.telegram_id
+            WHERE q.id = ? {where_pending}
+            """,
+            (int(queue_id),),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def claim_subscription_reminder(queue_id: int, admin_id: int) -> bool:
+    now_text = _dt_to_db(_utc_now()) or ""
+    with db.connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE subscription_reminder_queue
+            SET status = 'sending', reviewed_by = ?, reviewed_at = ?, updated_at = ?, last_error = NULL
+            WHERE id = ? AND status = 'pending'
+            """,
+            (int(admin_id), now_text, now_text, int(queue_id)),
+        )
+        conn.commit()
+    return bool(cursor.rowcount)
+
+
+def finish_subscription_reminder(queue_id: int, *, sent: bool, error: str = "") -> None:
+    now_text = _dt_to_db(_utc_now()) or ""
+    with db.connect() as conn:
+        if sent:
+            conn.execute(
+                """
+                UPDATE subscription_reminder_queue
+                SET status = 'sent', sent_at = ?, updated_at = ?, last_error = NULL
+                WHERE id = ? AND status = 'sending'
+                """,
+                (now_text, now_text, int(queue_id)),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE subscription_reminder_queue
+                SET status = 'pending', updated_at = ?, last_error = ?
+                WHERE id = ? AND status = 'sending'
+                """,
+                (now_text, str(error or "Ошибка отправки")[:1000], int(queue_id)),
+            )
+        conn.commit()
+
+
+def dismiss_subscription_reminder(queue_id: int, admin_id: int) -> bool:
+    now_text = _dt_to_db(_utc_now()) or ""
+    with db.connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE subscription_reminder_queue
+            SET status = 'dismissed', reviewed_by = ?, reviewed_at = ?, updated_at = ?
+            WHERE id = ? AND status = 'pending'
+            """,
+            (int(admin_id), now_text, now_text, int(queue_id)),
+        )
+        conn.commit()
+    return bool(cursor.rowcount)
+
+
+def _subscription_automation_state_get(key: str) -> str | None:
+    init_subscription_automation_tables()
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT state_value FROM subscription_automation_state WHERE state_key = ?",
+            (str(key),),
+        ).fetchone()
+    return str(row["state_value"]) if row and row["state_value"] is not None else None
+
+
+def _subscription_automation_state_set(key: str, value: str) -> None:
+    now_text = _dt_to_db(_utc_now()) or ""
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO subscription_automation_state (state_key, state_value, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(state_key) DO UPDATE SET
+                state_value = excluded.state_value,
+                updated_at = excluded.updated_at
+            """,
+            (str(key), str(value), now_text),
+        )
+        conn.commit()
+
+
+def _renewal_user_label(row: dict[str, Any]) -> str:
+    username = str(row.get("username") or "").strip()
+    first_name = str(row.get("first_name") or "").strip()
+    return f"@{username}" if username else (first_name or "без имени")
+
+
+def subscription_action_line(row: dict[str, Any]) -> str:
+    milestone = str(row.get("milestone") or "")
+    emoji = {"expired": "🚨", "d1": "🔴", "d3": "🟠", "d7": "🟡"}.get(milestone, "▫️")
+    kind = "оплата" if row.get("subscription_kind") == "paid" else "trial"
+    return (
+        f"{emoji} <b>#{int(row.get('id') or 0)}</b> | <code>{int(row.get('telegram_id') or 0)}</code> — "
+        f"{escape(_renewal_user_label(row))}\n"
+        f"{kind}, до <b>{_fmt_dt(row.get('active_until'))}</b> · открыть: <code>/reminder {int(row.get('id') or 0)}</code>"
+    )
+
+
+def build_subscription_action_digest(rows: list[dict[str, Any]], created: int = 0) -> str:
+    counts = {"expired": 0, "d1": 0, "d3": 0, "d7": 0}
+    for row in rows:
+        key = str(row.get("milestone") or "")
+        if key in counts:
+            counts[key] += 1
+    lines = [subscription_action_line(row) for row in rows[:25]]
+    more = len(rows) - len(lines)
+    body = "\n\n".join(lines) if lines else "— сейчас действий нет"
+    if more > 0:
+        body += f"\n\nЕщё записей: <b>{more}</b>"
+    return (
+        "🔐 <b>Контроль подписок</b>\n\n"
+        f"🚨 Уже закончились: <b>{counts['expired']}</b>\n"
+        f"🔴 До 1 дня: <b>{counts['d1']}</b>\n"
+        f"🟠 До 3 дней: <b>{counts['d3']}</b>\n"
+        f"🟡 До 7 дней: <b>{counts['d7']}</b>\n"
+        f"🆕 Новых черновиков: <b>{created}</b>\n\n"
+        f"{body}\n\n"
+        "<b>Что делать:</b>\n"
+        "1. Откройте черновик командой <code>/reminder НОМЕР</code>.\n"
+        "2. Проверьте текст и дату.\n"
+        "3. Отправьте его кнопкой подтверждения или отклоните.\n\n"
+        "Без вашего нажатия клиенту ничего не отправляется, подписка не продлевается и не блокируется."
+    )
+
+
 def list_blocked_users(limit: int = 50) -> list[dict[str, Any]]:
     with db.connect() as conn:
         rows = conn.execute(
@@ -779,6 +1143,7 @@ def list_staff_shop_connections(limit: int = 30) -> list[dict[str, Any]]:
 
 init_subscription_tables()
 init_business_tables()
+init_subscription_automation_tables()
 init_unit_economy_tables()
 init_staff_connect_tables()
 
@@ -5266,19 +5631,165 @@ async def check_connection(message: Message) -> None:
     await message.answer("\n".join(lines), reply_markup=menu_for_message(message))
 
 
-@dp.message(Command("expiring"))
+def subscription_queue_markup(rows: list[dict[str, Any]]) -> InlineKeyboardMarkup | None:
+    buttons = []
+    for row in rows[:10]:
+        queue_id = int(row.get("id") or 0)
+        label = _renewal_user_label(row)
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"👁 #{queue_id} · {label}"[:60],
+                callback_data=f"renewal_preview:{queue_id}",
+            )
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+
+
+def subscription_reminder_review_markup(queue_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Подтвердить и отправить",
+                    callback_data=f"renewal_send:{int(queue_id)}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗑 Не отправлять",
+                    callback_data=f"renewal_dismiss:{int(queue_id)}",
+                )
+            ],
+        ]
+    )
+
+
+def subscription_reminder_preview_text(row: dict[str, Any]) -> str:
+    last_error = str(row.get("last_error") or "").strip()
+    error_text = f"\n\n⚠️ Последняя ошибка: <code>{escape(last_error)}</code>" if last_error else ""
+    return (
+        "👁 <b>Проверка напоминания</b>\n\n"
+        f"Очередь: <b>#{int(row.get('id') or 0)}</b>\n"
+        f"Клиент: <code>{int(row.get('telegram_id') or 0)}</code> — {escape(_renewal_user_label(row))}\n"
+        f"Доступ до: <b>{_fmt_dt(row.get('active_until'))}</b>\n\n"
+        "<b>Текст, который получит клиент:</b>\n\n"
+        f"{row.get('draft_text') or '—'}"
+        f"{error_text}\n\n"
+        "Сообщение будет отправлено только после нажатия кнопки подтверждения."
+    )
+
+
+@dp.message(Command("expiring", "renewals"))
 async def admin_expiring(message: Message) -> None:
     admin_id = upsert_from_message(message)
     if not admin_only(admin_id):
         return
-    rows = list_expiring_users(3, 50)
-    if not rows:
-        await message.answer("⏳ В ближайшие 3 дня подписки не заканчиваются.", reply_markup=admin_menu_for_message(message))
+    summary = refresh_subscription_reminder_queue()
+    rows = list_pending_subscription_reminders(100)
+    await message.answer(
+        build_subscription_action_digest(rows, int(summary.get("created") or 0)),
+        reply_markup=subscription_queue_markup(rows) or admin_menu_for_message(message),
+    )
+
+
+@dp.message(Command("reminder"))
+async def admin_subscription_reminder_preview(message: Message) -> None:
+    admin_id = upsert_from_message(message)
+    if not admin_only(admin_id):
+        return
+    args = parse_args(message.text or "").split()
+    if not args or not args[0].isdigit():
+        await message.answer(
+            "Откройте список <code>/renewals</code>, затем напишите <code>/reminder НОМЕР</code>.",
+            reply_markup=admin_menu_for_message(message),
+        )
+        return
+    row = get_subscription_reminder(int(args[0]), pending_only=True)
+    if not row:
+        await message.answer(
+            "Этот черновик уже обработан или не найден. Обновите список: <code>/renewals</code>.",
+            reply_markup=admin_menu_for_message(message),
+        )
         return
     await message.answer(
-        "⏳ <b>Заканчиваются в ближайшие 3 дня</b>\n\n" + "\n".join(subscription_compact_line(r) for r in rows),
-        reply_markup=admin_menu_for_message(message),
+        subscription_reminder_preview_text(row),
+        reply_markup=subscription_reminder_review_markup(int(row["id"])),
     )
+
+
+@dp.callback_query(F.data.startswith("renewal_preview:"))
+async def subscription_reminder_preview_callback(callback: CallbackQuery) -> None:
+    admin_id = int(callback.from_user.id) if callback.from_user else 0
+    if not admin_only(admin_id):
+        await callback.answer("Только для администратора", show_alert=True)
+        return
+    raw_id = str(callback.data or "").split(":", 1)[-1]
+    row = get_subscription_reminder(int(raw_id), pending_only=True) if raw_id.isdigit() else None
+    if not row:
+        await callback.answer("Черновик уже обработан или не найден", show_alert=True)
+        return
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            subscription_reminder_preview_text(row),
+            reply_markup=subscription_reminder_review_markup(int(row["id"])),
+        )
+
+
+@dp.callback_query(F.data.startswith("renewal_send:"))
+async def subscription_reminder_send_callback(callback: CallbackQuery) -> None:
+    admin_id = int(callback.from_user.id) if callback.from_user else 0
+    if not admin_only(admin_id):
+        await callback.answer("Только для администратора", show_alert=True)
+        return
+    raw_id = str(callback.data or "").split(":", 1)[-1]
+    if not raw_id.isdigit():
+        await callback.answer("Некорректный номер", show_alert=True)
+        return
+    queue_id = int(raw_id)
+    row = get_subscription_reminder(queue_id, pending_only=True)
+    if not row or not claim_subscription_reminder(queue_id, admin_id):
+        await callback.answer("Черновик уже обработан", show_alert=True)
+        return
+
+    target = int(row.get("telegram_id") or 0)
+    try:
+        await bot.send_message(
+            target,
+            str(row.get("draft_text") or ""),
+            reply_markup=main_menu_for_user(target),
+        )
+        finish_subscription_reminder(queue_id, sent=True)
+    except Exception as exc:
+        logging.exception("Confirmed subscription reminder failed: queue=%s user=%s", queue_id, target)
+        finish_subscription_reminder(queue_id, sent=False, error=str(exc))
+        await callback.answer("Не удалось отправить. Черновик сохранён.", show_alert=True)
+        return
+
+    await callback.answer("Напоминание отправлено")
+    if callback.message:
+        await callback.message.answer(
+            f"✅ Напоминание <b>#{queue_id}</b> отправлено пользователю <code>{target}</code> после вашего подтверждения.",
+            reply_markup=admin_menu_for_user(admin_id),
+        )
+
+
+@dp.callback_query(F.data.startswith("renewal_dismiss:"))
+async def subscription_reminder_dismiss_callback(callback: CallbackQuery) -> None:
+    admin_id = int(callback.from_user.id) if callback.from_user else 0
+    if not admin_only(admin_id):
+        await callback.answer("Только для администратора", show_alert=True)
+        return
+    raw_id = str(callback.data or "").split(":", 1)[-1]
+    if not raw_id.isdigit() or not dismiss_subscription_reminder(int(raw_id), admin_id):
+        await callback.answer("Черновик уже обработан или не найден", show_alert=True)
+        return
+    await callback.answer("Черновик отклонён")
+    if callback.message:
+        await callback.message.answer(
+            f"🗑 Черновик <b>#{int(raw_id)}</b> отмечен как «не отправлять».",
+            reply_markup=admin_menu_for_user(admin_id),
+        )
 
 
 @dp.message(Command("blocked"))
@@ -5392,7 +5903,7 @@ async def admin_users(message: Message) -> None:
     await message.answer(
         "👥 <b>Пользователи</b>\n\n"
         + "\n".join(lines)
-        + "\n\nКоманды: <code>/extend ID 30</code>, <code>/paid ID сумма дни</code>, <code>/payments</code>",
+        + "\n\nКоманды: <code>/renewals</code>, <code>/extend ID 30</code>, <code>/paid ID сумма дни</code>, <code>/payments</code>",
         reply_markup=menu_for_message(message),
     )
 
@@ -8836,7 +9347,6 @@ async def button_smart_lowstock(message: Message) -> None:
 
 
 _daily_report_sent: set[tuple[int, str]] = set()
-_subscription_reminder_sent: set[tuple[int, str]] = set()
 
 
 def _connected_users_basic() -> list[dict[str, Any]]:
@@ -8883,47 +9393,40 @@ async def daily_report_loop() -> None:
 
 async def subscription_reminder_loop() -> None:
     await asyncio.sleep(120)
-    logging.info("Subscription reminder loop started. Enabled: %s", SUBSCRIPTION_REMINDERS)
+    logging.info(
+        "Subscription draft loop started. Enabled: %s. Admin digest hour UZT: %s. Windows: %s",
+        SUBSCRIPTION_REMINDERS,
+        SUBSCRIPTION_ADMIN_DIGEST_HOUR_UZT,
+        SUBSCRIPTION_REMINDER_DAYS,
+    )
     while True:
         try:
             if SUBSCRIPTION_REMINDERS:
-                now = _utc_now()
-                today_key = now.strftime("%Y-%m-%d")
-                with db.connect() as conn:
-                    rows = conn.execute(
-                        """
-                        SELECT telegram_id, trial_until, subscription_until, blocked
-                        FROM subscriptions
-                        WHERE blocked = 0
-                        """
-                    ).fetchall()
-                for row in rows:
-                    telegram_id = int(row["telegram_id"])
-                    if is_admin(telegram_id):
-                        continue
-                    until = subscription_active_until(dict(row))
-                    if not until:
-                        continue
-                    delta = until - now
-                    if timedelta(0) < delta <= timedelta(days=SUBSCRIPTION_REMINDER_DAYS):
-                        key = (telegram_id, today_key)
-                        if key in _subscription_reminder_sent:
-                            continue
+                now_uzt = datetime.now(UZT)
+                today_key = now_uzt.strftime("%Y-%m-%d")
+                last_digest_day = _subscription_automation_state_get("last_admin_digest_day")
+                if now_uzt.hour >= SUBSCRIPTION_ADMIN_DIGEST_HOUR_UZT and last_digest_day != today_key:
+                    summary = refresh_subscription_reminder_queue()
+                    rows = list_pending_subscription_reminders(100)
+                    digest = build_subscription_action_digest(rows, int(summary.get("created") or 0))
+                    sent_to_admin = False
+                    for admin_id in sorted(ADMIN_IDS):
                         try:
                             await bot.send_message(
-                                telegram_id,
-                                "⏳ <b>Скоро закончится доступ</b>\n\n"
-                                f"Подписка/trial активны до: <b>{_fmt_dt(until)}</b>\n\n"
-                                "Чтобы бот продолжил работать без остановки, продлите подписку заранее.\n"
-                                "Оплата: <code>/subscribe</code>",
-                                reply_markup=main_menu_for_user(telegram_id),
+                                admin_id,
+                                digest,
+                                reply_markup=subscription_queue_markup(rows) or ADMIN_PANEL_MENU_RU,
                             )
-                            _subscription_reminder_sent.add(key)
+                            sent_to_admin = True
                             await asyncio.sleep(0.2)
                         except Exception:
-                            logging.exception("Subscription reminder: failed for user=%s", telegram_id)
+                            logging.exception("Subscription action digest failed for admin=%s", admin_id)
+                    if sent_to_admin:
+                        _subscription_automation_state_set("last_admin_digest_day", today_key)
+                    elif not ADMIN_IDS:
+                        logging.error("Subscription action digest skipped: ADMIN_IDS is empty")
         except Exception:
-            logging.exception("Subscription reminder loop error")
+            logging.exception("Subscription draft loop error")
         await asyncio.sleep(3600)
 
 
@@ -10124,8 +10627,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
-
