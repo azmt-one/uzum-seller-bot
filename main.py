@@ -102,6 +102,12 @@ PAYMENT_TEXT = os.getenv(
     "PAYMENT_TEXT",
     "Нажмите кнопку ниже, напишите администратору и отправьте чек. После проверки доступ будет продлён."
 ).strip()
+PAYMENT_REQUISITES = os.getenv("PAYMENT_REQUISITES", "").strip().replace("\\n", "\n")
+PAYMENT_PLANS: dict[int, dict[str, Any]] = {
+    1: {"months": 1, "days": 30, "amount": 300_000, "ru": "1 месяц", "uz": "1 oy"},
+    3: {"months": 3, "days": 90, "amount": 800_000, "ru": "3 месяца", "uz": "3 oy"},
+    6: {"months": 6, "days": 180, "amount": 1_500_000, "ru": "6 месяцев", "uz": "6 oy"},
+}
 SUBSCRIPTION_PLANS_TEXT = os.getenv(
     "SUBSCRIPTION_PLANS_TEXT",
     "1 месяц — 300 000 сум\n3 месяца — 800 000 сум\n6 месяцев — 1 500 000 сум\n\nБез ограничений по количеству магазинов продавца"
@@ -514,6 +520,44 @@ def init_subscription_automation_tables() -> None:
         conn.commit()
 
 
+def init_payment_request_tables() -> None:
+    with db.connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS payment_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                plan_months INTEGER NOT NULL,
+                plan_days INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'awaiting_receipt',
+                receipt_file_id TEXT,
+                receipt_file_unique_id TEXT,
+                receipt_type TEXT,
+                reviewed_by INTEGER,
+                reviewed_at TEXT,
+                payment_history_id INTEGER,
+                rejection_reason TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_payment_requests_status
+            ON payment_requests (status, created_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_payment_requests_user
+            ON payment_requests (telegram_id, created_at)
+            """
+        )
+        conn.commit()
+
+
 def record_payment(telegram_id: int, amount: int, days: int, admin_id: int | None = None, comment: str = "") -> int:
     init_business_tables()
     with db.connect() as conn:
@@ -562,6 +606,298 @@ def payment_line(row: dict[str, Any]) -> str:
     return (
         f"#{row.get('id')} | <code>{int(row.get('telegram_id') or 0)}</code> | "
         f"{amount_text} сум | {int(row.get('days') or 0)} дней | {_fmt_dt(row.get('created_at'))}{comment_part}"
+    )
+
+
+def _payment_amount_text(amount: int) -> str:
+    return f"{int(amount):,}".replace(",", " ")
+
+
+def payment_plan(months: int) -> dict[str, Any] | None:
+    plan = PAYMENT_PLANS.get(int(months))
+    return dict(plan) if plan else None
+
+
+def create_payment_request(telegram_id: int, months: int) -> tuple[dict[str, Any], bool]:
+    init_payment_request_tables()
+    plan = payment_plan(months)
+    if not plan:
+        raise ValueError("Unknown payment plan")
+    now_text = _dt_to_db(_utc_now()) or ""
+    with db.connect() as conn:
+        pending = conn.execute(
+            """
+            SELECT * FROM payment_requests
+            WHERE telegram_id = ? AND status = 'pending_review'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (int(telegram_id),),
+        ).fetchone()
+        if pending:
+            return dict(pending), False
+        conn.execute(
+            """
+            UPDATE payment_requests
+            SET status = 'superseded', updated_at = ?
+            WHERE telegram_id = ? AND status = 'awaiting_receipt'
+            """,
+            (now_text, int(telegram_id)),
+        )
+        cursor = conn.execute(
+            """
+            INSERT INTO payment_requests
+            (telegram_id, plan_months, plan_days, amount, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, 'awaiting_receipt', ?, ?)
+            """,
+            (
+                int(telegram_id),
+                int(plan["months"]),
+                int(plan["days"]),
+                int(plan["amount"]),
+                now_text,
+                now_text,
+            ),
+        )
+        request_id = int(cursor.lastrowid)
+        conn.commit()
+        row = conn.execute("SELECT * FROM payment_requests WHERE id = ?", (request_id,)).fetchone()
+    return dict(row), True
+
+
+def get_payment_request(request_id: int) -> dict[str, Any] | None:
+    init_payment_request_tables()
+    with db.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT p.*, u.username, u.first_name
+            FROM payment_requests p
+            LEFT JOIN users u ON u.telegram_id = p.telegram_id
+            WHERE p.id = ?
+            """,
+            (int(request_id),),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def latest_awaiting_payment_request(telegram_id: int) -> dict[str, Any] | None:
+    init_payment_request_tables()
+    with db.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM payment_requests
+            WHERE telegram_id = ? AND status = 'awaiting_receipt'
+            ORDER BY id DESC LIMIT 1
+            """,
+            (int(telegram_id),),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def latest_payment_request_by_status(telegram_id: int, status: str) -> dict[str, Any] | None:
+    init_payment_request_tables()
+    with db.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM payment_requests
+            WHERE telegram_id = ? AND status = ?
+            ORDER BY id DESC LIMIT 1
+            """,
+            (int(telegram_id), str(status)),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def list_payment_requests(status: str = "pending_review", limit: int = 50) -> list[dict[str, Any]]:
+    init_payment_request_tables()
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT p.*, u.username, u.first_name
+            FROM payment_requests p
+            LEFT JOIN users u ON u.telegram_id = p.telegram_id
+            WHERE p.status = ?
+            ORDER BY p.id DESC
+            LIMIT ?
+            """,
+            (str(status), max(1, int(limit))),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def attach_payment_receipt(
+    request_id: int,
+    telegram_id: int,
+    *,
+    file_id: str,
+    file_unique_id: str,
+    receipt_type: str,
+) -> tuple[dict[str, Any] | None, str | None]:
+    init_payment_request_tables()
+    now_text = _dt_to_db(_utc_now()) or ""
+    with db.connect() as conn:
+        duplicate = conn.execute(
+            """
+            SELECT id FROM payment_requests
+            WHERE receipt_file_unique_id = ?
+              AND id <> ?
+              AND status IN ('pending_review', 'approved')
+            LIMIT 1
+            """,
+            (str(file_unique_id), int(request_id)),
+        ).fetchone()
+        if duplicate:
+            return None, "duplicate"
+        cursor = conn.execute(
+            """
+            UPDATE payment_requests
+            SET receipt_file_id = ?, receipt_file_unique_id = ?, receipt_type = ?,
+                status = 'pending_review', updated_at = ?
+            WHERE id = ? AND telegram_id = ? AND status = 'awaiting_receipt'
+            """,
+            (
+                str(file_id),
+                str(file_unique_id),
+                str(receipt_type),
+                now_text,
+                int(request_id),
+                int(telegram_id),
+            ),
+        )
+        conn.commit()
+    if not cursor.rowcount:
+        return None, "not_available"
+    return get_payment_request(request_id), None
+
+
+def cancel_payment_request(request_id: int, telegram_id: int) -> bool:
+    now_text = _dt_to_db(_utc_now()) or ""
+    with db.connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE payment_requests
+            SET status = 'cancelled', updated_at = ?
+            WHERE id = ? AND telegram_id = ? AND status = 'awaiting_receipt'
+            """,
+            (now_text, int(request_id), int(telegram_id)),
+        )
+        conn.commit()
+    return bool(cursor.rowcount)
+
+
+def approve_payment_request(request_id: int, admin_id: int) -> dict[str, Any] | None:
+    request = get_payment_request(request_id)
+    if not request or request.get("status") != "pending_review":
+        return None
+    telegram_id = int(request["telegram_id"])
+    ensure_subscription(telegram_id)
+    now = _utc_now()
+    now_text = _dt_to_db(now) or ""
+
+    with db.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT * FROM payment_requests WHERE id = ?",
+            (int(request_id),),
+        ).fetchone()
+        if not current or current["status"] != "pending_review":
+            conn.rollback()
+            return None
+
+        subscription = conn.execute(
+            "SELECT * FROM subscriptions WHERE telegram_id = ?",
+            (telegram_id,),
+        ).fetchone()
+        subscription_row = dict(subscription) if subscription else {}
+        candidates = [
+            now,
+            _dt_from_db(subscription_row.get("subscription_until")),
+            _dt_from_db(subscription_row.get("trial_until")),
+        ]
+        base = max(value for value in candidates if value is not None)
+        new_until = base + timedelta(days=int(current["plan_days"]))
+        new_until_text = _dt_to_db(new_until) or ""
+
+        conn.execute(
+            """
+            UPDATE subscriptions
+            SET subscription_until = ?, blocked = 0, updated_at = ?
+            WHERE telegram_id = ?
+            """,
+            (new_until_text, now_text, telegram_id),
+        )
+        payment_cursor = conn.execute(
+            """
+            INSERT INTO payment_history (telegram_id, amount, days, admin_id, comment, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                telegram_id,
+                int(current["amount"]),
+                int(current["plan_days"]),
+                int(admin_id),
+                f"чек #{int(request_id)}, {int(current['plan_months'])} мес.",
+                now_text,
+            ),
+        )
+        payment_id = int(payment_cursor.lastrowid)
+        conn.execute(
+            """
+            UPDATE payment_requests
+            SET status = 'approved', reviewed_by = ?, reviewed_at = ?,
+                payment_history_id = ?, updated_at = ?
+            WHERE id = ? AND status = 'pending_review'
+            """,
+            (int(admin_id), now_text, payment_id, now_text, int(request_id)),
+        )
+        conn.execute(
+            """
+            UPDATE subscription_reminder_queue
+            SET status = 'superseded', updated_at = ?
+            WHERE telegram_id = ? AND status = 'pending'
+            """,
+            (now_text, telegram_id),
+        )
+        conn.commit()
+
+    result = dict(current)
+    result["new_until"] = new_until_text
+    result["payment_history_id"] = payment_id
+    return result
+
+
+def reject_payment_request(request_id: int, admin_id: int, reason: str) -> dict[str, Any] | None:
+    now_text = _dt_to_db(_utc_now()) or ""
+    with db.connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE payment_requests
+            SET status = 'rejected', reviewed_by = ?, reviewed_at = ?,
+                rejection_reason = ?, updated_at = ?
+            WHERE id = ? AND status = 'pending_review'
+            """,
+            (int(admin_id), now_text, str(reason)[:500], now_text, int(request_id)),
+        )
+        conn.commit()
+    return get_payment_request(request_id) if cursor.rowcount else None
+
+
+def payment_request_user_label(row: dict[str, Any]) -> str:
+    username = str(row.get("username") or "").strip()
+    first_name = str(row.get("first_name") or "").strip()
+    return f"@{username}" if username else (first_name or "без имени")
+
+
+def payment_request_caption(row: dict[str, Any]) -> str:
+    telegram_id = int(row.get("telegram_id") or 0)
+    return (
+        "🧾 <b>Новый чек на проверку</b>\n\n"
+        f"Заявка: <b>#{int(row.get('id') or 0)}</b>\n"
+        f"Клиент: <a href=\"tg://user?id={telegram_id}\">{escape(payment_request_user_label(row))}</a>\n"
+        f"Telegram ID: <code>{telegram_id}</code>\n"
+        f"Тариф: <b>{int(row.get('plan_months') or 0)} мес.</b>\n"
+        f"Сумма: <b>{_payment_amount_text(int(row.get('amount') or 0))} сум</b>\n"
+        f"Отправлен: <b>{_fmt_dt(row.get('updated_at'))}</b>\n\n"
+        "Проверьте сумму и получателя на чеке. Доступ изменится только после подтверждения."
     )
 
 
@@ -711,6 +1047,9 @@ def get_admin_stats() -> dict[str, int]:
             "SELECT COALESCE(SUM(amount), 0) FROM payment_history WHERE created_at >= ?",
             (_dt_to_db(now - timedelta(days=30)),),
         ).fetchone()[0]
+        pending_receipts = conn.execute(
+            "SELECT COUNT(*) FROM payment_requests WHERE status = 'pending_review'"
+        ).fetchone()[0]
     active = paid = trial = expired = blocked = 0
     for r in rows:
         row = dict(r)
@@ -737,6 +1076,7 @@ def get_admin_stats() -> dict[str, int]:
         "blocked": blocked,
         "payments_today": int(payments_today or 0),
         "payments_30": int(payments_30 or 0),
+        "pending_receipts": int(pending_receipts or 0),
     }
 
 
@@ -1144,6 +1484,7 @@ def list_staff_shop_connections(limit: int = 30) -> list[dict[str, Any]]:
 init_subscription_tables()
 init_business_tables()
 init_subscription_automation_tables()
+init_payment_request_tables()
 init_unit_economy_tables()
 init_staff_connect_tables()
 
@@ -2027,8 +2368,8 @@ def subscription_full_text(telegram_id: int) -> str:
             f"Trial tugash vaqti: <b>{_fmt_dt(row.get('trial_until'))}</b>\n"
             f"To‘langan muddat: <b>{_fmt_dt(row.get('subscription_until'))}</b>\n\n"
             "Tariflar:\n"
-            f"<b>{escape(SUBSCRIPTION_PLANS_TEXT)}</b>\n\n"
-            f"{escape(PAYMENT_TEXT)}\n\n"
+            f"<b>{escape(SUBSCRIPTION_PLANS_TEXT_UZ)}</b>\n\n"
+            "Tarifni tanlash va chek yuborish: <code>/subscribe</code>\n\n"
             "To‘lovlar tarixi: <code>/my_payments</code>\n"
             "Yordam: <code>/support</code>\n"
             "API-kalitni almashtirish: <code>/reconnect</code>\n"
@@ -2042,7 +2383,7 @@ def subscription_full_text(telegram_id: int) -> str:
         f"Оплачено до: <b>{_fmt_dt(row.get('subscription_until'))}</b>\n\n"
         "Тарифы:\n"
         f"<b>{escape(SUBSCRIPTION_PLANS_TEXT)}</b>\n\n"
-        f"{escape(PAYMENT_TEXT)}\n\n"
+        "Выбрать тариф и отправить чек: <code>/subscribe</code>\n\n"
         "История оплат: <code>/my_payments</code>\n"
         "Поддержка: <code>/support</code>\n"
         "Заменить API-ключ: <code>/reconnect</code>\n"
@@ -2060,6 +2401,10 @@ class CostImportStates(StatesGroup):
 
 class BarcodePrintStates(StatesGroup):
     waiting_for_items = State()
+
+
+class PaymentStates(StatesGroup):
+    waiting_for_receipt = State()
 
 
 def get_tg_id(message: Message) -> int:
@@ -2755,8 +3100,15 @@ async def menu(message: Message) -> None:
 
 @dp.message(Command("cancel"))
 async def cancel(message: Message, state: FSMContext) -> None:
+    telegram_id = upsert_from_message(message)
+    current_state = await state.get_state()
+    if current_state == PaymentStates.waiting_for_receipt.state:
+        data = await state.get_data()
+        request_id = int(data.get("payment_request_id") or 0)
+        if request_id:
+            cancel_payment_request(request_id, telegram_id)
     await state.clear()
-    await message.answer(tr_user(upsert_from_message(message), "cancelled"), reply_markup=menu_for_message(message))
+    await message.answer(tr_user(telegram_id, "cancelled"), reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("status"))
@@ -5363,11 +5715,107 @@ async def reviews_watch_loop() -> None:
         await asyncio.sleep(max(60, REVIEW_CHECK_INTERVAL_SECONDS))
 
 
+def payment_plan_markup(lang: str) -> InlineKeyboardMarkup:
+    is_uz = normalize_lang(lang) == "uz"
+    rows = []
+    for months in (1, 3, 6):
+        plan = PAYMENT_PLANS[months]
+        label = plan["uz"] if is_uz else plan["ru"]
+        amount = _payment_amount_text(int(plan["amount"]))
+        rows.append([
+            InlineKeyboardButton(
+                text=f"{label} — {amount} {'so‘m' if is_uz else 'сум'}",
+                callback_data=f"payplan:{months}",
+            )
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def payment_cancel_markup(request_id: int, lang: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[[
+            InlineKeyboardButton(
+                text="❌ Bekor qilish" if normalize_lang(lang) == "uz" else "❌ Отменить оплату",
+                callback_data=f"paycancel:{int(request_id)}",
+            )
+        ]]
+    )
+
+
+def payment_admin_action_markup(request_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"payapprove:{int(request_id)}"),
+                InlineKeyboardButton(text="❌ Отклонить", callback_data=f"payreject_menu:{int(request_id)}"),
+            ]
+        ]
+    )
+
+
+def payment_rejection_markup(request_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📷 Чек не читается", callback_data=f"payreject:{int(request_id)}:unreadable")],
+            [InlineKeyboardButton(text="💰 Сумма не совпадает", callback_data=f"payreject:{int(request_id)}:amount")],
+            [InlineKeyboardButton(text="🔎 Платёж не найден", callback_data=f"payreject:{int(request_id)}:not_found")],
+            [InlineKeyboardButton(text="❌ Другая причина", callback_data=f"payreject:{int(request_id)}:other")],
+        ]
+    )
+
+
+async def send_payment_request_to_admins(row: dict[str, Any]) -> int:
+    sent = 0
+    caption = payment_request_caption(row)
+    request_id = int(row.get("id") or 0)
+    only_admin = int(row.get("_only_admin") or 0)
+    admin_ids = [only_admin] if only_admin else sorted(ADMIN_IDS)
+    for admin_id in admin_ids:
+        try:
+            if row.get("receipt_type") == "document":
+                await bot.send_document(
+                    admin_id,
+                    str(row.get("receipt_file_id") or ""),
+                    caption=caption,
+                    reply_markup=payment_admin_action_markup(request_id),
+                )
+            else:
+                await bot.send_photo(
+                    admin_id,
+                    str(row.get("receipt_file_id") or ""),
+                    caption=caption,
+                    reply_markup=payment_admin_action_markup(request_id),
+                )
+            sent += 1
+            await asyncio.sleep(0.15)
+        except Exception:
+            logging.exception("Payment receipt delivery failed: request=%s admin=%s", request_id, admin_id)
+    return sent
+
+
 @dp.message(Command("subscribe"))
 async def subscribe(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     ensure_subscription(telegram_id)
     lang = get_user_language(telegram_id)
+    pending = latest_payment_request_by_status(telegram_id, "pending_review")
+    if pending:
+        text = (
+            "🧾 <b>Chekingiz tekshirilmoqda</b>\n\n"
+            f"Ariza: <b>#{int(pending['id'])}</b>\n"
+            f"Tarif: <b>{int(pending['plan_months'])} oy</b>\n"
+            f"Summa: <b>{_payment_amount_text(int(pending['amount']))} so‘m</b>\n\n"
+            "Administrator tekshirgach, sizga xabar keladi."
+            if lang == "uz"
+            else
+            "🧾 <b>Ваш чек находится на проверке</b>\n\n"
+            f"Заявка: <b>#{int(pending['id'])}</b>\n"
+            f"Тариф: <b>{int(pending['plan_months'])} мес.</b>\n"
+            f"Сумма: <b>{_payment_amount_text(int(pending['amount']))} сум</b>\n\n"
+            "После проверки администратором вы получите уведомление."
+        )
+        await message.answer(text, reply_markup=menu_for_message(message))
+        return
     if lang == "uz":
         text = (
             "💎 <b>Uzum Seller Assistant obunasi</b>\n\n"
@@ -5379,12 +5827,8 @@ async def subscribe(message: Message) -> None:
             "✅ bir nechta do‘kon bilan ishlash\n"
             "✅ Excel hisobot va ertalabki hisobot\n\n"
             f"🎁 Trial: yangi foydalanuvchi uchun <b>{TRIAL_DAYS} kun</b>\n\n"
-            "💰 <b>Tariflar</b>\n"
-            f"{escape(SUBSCRIPTION_PLANS_TEXT)}\n\n"
-            f"To‘lov uchun administratorga yozing: <b>{admin_contact_text()}</b>\n"
-            f"{escape(PAYMENT_TEXT)}\n\n"
-            "Chek tekshirilgach, administrator kirishni uzaytiradi.\n"
-            "Holatni tekshirish: <code>/my_subscription</code>"
+            "💰 <b>Tarifni tanlang</b>\n\n"
+            "Keyingi bosqichda to‘lov rekvizitlari chiqadi. To‘lovdan so‘ng chekni shu yerga yuborasiz."
         )
     else:
         text = (
@@ -5397,14 +5841,330 @@ async def subscribe(message: Message) -> None:
             "✅ работа с несколькими магазинами\n"
             "✅ Excel-отчёт и утренний отчёт\n\n"
             f"🎁 Trial: <b>{TRIAL_DAYS} дня</b> для нового пользователя\n\n"
-            "💰 <b>Тарифы</b>\n"
-            f"{escape(SUBSCRIPTION_PLANS_TEXT)}\n\n"
-            f"Для оплаты напишите администратору: <b>{admin_contact_text()}</b>\n"
-            f"{escape(PAYMENT_TEXT)}\n\n"
-            "После проверки чекa администратор продлит доступ.\n"
-            "Проверить статус: <code>/my_subscription</code>"
+            "💰 <b>Выберите тариф</b>\n\n"
+            "На следующем шаге появятся реквизиты. После оплаты вы отправите чек прямо сюда."
         )
-    await message.answer(text, reply_markup=admin_contact_markup() or menu_for_message(message))
+    await message.answer(text, reply_markup=payment_plan_markup(lang))
+
+
+@dp.callback_query(F.data.startswith("payplan:"))
+async def payment_plan_selected(callback: CallbackQuery, state: FSMContext) -> None:
+    user = callback.from_user
+    if not user:
+        return
+    telegram_id = int(user.id)
+    db.upsert_user(telegram_id, user.username, user.first_name)
+    lang = get_user_language(telegram_id)
+    raw_months = str(callback.data or "").split(":", 1)[-1]
+    plan = payment_plan(int(raw_months)) if raw_months.isdigit() else None
+    if not plan:
+        await callback.answer("Некорректный тариф", show_alert=True)
+        return
+    if not PAYMENT_REQUISITES:
+        await callback.answer(
+            "Реквизиты оплаты пока не настроены. Напишите администратору.",
+            show_alert=True,
+        )
+        if callback.message:
+            await callback.message.answer(
+                ("Administratorga yozing: " if lang == "uz" else "Напишите администратору: ")
+                + f"<b>{admin_contact_text()}</b>",
+                reply_markup=admin_contact_markup() or main_menu_for_user(telegram_id),
+            )
+        return
+
+    row, created = create_payment_request(telegram_id, int(plan["months"]))
+    if not created and row.get("status") == "pending_review":
+        await callback.answer(
+            "Chekingiz allaqachon tekshirilmoqda" if lang == "uz" else "Ваш чек уже проверяется",
+            show_alert=True,
+        )
+        return
+
+    request_id = int(row["id"])
+    await state.set_state(PaymentStates.waiting_for_receipt)
+    await state.update_data(payment_request_id=request_id)
+    await callback.answer()
+    if not callback.message:
+        return
+    amount_text = _payment_amount_text(int(plan["amount"]))
+    if lang == "uz":
+        text = (
+            "💳 <b>To‘lov</b>\n\n"
+            f"Tarif: <b>{plan['uz']}</b>\n"
+            f"To‘lov summasi: <b>{amount_text} so‘m</b>\n\n"
+            f"<b>Rekvizitlar:</b>\n{escape(PAYMENT_REQUISITES)}\n\n"
+            "To‘lovdan so‘ng chek skrinshotini yoki PDF faylini shu chatga yuboring."
+        )
+    else:
+        text = (
+            "💳 <b>Оплата подписки</b>\n\n"
+            f"Тариф: <b>{plan['ru']}</b>\n"
+            f"К оплате: <b>{amount_text} сум</b>\n\n"
+            f"<b>Реквизиты:</b>\n{escape(PAYMENT_REQUISITES)}\n\n"
+            "После оплаты отправьте в этот чат скриншот чека или PDF-файл."
+        )
+    await callback.message.answer(text, reply_markup=payment_cancel_markup(request_id, lang))
+
+
+@dp.callback_query(F.data.startswith("paycancel:"))
+async def payment_cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    user = callback.from_user
+    raw_id = str(callback.data or "").split(":", 1)[-1]
+    if not user or not raw_id.isdigit():
+        await callback.answer("Ошибка", show_alert=True)
+        return
+    cancelled = cancel_payment_request(int(raw_id), int(user.id))
+    await state.clear()
+    lang = get_user_language(int(user.id))
+    await callback.answer("Bekor qilindi" if lang == "uz" else "Оплата отменена")
+    if callback.message:
+        await callback.message.answer(
+            "To‘lov bekor qilindi." if lang == "uz" else "Оплата отменена. Вы можете выбрать тариф заново: /subscribe",
+            reply_markup=main_menu_for_user(int(user.id)),
+        )
+    if not cancelled:
+        logging.info("Payment cancel ignored: request=%s user=%s", raw_id, user.id)
+
+
+@dp.message(PaymentStates.waiting_for_receipt, F.photo)
+@dp.message(PaymentStates.waiting_for_receipt, F.document)
+async def payment_receipt_received(message: Message, state: FSMContext) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    receipt_type = "photo"
+    file_id = ""
+    file_unique_id = ""
+    if message.photo:
+        photo = message.photo[-1]
+        file_id = photo.file_id
+        file_unique_id = photo.file_unique_id
+    elif message.document:
+        mime = str(message.document.mime_type or "").lower()
+        if not (mime.startswith("image/") or mime == "application/pdf"):
+            await message.answer(
+                "Rasm yoki PDF chek yuboring." if lang == "uz" else "Отправьте чек как изображение или PDF-файл."
+            )
+            return
+        receipt_type = "document"
+        file_id = message.document.file_id
+        file_unique_id = message.document.file_unique_id
+
+    data = await state.get_data()
+    request_id = int(data.get("payment_request_id") or 0)
+    if not request_id:
+        latest = latest_awaiting_payment_request(telegram_id)
+        request_id = int(latest["id"]) if latest else 0
+    if not request_id or not file_id:
+        await state.clear()
+        await message.answer(
+            "Avval tarifni tanlang: /subscribe" if lang == "uz" else "Сначала выберите тариф: /subscribe",
+            reply_markup=main_menu_for_user(telegram_id),
+        )
+        return
+
+    row, error = attach_payment_receipt(
+        request_id,
+        telegram_id,
+        file_id=file_id,
+        file_unique_id=file_unique_id,
+        receipt_type=receipt_type,
+    )
+    if error == "duplicate":
+        await message.answer(
+            "Bu chek avval yuborilgan." if lang == "uz" else "Этот чек уже использовался в другой заявке."
+        )
+        return
+    if not row:
+        await state.clear()
+        await message.answer(
+            "Ariza topilmadi. Qaytadan boshlang: /subscribe"
+            if lang == "uz"
+            else "Заявка не найдена. Начните заново: /subscribe",
+            reply_markup=main_menu_for_user(telegram_id),
+        )
+        return
+
+    await state.clear()
+    if lang == "uz":
+        client_text = (
+            "✅ <b>Chek qabul qilindi</b>\n\n"
+            f"Ariza: <b>#{int(row['id'])}</b>\n"
+            "Administrator chekni tekshiradi. Natija haqida shu yerda xabar beramiz."
+        )
+    else:
+        client_text = (
+            "✅ <b>Чек принят</b>\n\n"
+            f"Заявка: <b>#{int(row['id'])}</b>\n"
+            "Администратор проверит чек. Результат придёт в этот чат."
+        )
+    await message.answer(client_text, reply_markup=main_menu_for_user(telegram_id))
+    sent = await send_payment_request_to_admins(row)
+    if not sent:
+        logging.error("Payment request saved but no admin notification sent: request=%s", row["id"])
+
+
+@dp.message(PaymentStates.waiting_for_receipt)
+async def payment_receipt_wrong_format(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    await message.answer(
+        "Chekni rasm yoki PDF shaklida yuboring."
+        if lang == "uz"
+        else "Отправьте чек фотографией, скриншотом или PDF-файлом."
+    )
+
+
+@dp.callback_query(F.data.startswith("payview:"))
+async def payment_request_view_callback(callback: CallbackQuery) -> None:
+    admin_id = int(callback.from_user.id) if callback.from_user else 0
+    if not admin_only(admin_id):
+        await callback.answer("Только для администратора", show_alert=True)
+        return
+    raw_id = str(callback.data or "").split(":", 1)[-1]
+    row = get_payment_request(int(raw_id)) if raw_id.isdigit() else None
+    if not row or row.get("status") != "pending_review":
+        await callback.answer("Заявка уже обработана или не найдена", show_alert=True)
+        return
+    await callback.answer()
+    await send_payment_request_to_admins({**row, "_only_admin": admin_id})
+
+
+@dp.callback_query(F.data.startswith("payapprove:"))
+async def payment_request_approve_callback(callback: CallbackQuery) -> None:
+    admin_id = int(callback.from_user.id) if callback.from_user else 0
+    if not admin_only(admin_id):
+        await callback.answer("Только для администратора", show_alert=True)
+        return
+    raw_id = str(callback.data or "").split(":", 1)[-1]
+    if not raw_id.isdigit():
+        await callback.answer("Некорректная заявка", show_alert=True)
+        return
+    request_id = int(raw_id)
+    result = approve_payment_request(request_id, admin_id)
+    if not result:
+        await callback.answer("Заявка уже обработана", show_alert=True)
+        return
+
+    target = int(result["telegram_id"])
+    amount = _payment_amount_text(int(result["amount"]))
+    new_until = _fmt_dt(result.get("new_until"))
+    lang = get_user_language(target)
+    if lang == "uz":
+        client_text = (
+            "✅ <b>To‘lov tasdiqlandi</b>\n\n"
+            f"Tarif: <b>{int(result['plan_months'])} oy</b>\n"
+            f"Summa: <b>{amount} so‘m</b>\n"
+            f"Obuna muddati: <b>{new_until}</b> gacha.\n\n"
+            "Rahmat! Botning barcha funksiyalari ishlaydi."
+        )
+    else:
+        client_text = (
+            "✅ <b>Оплата подтверждена</b>\n\n"
+            f"Тариф: <b>{int(result['plan_months'])} мес.</b>\n"
+            f"Сумма: <b>{amount} сум</b>\n"
+            f"Подписка активна до: <b>{new_until}</b>\n\n"
+            "Спасибо! Все функции бота доступны."
+        )
+    try:
+        await bot.send_message(target, client_text, reply_markup=main_menu_for_user(target))
+    except Exception:
+        logging.exception("Approved payment client notification failed: request=%s user=%s", request_id, target)
+
+    await callback.answer("Оплата подтверждена")
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.message.answer(
+            "✅ <b>Оплата подтверждена</b>\n\n"
+            f"Заявка: <b>#{request_id}</b>\n"
+            f"Пользователь: <code>{target}</code>\n"
+            f"Продлено до: <b>{new_until}</b>\n"
+            f"Запись оплаты: <b>#{int(result['payment_history_id'])}</b>",
+            reply_markup=admin_menu_for_user(admin_id),
+        )
+
+
+@dp.callback_query(F.data.startswith("payreject_menu:"))
+async def payment_request_reject_menu_callback(callback: CallbackQuery) -> None:
+    admin_id = int(callback.from_user.id) if callback.from_user else 0
+    if not admin_only(admin_id):
+        await callback.answer("Только для администратора", show_alert=True)
+        return
+    raw_id = str(callback.data or "").split(":", 1)[-1]
+    row = get_payment_request(int(raw_id)) if raw_id.isdigit() else None
+    if not row or row.get("status") != "pending_review":
+        await callback.answer("Заявка уже обработана", show_alert=True)
+        return
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            f"Почему отклонить чек <b>#{int(raw_id)}</b>?",
+            reply_markup=payment_rejection_markup(int(raw_id)),
+        )
+
+
+@dp.callback_query(F.data.startswith("payreject:"))
+async def payment_request_reject_callback(callback: CallbackQuery) -> None:
+    admin_id = int(callback.from_user.id) if callback.from_user else 0
+    if not admin_only(admin_id):
+        await callback.answer("Только для администратора", show_alert=True)
+        return
+    parts = str(callback.data or "").split(":", 2)
+    if len(parts) != 3 or not parts[1].isdigit():
+        await callback.answer("Некорректная заявка", show_alert=True)
+        return
+    request_id = int(parts[1])
+    reason_code = parts[2]
+    reasons = {
+        "unreadable": "Чек не читается",
+        "amount": "Сумма на чеке не совпадает с тарифом",
+        "not_found": "Платёж не найден",
+        "other": "Чек не прошёл проверку",
+    }
+    reason = reasons.get(reason_code, reasons["other"])
+    row = reject_payment_request(request_id, admin_id, reason)
+    if not row:
+        await callback.answer("Заявка уже обработана", show_alert=True)
+        return
+
+    target = int(row["telegram_id"])
+    lang = get_user_language(target)
+    if lang == "uz":
+        reason_uz = {
+            "unreadable": "Chek aniq ko‘rinmayapti",
+            "amount": "Chekdagi summa tarifga mos kelmaydi",
+            "not_found": "To‘lov topilmadi",
+            "other": "Chek tekshiruvdan o‘tmadi",
+        }.get(reason_code, "Chek tekshiruvdan o‘tmadi")
+        client_text = (
+            "❌ <b>Chek tasdiqlanmadi</b>\n\n"
+            f"Sabab: <b>{reason_uz}</b>\n\n"
+            "Ma’lumotlarni tekshirib, yangi chek yuboring: /subscribe"
+        )
+    else:
+        client_text = (
+            "❌ <b>Чек не подтверждён</b>\n\n"
+            f"Причина: <b>{escape(reason)}</b>\n\n"
+            "Проверьте данные и отправьте новый чек: /subscribe"
+        )
+    try:
+        await bot.send_message(target, client_text, reply_markup=main_menu_for_user(target))
+    except Exception:
+        logging.exception("Rejected payment client notification failed: request=%s user=%s", request_id, target)
+
+    await callback.answer("Чек отклонён")
+    if callback.message:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.message.answer(
+            f"❌ Чек <b>#{request_id}</b> отклонён. Причина: <b>{escape(reason)}</b>",
+            reply_markup=admin_menu_for_user(admin_id),
+        )
 
 
 @dp.message(Command("video", "api_video", "instruction"))
@@ -5537,14 +6297,26 @@ async def support(message: Message) -> None:
 @dp.message(Command("my_payments"))
 async def my_payments(message: Message) -> None:
     telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    pending = latest_payment_request_by_status(telegram_id, "pending_review")
     rows = list_payments(telegram_id, 10)
-    if not rows:
-        await message.answer("💳 История оплат пока пустая.", reply_markup=menu_for_message(message))
+    if not rows and not pending:
+        await message.answer(
+            "💳 To‘lovlar tarixi hozircha bo‘sh." if lang == "uz" else "💳 История оплат пока пустая.",
+            reply_markup=menu_for_message(message),
+        )
         return
-    await message.answer(
-        "💳 <b>Мои оплаты</b>\n\n" + "\n".join(payment_line(row) for row in rows),
-        reply_markup=menu_for_message(message),
-    )
+    parts = ["💳 <b>Mening to‘lovlarim</b>" if lang == "uz" else "💳 <b>Мои оплаты</b>"]
+    if pending:
+        status_text = (
+            f"🕐 Chek <b>#{int(pending['id'])}</b> tekshirilmoqda"
+            if lang == "uz"
+            else f"🕐 Чек <b>#{int(pending['id'])}</b> находится на проверке"
+        )
+        parts.append(status_text)
+    if rows:
+        parts.append("\n".join(payment_line(row) for row in rows))
+    await message.answer("\n\n".join(parts), reply_markup=menu_for_message(message))
 
 @dp.message(Command("my_subscription", "subscription"))
 async def my_subscription(message: Message) -> None:
@@ -5573,7 +6345,9 @@ async def admin_panel(message: Message) -> None:
         f"🚫 Заблокированы: <b>{stats['blocked']}</b>\n\n"
         f"💰 Оплаты сегодня: <b>{money_today}</b> сум\n"
         f"💰 Оплаты за 30 дней: <b>{money_30}</b> сум\n\n"
+        f"🧾 Чеков на проверке: <b>{stats['pending_receipts']}</b>\n\n"
         "Быстрые команды:\n"
+        "• <code>/payments</code> — проверить новые чеки\n"
         "• <code>/paid1 ID</code> — 1 месяц / 300 000 сум\n"
         "• <code>/paid3 ID</code> — 3 месяца / 800 000 сум\n"
         "• <code>/paid6 ID</code> — 6 месяцев / 1 500 000 сум\n"
@@ -6065,6 +6839,21 @@ async def admin_paid_6_months(message: Message) -> None:
         pass
 
 
+def pending_payment_requests_markup(rows: list[dict[str, Any]]) -> InlineKeyboardMarkup | None:
+    buttons = []
+    for row in rows[:10]:
+        request_id = int(row.get("id") or 0)
+        label = payment_request_user_label(row)
+        amount = _payment_amount_text(int(row.get("amount") or 0))
+        buttons.append([
+            InlineKeyboardButton(
+                text=f"🧾 #{request_id} · {label} · {amount}"[:60],
+                callback_data=f"payview:{request_id}",
+            )
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+
+
 @dp.message(Command("payments"))
 async def admin_payments(message: Message) -> None:
     admin_id = upsert_from_message(message)
@@ -6072,12 +6861,24 @@ async def admin_payments(message: Message) -> None:
         return
     args = parse_args(message.text or "").split()
     target = int(args[0]) if args and args[0].isdigit() else None
+    pending = list_payment_requests("pending_review", 50)
     rows = list_payments(target, 20)
-    if not rows:
-        await message.answer("💳 История оплат пока пустая.", reply_markup=menu_for_message(message))
-        return
-    title = f"💳 <b>Оплаты пользователя <code>{target}</code></b>" if target else "💳 <b>Последние оплаты</b>"
-    await message.answer(title + "\n\n" + "\n".join(payment_line(row) for row in rows), reply_markup=menu_for_message(message))
+    if pending:
+        pending_lines = [
+            f"🧾 <b>#{int(row['id'])}</b> · <code>{int(row['telegram_id'])}</code> — "
+            f"{escape(payment_request_user_label(row))} · "
+            f"{int(row['plan_months'])} мес. · {_payment_amount_text(int(row['amount']))} сум"
+            for row in pending[:20]
+        ]
+        await message.answer(
+            f"🕐 <b>Чеки ожидают проверки: {len(pending)}</b>\n\n" + "\n".join(pending_lines),
+            reply_markup=pending_payment_requests_markup(pending),
+        )
+    if rows:
+        title = f"💳 <b>Оплаты пользователя <code>{target}</code></b>" if target else "💳 <b>Последние подтверждённые оплаты</b>"
+        await message.answer(title + "\n\n" + "\n".join(payment_line(row) for row in rows), reply_markup=menu_for_message(message))
+    elif not pending:
+        await message.answer("💳 Чеков на проверке и подтверждённых оплат пока нет.", reply_markup=menu_for_message(message))
 
 
 @dp.message(Command("backup_db"))
@@ -9966,6 +10767,19 @@ async def friendly_auto_start(message: Message, state: FSMContext) -> None:
             "🎥 Видеоинструкция по API тоже есть в меню."
         )
     await message.answer(text, reply_markup=menu_for_message(message))
+
+
+@dp.message(F.photo)
+@dp.message(F.document)
+async def recover_payment_receipt_after_restart(message: Message, state: FSMContext) -> None:
+    """Resume a persisted payment request if the in-memory FSM was lost on restart."""
+    telegram_id = upsert_from_message(message)
+    pending = latest_awaiting_payment_request(telegram_id)
+    if not pending:
+        return
+    await state.set_state(PaymentStates.waiting_for_receipt)
+    await state.update_data(payment_request_id=int(pending["id"]))
+    await payment_receipt_received(message, state)
 
 
 # --- Финальная чистка узбекских сообщений для клиентов ---
