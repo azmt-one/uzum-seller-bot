@@ -6,6 +6,7 @@ import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import tempfile
 import time
@@ -39,11 +40,13 @@ from subscription_automation import (
     select_milestone,
 )
 from formatters import (
+    clean_num,
     compact_json_preview,
     excel_value,
     extract_items,
     flatten_sku_rows,
     format_order_line,
+    format_product_line,
     format_shop_line,
     format_sku_stock_line,
     pick,
@@ -227,6 +230,8 @@ def build_premium_workbook(
     actions = list(payload.get("actions") or [])
     lost = list(payload.get("lost") or [])
     notes = list(payload.get("notes") or [])
+    business_profit = dict(payload.get("business_profit") or {})
+    finance_settings = dict(payload.get("finance_settings") or {})
 
     # 1. Executive dashboard
     ws = wb.active
@@ -320,8 +325,18 @@ def build_premium_workbook(
     ws.cell(note_row, 1).font = Font(bold=True, color=RED)
     default_note = _t(
         lang,
-        "Расчётная прибыль учитывает комиссию, логистику и загруженную себестоимость. Налоги, реклама, хранение и другие расходы в неё не входят.",
-        "Hisobiy foyda komissiya, logistika va yuklangan tannarxni hisobga oladi. Soliq, reklama, saqlash va boshqa xarajatlar kiritilmagan.",
+        (
+            "Чистая прибыль учитывает введённые налоги, рекламу, хранение и прочие расходы. "
+            "Точность зависит от покрытия продаж себестоимостью."
+            if business_profit
+            else "Расчётная прибыль учитывает комиссию, логистику и загруженную себестоимость. Налоги, реклама, хранение и другие расходы в неё не входят."
+        ),
+        (
+            "Sof foyda kiritilgan soliq, reklama, saqlash va boshqa xarajatlarni hisobga oladi. "
+            "Aniqlik tannarx bilan qamrovga bog‘liq."
+            if business_profit
+            else "Hisobiy foyda komissiya, logistika va yuklangan tannarxni hisobga oladi. Soliq, reklama, saqlash va boshqa xarajatlar kiritilmagan."
+        ),
     )
     ws.cell(note_row + 1, 1, default_note)
     ws.merge_cells(start_row=note_row + 1, start_column=1, end_row=note_row + 1, end_column=12)
@@ -347,7 +362,50 @@ def build_premium_workbook(
         ws.add_chart(chart, "N4")
     _finalize(ws, freeze=f"A{summary_start + 1}", max_width=48)
 
-    # 2. Complete sales ledger
+    # 2. Net profit with seller-entered operating expenses
+    if business_profit:
+        ws = wb.create_sheet(_sheet_name(lang, "Чистая прибыль", "Sof foyda"))
+        _title(ws, _t(lang, "Чистая прибыль и расходы — 30 дней", "Sof foyda va xarajatlar — 30 kun"), end_col=4)
+        ws.append([
+            _t(lang, "Показатель", "Ko‘rsatkich"),
+            _t(lang, "Сумма", "Summa"),
+            _t(lang, "Источник", "Manba"),
+            _t(lang, "Комментарий", "Izoh"),
+        ])
+        expense_rows = [
+            (_t(lang, "Выручка", "Tushum"), business_profit.get("revenue"), "Uzum Finance API", ""),
+            (_t(lang, "Комиссия", "Komissiya"), business_profit.get("commission"), "Uzum Finance API", ""),
+            (_t(lang, "Логистика", "Logistika"), business_profit.get("logistics"), "Uzum Finance API", ""),
+            (_t(lang, "Себестоимость", "Tannarx"), business_profit.get("cost_total"), _t(lang, "Данные продавца", "Sotuvchi ma’lumoti"), ""),
+            (_t(lang, "Налог", "Soliq"), business_profit.get("tax_expense"), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi"), f"{float(finance_settings.get('tax_percent') or 0):.2f}%"),
+            (_t(lang, "Реклама", "Reklama"), business_profit.get("advertising_expense"), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi"), _t(lang, "За 30 дней", "30 kun uchun")),
+            (_t(lang, "Хранение", "Saqlash"), business_profit.get("storage_expense"), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi"), _t(lang, "За 30 дней", "30 kun uchun")),
+            (_t(lang, "Другие расходы", "Boshqa xarajat"), business_profit.get("other_expense"), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi"), _t(lang, "За 30 дней", "30 kun uchun")),
+            (_t(lang, "Чистая прибыль", "Sof foyda"), business_profit.get("net_profit"), _t(lang, "Расчёт бота", "Bot hisobi"), f"{float(business_profit.get('net_margin') or 0):.1f}%"),
+        ]
+        for row in expense_rows:
+            ws.append(list(row))
+        end = ws.max_row
+        _header(ws, 2, 1, 4)
+        _style_body(ws, 3, end, 1, 4)
+        _money(ws, ("B",), 3)
+        for col in range(1, 5):
+            ws.cell(end, col).font = Font(bold=True, color=WHITE)
+            ws.cell(end, col).fill = PatternFill("solid", fgColor=GREEN if float(business_profit.get("net_profit") or 0) >= 0 else RED)
+        note_row = end + 2
+        coverage = float(business_profit.get("coverage") or 0) * 100
+        ws.cell(note_row, 1, _t(lang, "Полнота себестоимости", "Tannarx to‘liqligi"))
+        ws.cell(note_row, 2, coverage / 100)
+        ws.cell(note_row, 2).number_format = "0.0%"
+        ws.cell(note_row + 1, 1, _t(
+            lang,
+            "Если покрытие ниже 100%, чистая прибыль неполная: для части продаж не указана себестоимость.",
+            "Qamrov 100% dan past bo‘lsa, sof foyda to‘liq emas: ayrim savdolarning tannarxi kiritilmagan.",
+        ))
+        ws.merge_cells(start_row=note_row + 1, start_column=1, end_row=note_row + 1, end_column=4)
+        _finalize(ws, freeze="A3", max_width=55)
+
+    # Complete sales ledger
     ws = wb.create_sheet(_sheet_name(lang, "Продажи", "Savdolar"))
     _title(ws, _t(lang, "Все операции за 30 дней", "30 kunlik barcha operatsiyalar"), end_col=12)
     headers = [
@@ -569,6 +627,7 @@ def build_premium_workbook(
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+APP_BUILD = "2026.07.17-stock-truth-forecast-v1"
 
 TELEGRAM_BOT_TOKEN = (
     os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -605,6 +664,14 @@ SALE_NOTIFICATIONS = (
     not in {"0", "false", "no", "off"}
 )
 SALE_CHECK_INTERVAL_SECONDS = int(os.getenv("SALE_CHECK_INTERVAL_SECONDS", "300") or "300")
+SALES_DIGEST_INTERVAL_SECONDS = max(
+    900,
+    int(os.getenv("SALES_DIGEST_INTERVAL_SECONDS", "3600") or "3600"),
+)
+INSTANT_SALE_BURST_LIMIT = max(
+    1,
+    min(50, int(os.getenv("INSTANT_SALE_BURST_LIMIT", "10") or "10")),
+)
 STOCK_CHANGE_NOTIFICATIONS = (
     os.getenv("STOCK_CHANGE_NOTIFICATIONS", "0").strip().lower()
     not in {"0", "false", "no", "off"}
@@ -612,6 +679,173 @@ STOCK_CHANGE_NOTIFICATIONS = (
 STOCK_CHANGE_CHECK_INTERVAL_SECONDS = int(
     os.getenv("STOCK_CHANGE_CHECK_INTERVAL_SECONDS", "900") or "900"
 )
+LOSS_DEFECT_CHECK_INTERVAL_SECONDS = int(
+    os.getenv("LOSS_DEFECT_CHECK_INTERVAL_SECONDS", "900") or "900"
+)
+FBO_ACCEPTANCE_CHECK_INTERVAL_SECONDS = int(
+    os.getenv("FBO_ACCEPTANCE_CHECK_INTERVAL_SECONDS", "600") or "600"
+)
+FBO_ACCEPTANCE_INVOICE_PAGES = max(
+    1,
+    min(20, int(os.getenv("FBO_ACCEPTANCE_INVOICE_PAGES", "5") or "5")),
+)
+UZUM_API_MIN_INTERVAL_SECONDS = max(
+    0.1,
+    float(os.getenv("UZUM_API_MIN_INTERVAL_SECONDS", "1.0") or "1.0"),
+)
+UZUM_API_429_RETRIES = max(
+    0,
+    min(5, int(os.getenv("UZUM_API_429_RETRIES", "3") or "3")),
+)
+UZUM_API_429_BASE_DELAY_SECONDS = max(
+    2.0,
+    float(os.getenv("UZUM_API_429_BASE_DELAY_SECONDS", "10") or "10"),
+)
+UZUM_API_429_MAX_DELAY_SECONDS = max(
+    UZUM_API_429_BASE_DELAY_SECONDS,
+    float(os.getenv("UZUM_API_429_MAX_DELAY_SECONDS", "60") or "60"),
+)
+WATCH_STOCK_CACHE_SECONDS = max(
+    30,
+    int(os.getenv("WATCH_STOCK_CACHE_SECONDS", "240") or "240"),
+)
+SALES_WATCH_FAST_LOOKBACK_HOURS = max(
+    24,
+    int(os.getenv("SALES_WATCH_FAST_LOOKBACK_HOURS", "36") or "36"),
+)
+SALES_WATCH_FULL_SCAN_INTERVAL_SECONDS = max(
+    900,
+    int(os.getenv("SALES_WATCH_FULL_SCAN_INTERVAL_SECONDS", "3600") or "3600"),
+)
+FBO_ACCEPTANCE_FAST_PAGES = max(
+    1,
+    min(
+        FBO_ACCEPTANCE_INVOICE_PAGES,
+        int(os.getenv("FBO_ACCEPTANCE_FAST_PAGES", "2") or "2"),
+    ),
+)
+FBO_ACCEPTANCE_FULL_SCAN_INTERVAL_SECONDS = max(
+    1800,
+    int(os.getenv("FBO_ACCEPTANCE_FULL_SCAN_INTERVAL_SECONDS", "3600") or "3600"),
+)
+
+# Uzum периодически отвечает 429, если несколько фоновых задач одновременно
+# листают продажи, остатки и поставки. Этот ограничитель действует на все
+# экземпляры UzumClient внутри main.py: запросы стартуют с безопасным интервалом,
+# а после 429 весь бот выдерживает общий cooldown и повторяет запрос.
+_ORIGINAL_UZUM_REQUEST = UzumClient._request
+_UZUM_API_GATE_LOCK: asyncio.Lock | None = None
+_UZUM_API_GATE_LOOP: Any = None
+_UZUM_API_LAST_REQUEST_AT = 0.0
+_UZUM_API_COOLDOWN_UNTIL = 0.0
+
+
+def _is_uzum_rate_limit_error(error: BaseException) -> bool:
+    text = str(error).lower()
+    return (
+        "error 429" in text
+        or " 429:" in text
+        or "status 429" in text
+        or "too many requests" in text
+        or "rate limit" in text
+    )
+
+
+def _uzum_api_gate_lock() -> asyncio.Lock:
+    global _UZUM_API_GATE_LOCK, _UZUM_API_GATE_LOOP
+    loop = asyncio.get_running_loop()
+    if _UZUM_API_GATE_LOCK is None or _UZUM_API_GATE_LOOP is not loop:
+        _UZUM_API_GATE_LOCK = asyncio.Lock()
+        _UZUM_API_GATE_LOOP = loop
+    return _UZUM_API_GATE_LOCK
+
+
+async def _wait_for_uzum_api_slot() -> None:
+    global _UZUM_API_LAST_REQUEST_AT
+    async with _uzum_api_gate_lock():
+        now = time.monotonic()
+        wait_for = max(
+            0.0,
+            _UZUM_API_COOLDOWN_UNTIL - now,
+            UZUM_API_MIN_INTERVAL_SECONDS - (now - _UZUM_API_LAST_REQUEST_AT),
+        )
+        if wait_for > 0:
+            await asyncio.sleep(wait_for)
+        _UZUM_API_LAST_REQUEST_AT = time.monotonic()
+
+
+def _set_uzum_api_cooldown(delay_seconds: float) -> None:
+    global _UZUM_API_COOLDOWN_UNTIL
+    _UZUM_API_COOLDOWN_UNTIL = max(
+        _UZUM_API_COOLDOWN_UNTIL,
+        time.monotonic() + max(0.0, float(delay_seconds)),
+    )
+
+
+async def _rate_limited_uzum_request(
+    client: UzumClient,
+    method: str,
+    path: str,
+    **kwargs: Any,
+) -> Any:
+    for attempt in range(UZUM_API_429_RETRIES + 1):
+        await _wait_for_uzum_api_slot()
+        try:
+            return await _ORIGINAL_UZUM_REQUEST(client, method, path, **kwargs)
+        except Exception as error:
+            if not _is_uzum_rate_limit_error(error):
+                raise
+            delay = min(
+                UZUM_API_429_MAX_DELAY_SECONDS,
+                UZUM_API_429_BASE_DELAY_SECONDS * (2 ** attempt),
+            )
+            _set_uzum_api_cooldown(delay)
+            safe_path = str(path).split("?", 1)[0][:120]
+            if attempt >= UZUM_API_429_RETRIES:
+                logging.warning(
+                    "Uzum API 429: retries exhausted method=%s path=%s; "
+                    "global cooldown %.0fs remains active",
+                    method,
+                    safe_path,
+                    delay,
+                )
+                raise
+            logging.warning(
+                "Uzum API 429: retry %s/%s in %.0fs method=%s path=%s",
+                attempt + 1,
+                UZUM_API_429_RETRIES,
+                delay,
+                method,
+                safe_path,
+            )
+    raise RuntimeError("Unreachable Uzum API retry state")
+
+
+UzumClient._request = _rate_limited_uzum_request
+
+
+def _log_watcher_api_failure(
+    watcher: str,
+    error: BaseException,
+    *,
+    shop_id: int,
+    telegram_ids: list[int],
+) -> None:
+    if _is_uzum_rate_limit_error(error):
+        logging.warning(
+            "%s: Uzum API rate limit for shop=%s users=%s; "
+            "snapshot kept, retry on next cycle",
+            watcher,
+            shop_id,
+            telegram_ids,
+        )
+        return
+    logging.exception(
+        "%s: failed shop=%s users=%s",
+        watcher,
+        shop_id,
+        telegram_ids,
+    )
 TRIAL_DAYS = int(os.getenv("TRIAL_DAYS", "3") or "3")
 SUBSCRIPTION_PRICE_TEXT = os.getenv("SUBSCRIPTION_PRICE_TEXT", "300 000 сум / 1 месяц").strip()
 PAYMENT_TEXT = os.getenv(
@@ -737,7 +971,6 @@ if SQLITE_WAL:
             _conn.execute("PRAGMA synchronous=NORMAL")
     except Exception:
         logging.exception("SQLite WAL could not be enabled; continuing with default mode")
-
 cipher = TokenCipher(ENCRYPTION_KEY)
 
 bot = Bot(
@@ -2027,12 +2260,754 @@ def list_staff_shop_connections(limit: int = 30) -> list[dict[str, Any]]:
     return [dict(r) for r in rows]
 
 
+# --- Персональные настройки и доказуемая бизнес-ценность ---
+PRODUCT_SETTING_FIELDS = {
+    "notify_orders",
+    "notify_sales",
+    "sales_notification_mode",
+    "notify_low_stock",
+    "notify_out_of_stock",
+    "notify_cancellations",
+    "notify_reviews",
+    "notify_stock_change",
+    "notify_losses",
+    "notify_defects",
+    "notify_fbo_acceptance",
+    "daily_enabled",
+    "daily_hour",
+    "weekly_enabled",
+    "weekly_weekday",
+    "weekly_hour",
+    "monthly_enabled",
+    "monthly_day",
+    "monthly_hour",
+    "low_stock_threshold",
+    "lead_time_days",
+    "safety_days",
+    "target_cover_days",
+}
+
+FINANCE_SETTING_FIELDS = {
+    "tax_percent",
+    "advertising_monthly",
+    "storage_monthly",
+    "other_monthly",
+}
+
+
+def init_product_value_tables() -> None:
+    with db.connect() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_settings (
+                telegram_id INTEGER PRIMARY KEY,
+                notify_orders INTEGER NOT NULL DEFAULT 0,
+                notify_sales INTEGER NOT NULL DEFAULT 1,
+                sales_notification_mode TEXT NOT NULL DEFAULT 'instant',
+                notify_low_stock INTEGER NOT NULL DEFAULT 1,
+                notify_out_of_stock INTEGER NOT NULL DEFAULT 1,
+                notify_cancellations INTEGER NOT NULL DEFAULT 1,
+                notify_reviews INTEGER NOT NULL DEFAULT 0,
+                notify_stock_change INTEGER NOT NULL DEFAULT 0,
+                notify_losses INTEGER NOT NULL DEFAULT 1,
+                notify_defects INTEGER NOT NULL DEFAULT 1,
+                notify_fbo_acceptance INTEGER NOT NULL DEFAULT 1,
+                daily_enabled INTEGER NOT NULL DEFAULT 0,
+                daily_hour INTEGER NOT NULL DEFAULT 9,
+                weekly_enabled INTEGER NOT NULL DEFAULT 0,
+                weekly_weekday INTEGER NOT NULL DEFAULT 0,
+                weekly_hour INTEGER NOT NULL DEFAULT 9,
+                monthly_enabled INTEGER NOT NULL DEFAULT 0,
+                monthly_day INTEGER NOT NULL DEFAULT 1,
+                monthly_hour INTEGER NOT NULL DEFAULT 9,
+                low_stock_threshold INTEGER NOT NULL DEFAULT 5,
+                lead_time_days INTEGER NOT NULL DEFAULT 3,
+                safety_days INTEGER NOT NULL DEFAULT 5,
+                target_cover_days INTEGER NOT NULL DEFAULT 30,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
+        existing_product_columns = {
+            str(row[1]) for row in conn.execute("PRAGMA table_info(product_settings)").fetchall()
+        }
+        for column in ("notify_losses", "notify_defects", "notify_fbo_acceptance"):
+            if column not in existing_product_columns:
+                conn.execute(
+                    f"ALTER TABLE product_settings ADD COLUMN {column} INTEGER NOT NULL DEFAULT 1"
+                )
+        if "sales_notification_mode" not in existing_product_columns:
+            conn.execute(
+                "ALTER TABLE product_settings "
+                "ADD COLUMN sales_notification_mode TEXT NOT NULL DEFAULT 'instant'"
+            )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS business_finance_settings (
+                telegram_id INTEGER NOT NULL,
+                shop_id INTEGER NOT NULL,
+                tax_percent REAL NOT NULL DEFAULT 0,
+                advertising_monthly REAL NOT NULL DEFAULT 0,
+                storage_monthly REAL NOT NULL DEFAULT 0,
+                other_monthly REAL NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (telegram_id, shop_id)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS business_actions (
+                telegram_id INTEGER NOT NULL,
+                shop_id INTEGER NOT NULL,
+                action_key TEXT NOT NULL,
+                category TEXT NOT NULL,
+                title TEXT,
+                amount REAL NOT NULL DEFAULT 0,
+                state TEXT NOT NULL DEFAULT 'active',
+                snoozed_until TEXT,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                resolved_at TEXT,
+                PRIMARY KEY (telegram_id, shop_id, action_key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS business_value_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                shop_id INTEGER NOT NULL,
+                action_key TEXT,
+                event_type TEXT NOT NULL,
+                amount REAL NOT NULL DEFAULT 0,
+                description TEXT,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduled_report_delivery (
+                telegram_id INTEGER NOT NULL,
+                report_kind TEXT NOT NULL,
+                period_key TEXT NOT NULL,
+                sent_at TEXT NOT NULL,
+                PRIMARY KEY (telegram_id, report_kind, period_key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operational_watcher_baseline (
+                telegram_id INTEGER NOT NULL,
+                shop_id INTEGER NOT NULL,
+                watcher_kind TEXT NOT NULL,
+                initialized_at TEXT NOT NULL,
+                PRIMARY KEY (telegram_id, shop_id, watcher_kind)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS product_loss_snapshot (
+                telegram_id INTEGER NOT NULL,
+                shop_id INTEGER NOT NULL,
+                sku_key TEXT NOT NULL,
+                product_title TEXT,
+                sku_title TEXT,
+                sku_id TEXT,
+                barcode TEXT,
+                missing_qty INTEGER NOT NULL DEFAULT 0,
+                defected_qty INTEGER NOT NULL DEFAULT 0,
+                price REAL NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (telegram_id, shop_id, sku_key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fbo_acceptance_watch (
+                telegram_id INTEGER NOT NULL,
+                shop_id INTEGER NOT NULL,
+                invoice_key TEXT NOT NULL,
+                invoice_id TEXT,
+                invoice_number TEXT,
+                status TEXT,
+                planned_qty REAL NOT NULL DEFAULT 0,
+                accepted_qty REAL NOT NULL DEFAULT 0,
+                terminal INTEGER NOT NULL DEFAULT 0,
+                first_seen TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                notified_at TEXT,
+                PRIMARY KEY (telegram_id, shop_id, invoice_key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_fbo_acceptance_pending
+            ON fbo_acceptance_watch (telegram_id, shop_id, terminal, notified_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sales_digest_queue (
+                telegram_id INTEGER NOT NULL,
+                shop_id INTEGER NOT NULL,
+                event_key TEXT NOT NULL,
+                identity_key TEXT NOT NULL,
+                order_id TEXT,
+                product_title TEXT,
+                sku_title TEXT,
+                quantity REAL NOT NULL DEFAULT 0,
+                revenue REAL NOT NULL DEFAULT 0,
+                commission REAL NOT NULL DEFAULT 0,
+                logistics REAL NOT NULL DEFAULT 0,
+                payout REAL NOT NULL DEFAULT 0,
+                sold_at TEXT,
+                detected_at TEXT NOT NULL,
+                PRIMARY KEY (telegram_id, shop_id, event_key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_sales_digest_queue_pending
+            ON sales_digest_queue (telegram_id, shop_id, detected_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sales_digest_state (
+                telegram_id INTEGER NOT NULL,
+                shop_id INTEGER NOT NULL,
+                last_sent_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (telegram_id, shop_id)
+            )
+            """
+        )
+        conn.commit()
+
+
+def ensure_product_settings(telegram_id: int) -> dict[str, Any]:
+    init_product_value_tables()
+    now_text = _dt_to_db(_utc_now()) or ""
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO product_settings (
+                telegram_id, notify_orders, notify_sales, notify_low_stock,
+                notify_out_of_stock, notify_cancellations, notify_reviews,
+                notify_stock_change, daily_enabled, daily_hour,
+                low_stock_threshold, updated_at
+            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                int(telegram_id),
+                1 if NEW_ORDER_NOTIFICATIONS else 0,
+                1 if SALE_NOTIFICATIONS else 0,
+                1 if LOW_STOCK_NOTIFICATIONS else 0,
+                1 if OUT_OF_STOCK_NOTIFICATIONS else 0,
+                1 if REVIEW_NOTIFICATIONS else 0,
+                1 if STOCK_CHANGE_NOTIFICATIONS else 0,
+                1 if DAILY_REPORTS else 0,
+                max(0, min(23, int(DAILY_REPORT_HOUR_UZT))),
+                max(0, int(LOW_STOCK_THRESHOLD)),
+                now_text,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM product_settings WHERE telegram_id = ?",
+            (int(telegram_id),),
+        ).fetchone()
+        conn.commit()
+    return dict(row) if row else {}
+
+
+def update_product_setting(telegram_id: int, field: str, value: Any) -> dict[str, Any]:
+    if field not in PRODUCT_SETTING_FIELDS:
+        raise ValueError(f"Unsupported product setting: {field}")
+    ensure_product_settings(telegram_id)
+    with db.connect() as conn:
+        conn.execute(
+            f"UPDATE product_settings SET {field} = ?, updated_at = ? WHERE telegram_id = ?",
+            (value, _dt_to_db(_utc_now()) or "", int(telegram_id)),
+        )
+        conn.commit()
+    return ensure_product_settings(telegram_id)
+
+
+def product_setting_enabled(telegram_id: int, field: str) -> bool:
+    return bool(int(ensure_product_settings(telegram_id).get(field) or 0))
+
+
+SALES_NOTIFICATION_MODES = {"instant", "hourly", "off"}
+
+
+def _sales_notification_mode_from_settings(settings: dict[str, Any]) -> str:
+    if not bool(int(settings.get("notify_sales") or 0)):
+        return "off"
+    mode = str(settings.get("sales_notification_mode") or "instant").strip().lower()
+    return mode if mode in {"instant", "hourly"} else "instant"
+
+
+def get_sales_notification_mode(telegram_id: int) -> str:
+    return _sales_notification_mode_from_settings(ensure_product_settings(telegram_id))
+
+
+def set_sales_notification_mode(telegram_id: int, mode: str) -> dict[str, Any]:
+    normalized = str(mode or "").strip().lower()
+    if normalized not in SALES_NOTIFICATION_MODES:
+        raise ValueError(f"Unsupported sales notification mode: {mode}")
+    ensure_product_settings(telegram_id)
+    enabled = 0 if normalized == "off" else 1
+    stored_mode = "instant" if normalized == "off" else normalized
+    with db.connect() as conn:
+        conn.execute(
+            """
+            UPDATE product_settings
+            SET notify_sales = ?, sales_notification_mode = ?, updated_at = ?
+            WHERE telegram_id = ?
+            """,
+            (
+                enabled,
+                stored_mode,
+                _dt_to_db(_utc_now()) or "",
+                int(telegram_id),
+            ),
+        )
+        conn.commit()
+    return ensure_product_settings(telegram_id)
+
+
+def ensure_finance_settings(telegram_id: int, shop_id: int) -> dict[str, Any]:
+    init_product_value_tables()
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO business_finance_settings
+                (telegram_id, shop_id, updated_at)
+            VALUES (?, ?, ?)
+            """,
+            (int(telegram_id), int(shop_id), _dt_to_db(_utc_now()) or ""),
+        )
+        row = conn.execute(
+            """
+            SELECT * FROM business_finance_settings
+            WHERE telegram_id = ? AND shop_id = ?
+            """,
+            (int(telegram_id), int(shop_id)),
+        ).fetchone()
+        conn.commit()
+    return dict(row) if row else {}
+
+
+def update_finance_setting(
+    telegram_id: int,
+    shop_id: int,
+    field: str,
+    value: float,
+) -> dict[str, Any]:
+    if field not in FINANCE_SETTING_FIELDS:
+        raise ValueError(f"Unsupported finance setting: {field}")
+    ensure_finance_settings(telegram_id, shop_id)
+    with db.connect() as conn:
+        conn.execute(
+            f"""
+            UPDATE business_finance_settings
+            SET {field} = ?, updated_at = ?
+            WHERE telegram_id = ? AND shop_id = ?
+            """,
+            (float(value), _dt_to_db(_utc_now()) or "", int(telegram_id), int(shop_id)),
+        )
+        conn.commit()
+    return ensure_finance_settings(telegram_id, shop_id)
+
+
+def _business_action_key(action: dict[str, Any]) -> str:
+    raw = "|".join(
+        str(action.get(key) or "").strip().lower()
+        for key in ("category_ru", "sku", "title", "source")
+    )
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def sync_business_actions(
+    telegram_id: int,
+    shop_id: int,
+    actions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    init_product_value_tables()
+    now = _utc_now()
+    now_text = _dt_to_db(now) or ""
+    with db.connect() as conn:
+        conn.execute(
+            """
+            UPDATE business_actions
+            SET state = 'active', snoozed_until = NULL
+            WHERE telegram_id = ? AND shop_id = ?
+              AND snoozed_until IS NOT NULL AND snoozed_until <= ?
+            """,
+            (int(telegram_id), int(shop_id), now_text),
+        )
+        for action in actions:
+            key = str(action.get("action_key") or _business_action_key(action))
+            action["action_key"] = key
+            conn.execute(
+                """
+                INSERT INTO business_actions (
+                    telegram_id, shop_id, action_key, category, title, amount,
+                    state, first_seen, last_seen
+                ) VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+                ON CONFLICT (telegram_id, shop_id, action_key) DO UPDATE SET
+                    category = excluded.category,
+                    title = excluded.title,
+                    amount = excluded.amount,
+                    last_seen = excluded.last_seen
+                """,
+                (
+                    int(telegram_id),
+                    int(shop_id),
+                    key,
+                    str(action.get("category_ru") or ""),
+                    str(action.get("title") or ""),
+                    max(0.0, float(action.get("amount") or 0)),
+                    now_text,
+                    now_text,
+                ),
+            )
+        rows = conn.execute(
+            """
+            SELECT action_key, state, snoozed_until
+            FROM business_actions
+            WHERE telegram_id = ? AND shop_id = ?
+            """,
+            (int(telegram_id), int(shop_id)),
+        ).fetchall()
+        conn.commit()
+    states = {str(row["action_key"]): dict(row) for row in rows}
+    visible: list[dict[str, Any]] = []
+    for action in actions:
+        state = states.get(str(action.get("action_key") or ""), {})
+        if str(state.get("state") or "active") != "active":
+            continue
+        visible.append(action)
+    return visible
+
+
+def update_business_action_state(
+    telegram_id: int,
+    shop_id: int,
+    action_key: str,
+    state: str,
+) -> bool:
+    if state not in {"resolved", "snoozed"}:
+        return False
+    init_product_value_tables()
+    now = _utc_now()
+    until = now + timedelta(days=7 if state == "resolved" else 3)
+    with db.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT category, title, amount, state, snoozed_until
+            FROM business_actions
+            WHERE telegram_id = ? AND shop_id = ? AND action_key = ?
+            """,
+            (int(telegram_id), int(shop_id), str(action_key)),
+        ).fetchone()
+        if not row:
+            return False
+        previous_until = _dt_from_db(row["snoozed_until"])
+        already_suppressed = (
+            str(row["state"] or "") == state
+            and previous_until is not None
+            and previous_until > now
+        )
+        conn.execute(
+            """
+            UPDATE business_actions
+            SET state = ?, snoozed_until = ?, resolved_at = ?, last_seen = last_seen
+            WHERE telegram_id = ? AND shop_id = ? AND action_key = ?
+            """,
+            (
+                state,
+                _dt_to_db(until),
+                _dt_to_db(now) if state == "resolved" else None,
+                int(telegram_id),
+                int(shop_id),
+                str(action_key),
+            ),
+        )
+        if state == "resolved" and not already_suppressed:
+            conn.execute(
+                """
+                INSERT INTO business_value_events (
+                    telegram_id, shop_id, action_key, event_type, amount,
+                    description, created_at
+                ) VALUES (?, ?, ?, 'resolved_action', ?, ?, ?)
+                """,
+                (
+                    int(telegram_id),
+                    int(shop_id),
+                    str(action_key),
+                    max(0.0, float(row["amount"] or 0)),
+                    f"{row['category']}: {row['title']}",
+                    _dt_to_db(now) or "",
+                ),
+            )
+        conn.commit()
+    return True
+
+
+def resolved_business_value(telegram_id: int, shop_id: int) -> float:
+    now = datetime.now(UZT)
+    month_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    with db.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT COALESCE(SUM(amount), 0) AS total
+            FROM business_value_events
+            WHERE telegram_id = ? AND shop_id = ?
+              AND event_type = 'resolved_action' AND created_at >= ?
+            """,
+            (
+                int(telegram_id),
+                int(shop_id),
+                _dt_to_db(month_start.astimezone(timezone.utc)) or "",
+            ),
+        ).fetchone()
+    return float(row["total"] or 0) if row else 0.0
+
+
+def scheduled_report_was_sent(telegram_id: int, kind: str, period_key: str) -> bool:
+    init_product_value_tables()
+    with db.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM scheduled_report_delivery
+            WHERE telegram_id = ? AND report_kind = ? AND period_key = ?
+            """,
+            (int(telegram_id), str(kind), str(period_key)),
+        ).fetchone()
+    return row is not None
+
+
+def mark_scheduled_report_sent(telegram_id: int, kind: str, period_key: str) -> None:
+    init_product_value_tables()
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO scheduled_report_delivery
+                (telegram_id, report_kind, period_key, sent_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (int(telegram_id), str(kind), str(period_key), _dt_to_db(_utc_now()) or ""),
+        )
+        conn.commit()
+
+
+def operational_watcher_initialized(telegram_id: int, shop_id: int, kind: str) -> bool:
+    init_product_value_tables()
+    with db.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT 1 FROM operational_watcher_baseline
+            WHERE telegram_id = ? AND shop_id = ? AND watcher_kind = ?
+            """,
+            (int(telegram_id), int(shop_id), str(kind)),
+        ).fetchone()
+    return row is not None
+
+
+def mark_operational_watcher_initialized(telegram_id: int, shop_id: int, kind: str) -> None:
+    init_product_value_tables()
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO operational_watcher_baseline
+                (telegram_id, shop_id, watcher_kind, initialized_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (int(telegram_id), int(shop_id), str(kind), _dt_to_db(_utc_now()) or ""),
+        )
+        conn.commit()
+
+
+def load_product_loss_snapshot(
+    telegram_id: int,
+    shop_id: int,
+) -> dict[str, dict[str, Any]]:
+    init_product_value_tables()
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT sku_key, product_title, sku_title, sku_id, barcode,
+                   missing_qty, defected_qty, price
+            FROM product_loss_snapshot
+            WHERE telegram_id = ? AND shop_id = ?
+            """,
+            (int(telegram_id), int(shop_id)),
+        ).fetchall()
+    return {str(row["sku_key"]): dict(row) for row in rows}
+
+
+def save_product_loss_snapshot(
+    telegram_id: int,
+    shop_id: int,
+    snapshot: dict[str, dict[str, Any]],
+    *,
+    reset_absent: bool,
+) -> None:
+    init_product_value_tables()
+    now_text = _dt_to_db(_utc_now()) or ""
+    with db.connect() as conn:
+        if reset_absent:
+            conn.execute(
+                """
+                UPDATE product_loss_snapshot
+                SET missing_qty = 0, defected_qty = 0, updated_at = ?
+                WHERE telegram_id = ? AND shop_id = ?
+                """,
+                (now_text, int(telegram_id), int(shop_id)),
+            )
+        for key, item in snapshot.items():
+            conn.execute(
+                """
+                INSERT INTO product_loss_snapshot (
+                    telegram_id, shop_id, sku_key, product_title, sku_title,
+                    sku_id, barcode, missing_qty, defected_qty, price, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (telegram_id, shop_id, sku_key) DO UPDATE SET
+                    product_title = excluded.product_title,
+                    sku_title = excluded.sku_title,
+                    sku_id = excluded.sku_id,
+                    barcode = excluded.barcode,
+                    missing_qty = excluded.missing_qty,
+                    defected_qty = excluded.defected_qty,
+                    price = excluded.price,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    int(telegram_id),
+                    int(shop_id),
+                    str(key),
+                    str(item.get("product_title") or ""),
+                    str(item.get("sku_title") or ""),
+                    str(item.get("sku_id") or ""),
+                    str(item.get("barcode") or ""),
+                    max(0, int(item.get("missing_qty") or 0)),
+                    max(0, int(item.get("defected_qty") or 0)),
+                    max(0.0, float(item.get("price") or 0)),
+                    now_text,
+                ),
+            )
+        conn.commit()
+
+
+def get_fbo_acceptance_watch_state(
+    telegram_id: int,
+    shop_id: int,
+    invoice_key: str,
+) -> dict[str, Any] | None:
+    init_product_value_tables()
+    with db.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT * FROM fbo_acceptance_watch
+            WHERE telegram_id = ? AND shop_id = ? AND invoice_key = ?
+            """,
+            (int(telegram_id), int(shop_id), str(invoice_key)),
+        ).fetchone()
+    return dict(row) if row else None
+
+
+def save_fbo_acceptance_watch_state(
+    telegram_id: int,
+    shop_id: int,
+    invoice_key: str,
+    *,
+    invoice_id: Any,
+    invoice_number: str,
+    status: str,
+    planned_qty: float,
+    accepted_qty: float,
+    terminal: bool,
+    baseline_notified: bool = False,
+) -> None:
+    init_product_value_tables()
+    now_text = _dt_to_db(_utc_now()) or ""
+    notified_at = now_text if baseline_notified else None
+    with db.connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO fbo_acceptance_watch (
+                telegram_id, shop_id, invoice_key, invoice_id, invoice_number,
+                status, planned_qty, accepted_qty, terminal, first_seen,
+                updated_at, notified_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (telegram_id, shop_id, invoice_key) DO UPDATE SET
+                invoice_id = excluded.invoice_id,
+                invoice_number = excluded.invoice_number,
+                status = excluded.status,
+                planned_qty = excluded.planned_qty,
+                accepted_qty = excluded.accepted_qty,
+                terminal = excluded.terminal,
+                updated_at = excluded.updated_at,
+                notified_at = COALESCE(fbo_acceptance_watch.notified_at, excluded.notified_at)
+            """,
+            (
+                int(telegram_id),
+                int(shop_id),
+                str(invoice_key),
+                str(invoice_id or ""),
+                str(invoice_number or ""),
+                str(status or ""),
+                max(0.0, float(planned_qty or 0)),
+                max(0.0, float(accepted_qty or 0)),
+                1 if terminal else 0,
+                now_text,
+                now_text,
+                notified_at,
+            ),
+        )
+        conn.commit()
+
+
+def mark_fbo_acceptance_notified(
+    telegram_id: int,
+    shop_id: int,
+    invoice_key: str,
+) -> None:
+    init_product_value_tables()
+    with db.connect() as conn:
+        conn.execute(
+            """
+            UPDATE fbo_acceptance_watch
+            SET notified_at = ?, updated_at = ?
+            WHERE telegram_id = ? AND shop_id = ? AND invoice_key = ?
+            """,
+            (
+                _dt_to_db(_utc_now()) or "",
+                _dt_to_db(_utc_now()) or "",
+                int(telegram_id),
+                int(shop_id),
+                str(invoice_key),
+            ),
+        )
+        conn.commit()
+
+
 init_subscription_tables()
 init_business_tables()
 init_subscription_automation_tables()
 init_payment_request_tables()
 init_unit_economy_tables()
 init_staff_connect_tables()
+init_product_value_tables()
 
 # --- Языки интерфейса ---
 # Основной код отчётов остаётся совместимым с русскими командами, но клиент может выбрать язык меню и основных экранов.
@@ -2508,10 +3483,10 @@ def language_markup() -> InlineKeyboardMarkup:
 
 MAIN_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔌 Подключить"), KeyboardButton(text="🎥 Видеоинструкция")],
-        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
-        [KeyboardButton(text="ℹ️ Помощь")],
-        [KeyboardButton(text="🌐 Веб-кабинет")],
+        [KeyboardButton(text="🔌 Подключить магазин")],
+        [KeyboardButton(text="🎥 Как подключить")],
+        [KeyboardButton(text="🌐 Язык"), KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="💎 Подписка")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Сначала подключите магазин",
@@ -2519,10 +3494,10 @@ MAIN_MENU_RU = ReplyKeyboardMarkup(
 
 MAIN_MENU_RU_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔌 Подключить"), KeyboardButton(text="🎥 Видеоинструкция")],
-        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
-        [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="👑 Админ")],
-        [KeyboardButton(text="🌐 Веб-кабинет")],
+        [KeyboardButton(text="🔌 Подключить магазин")],
+        [KeyboardButton(text="🎥 Как подключить")],
+        [KeyboardButton(text="🌐 Язык"), KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="👑 Админ")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Сначала подключите магазин",
@@ -2530,10 +3505,10 @@ MAIN_MENU_RU_ADMIN = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔌 Ulash"), KeyboardButton(text="🎥 API ulash videosi")],
-        [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
-        [KeyboardButton(text="ℹ️ Yordam")],
-        [KeyboardButton(text="🌐 Veb-kabinet")],
+        [KeyboardButton(text="🔌 Do‘konni ulash")],
+        [KeyboardButton(text="🎥 Qanday ulash kerak")],
+        [KeyboardButton(text="🌐 Til"), KeyboardButton(text="ℹ️ Yordam")],
+        [KeyboardButton(text="💎 Obuna")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Avval do‘konni ulang",
@@ -2541,10 +3516,10 @@ MAIN_MENU_UZ = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔌 Ulash"), KeyboardButton(text="🎥 API ulash videosi")],
-        [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
-        [KeyboardButton(text="ℹ️ Yordam"), KeyboardButton(text="👑 Admin")],
-        [KeyboardButton(text="🌐 Veb-kabinet")],
+        [KeyboardButton(text="🔌 Do‘konni ulash")],
+        [KeyboardButton(text="🎥 Qanday ulash kerak")],
+        [KeyboardButton(text="🌐 Til"), KeyboardButton(text="ℹ️ Yordam")],
+        [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="👑 Admin")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Avval do‘konni ulang",
@@ -2553,12 +3528,10 @@ MAIN_MENU_UZ_ADMIN = ReplyKeyboardMarkup(
 # Главное меню после подключения API: простая структура по разделам.
 MAIN_MENU_RU_CONNECTED = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🏠 Обзор магазина")],
         [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
-        [KeyboardButton(text="🧠 Что проверить"), KeyboardButton(text="🔔 Уведомления")],
-        [KeyboardButton(text="📊 Отчёты"), KeyboardButton(text="🏪 Магазины")],
-        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
-        [KeyboardButton(text="ℹ️ Помощь")],
-        [KeyboardButton(text="🌐 Веб-кабинет")],
+        [KeyboardButton(text="🚨 Важно сейчас"), KeyboardButton(text="📊 Отчёты")],
+        [KeyboardButton(text="⚙️ Настройки")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите раздел",
@@ -2566,12 +3539,10 @@ MAIN_MENU_RU_CONNECTED = ReplyKeyboardMarkup(
 
 MAIN_MENU_RU_CONNECTED_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🏠 Обзор магазина")],
         [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
-        [KeyboardButton(text="🧠 Что проверить"), KeyboardButton(text="🔔 Уведомления")],
-        [KeyboardButton(text="📊 Отчёты"), KeyboardButton(text="🏪 Магазины")],
-        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
-        [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="👑 Админ")],
-        [KeyboardButton(text="🌐 Веб-кабинет")],
+        [KeyboardButton(text="🚨 Важно сейчас"), KeyboardButton(text="📊 Отчёты")],
+        [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="👑 Админ")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите раздел",
@@ -2579,12 +3550,10 @@ MAIN_MENU_RU_CONNECTED_ADMIN = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ_CONNECTED = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🏠 Do‘kon holati")],
         [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
-        [KeyboardButton(text="🧠 Tekshirish"), KeyboardButton(text="🔔 Xabarnomalar")],
-        [KeyboardButton(text="📊 Hisobotlar"), KeyboardButton(text="🏪 Do‘konlar")],
-        [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
-        [KeyboardButton(text="ℹ️ Yordam")],
-        [KeyboardButton(text="🌐 Veb-kabinet")],
+        [KeyboardButton(text="🚨 Hozir muhim"), KeyboardButton(text="📊 Hisobotlar")],
+        [KeyboardButton(text="⚙️ Sozlamalar")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Bo‘limni tanlang",
@@ -2592,12 +3561,10 @@ MAIN_MENU_UZ_CONNECTED = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ_CONNECTED_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🏠 Do‘kon holati")],
         [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
-        [KeyboardButton(text="🧠 Tekshirish"), KeyboardButton(text="🔔 Xabarnomalar")],
-        [KeyboardButton(text="📊 Hisobotlar"), KeyboardButton(text="🏪 Do‘konlar")],
-        [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
-        [KeyboardButton(text="ℹ️ Yordam"), KeyboardButton(text="👑 Admin")],
-        [KeyboardButton(text="🌐 Veb-kabinet")],
+        [KeyboardButton(text="🚨 Hozir muhim"), KeyboardButton(text="📊 Hisobotlar")],
+        [KeyboardButton(text="⚙️ Sozlamalar"), KeyboardButton(text="👑 Admin")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Bo‘limni tanlang",
@@ -2607,11 +3574,9 @@ SALES_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Сегодня"), KeyboardButton(text="📆 Вчера")],
         [KeyboardButton(text="🗓 7 дней"), KeyboardButton(text="📅 30 дней")],
-        [KeyboardButton(text="📊 Бизнес-сводка"), KeyboardButton(text="🌐 Все магазины")],
-        [KeyboardButton(text="🏆 Топ товаров"), KeyboardButton(text="🐢 Не продаётся")],
-        [KeyboardButton(text="🧾 Юнит-экономика"), KeyboardButton(text="💰 Прибыль")],
-        [KeyboardButton(text="📥 Себестоимость Excel")],
-        [KeyboardButton(text="⬅️ Главное меню")],
+        [KeyboardButton(text="💰 Прибыль"), KeyboardButton(text="🏆 Топ товаров")],
+        [KeyboardButton(text="✨ Ещё по продажам")],
+        [KeyboardButton(text="🏠 Главное")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Продажи",
@@ -2621,21 +3586,42 @@ SALES_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Bugun"), KeyboardButton(text="📆 Kecha")],
         [KeyboardButton(text="🗓 7 kun"), KeyboardButton(text="📅 30 kun")],
-        [KeyboardButton(text="📊 Biznes xulosa"), KeyboardButton(text="🌐 Barcha do‘konlar")],
-        [KeyboardButton(text="🏆 Top tovarlar"), KeyboardButton(text="🐢 Sotilmayapti")],
-        [KeyboardButton(text="🧾 Unit iqtisodiyot"), KeyboardButton(text="💰 Foyda")],
-        [KeyboardButton(text="📥 Tannarx Excel")],
-        [KeyboardButton(text="⬅️ Asosiy menyu")],
+        [KeyboardButton(text="💰 Foyda"), KeyboardButton(text="🏆 Top tovarlar")],
+        [KeyboardButton(text="✨ Yana savdo tahlili")],
+        [KeyboardButton(text="🏠 Asosiy")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Savdo",
 )
 
+SALES_MORE_MENU_RU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📊 Бизнес-сводка"), KeyboardButton(text="🌐 Все магазины")],
+        [KeyboardButton(text="🐢 Не продаётся"), KeyboardButton(text="🧾 Юнит-экономика")],
+        [KeyboardButton(text="📥 Себестоимость Excel"), KeyboardButton(text="🧮 Расходы и налоги")],
+        [KeyboardButton(text="⬅️ Продажи"), KeyboardButton(text="🏠 Главное")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Дополнительная аналитика",
+)
+
+SALES_MORE_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📊 Biznes xulosa"), KeyboardButton(text="🌐 Barcha do‘konlar")],
+        [KeyboardButton(text="🐢 Sotilmayapti"), KeyboardButton(text="🧾 Unit iqtisodiyot")],
+        [KeyboardButton(text="📥 Tannarx Excel"), KeyboardButton(text="🧮 Xarajat va soliq")],
+        [KeyboardButton(text="⬅️ Savdo"), KeyboardButton(text="🏠 Asosiy")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Qo‘shimcha tahlil",
+)
+
 STOCK_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📦 Остатки"), KeyboardButton(text="⚠️ Прогноз остатков")],
-        [KeyboardButton(text="🧭 Потерянные"), KeyboardButton(text="🏷 Этикетки SKU")],
-        [KeyboardButton(text="⬅️ Главное меню")],
+        [KeyboardButton(text="📦 Все остатки"), KeyboardButton(text="🚚 Что заказать")],
+        [KeyboardButton(text="🧭 Потери и брак"), KeyboardButton(text="🏷 Этикетки SKU")],
+        [KeyboardButton(text="⚙️ Срок поставки")],
+        [KeyboardButton(text="🏠 Главное")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Склад",
@@ -2643,9 +3629,10 @@ STOCK_MENU_RU = ReplyKeyboardMarkup(
 
 STOCK_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📦 Qoldiq"), KeyboardButton(text="⚠️ Qoldiq prognozi")],
-        [KeyboardButton(text="🧭 Yo‘qolganlar"), KeyboardButton(text="🏷 SKU etiketkalari")],
-        [KeyboardButton(text="⬅️ Asosiy menyu")],
+        [KeyboardButton(text="📦 Barcha qoldiq"), KeyboardButton(text="🚚 Nima buyurtma qilish")],
+        [KeyboardButton(text="🧭 Yo‘qotish va brak"), KeyboardButton(text="🏷 SKU etiketkalari")],
+        [KeyboardButton(text="⚙️ Yetkazish muddati")],
+        [KeyboardButton(text="🏠 Asosiy")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Ombor",
@@ -2653,10 +3640,8 @@ STOCK_MENU_UZ = ReplyKeyboardMarkup(
 
 NOTIFY_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💸 Новые продажи"), KeyboardButton(text="📉 Низкие остатки")],
-        [KeyboardButton(text="❌ Нет в наличии"), KeyboardButton(text="🚫 Отмены заказов")],
-        [KeyboardButton(text="⚙️ Статус")],
-        [KeyboardButton(text="⬅️ Главное меню")],
+        [KeyboardButton(text="⚙️ Настроить уведомления")],
+        [KeyboardButton(text="⬅️ Настройки"), KeyboardButton(text="🏠 Главное")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Уведомления",
@@ -2664,10 +3649,8 @@ NOTIFY_MENU_RU = ReplyKeyboardMarkup(
 
 NOTIFY_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💸 Yangi savdolar"), KeyboardButton(text="📉 Kam qoldiq")],
-        [KeyboardButton(text="❌ Qoldiq tugagan"), KeyboardButton(text="🚫 Bekor qilishlar")],
-        [KeyboardButton(text="⚙️ Holat")],
-        [KeyboardButton(text="⬅️ Asosiy menyu")],
+        [KeyboardButton(text="⚙️ Xabarnomalarni sozlash")],
+        [KeyboardButton(text="⬅️ Sozlamalar"), KeyboardButton(text="🏠 Asosiy")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Xabarnomalar",
@@ -2675,11 +3658,10 @@ NOTIFY_MENU_UZ = ReplyKeyboardMarkup(
 
 REPORT_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Excel отчёт"), KeyboardButton(text="🌙 Утренний отчёт")],
-        [KeyboardButton(text="💰 Прибыль"), KeyboardButton(text="📥 Себестоимость Excel")],
-        [KeyboardButton(text="⭐ Отзывы"), KeyboardButton(text="✅ Проверить подключение")],
-        [KeyboardButton(text="🔐 Безопасность")],
-        [KeyboardButton(text="⬅️ Главное меню")],
+        [KeyboardButton(text="📊 Excel-отчёт")],
+        [KeyboardButton(text="🌙 Краткий отчёт"), KeyboardButton(text="💰 Прибыль")],
+        [KeyboardButton(text="📈 Эффект рекомендаций"), KeyboardButton(text="📅 Автоотчёты")],
+        [KeyboardButton(text="🏠 Главное")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Отчёты",
@@ -2687,22 +3669,102 @@ REPORT_MENU_RU = ReplyKeyboardMarkup(
 
 REPORT_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Excel hisobot"), KeyboardButton(text="🌙 Ertalabki hisobot")],
-        [KeyboardButton(text="💰 Foyda"), KeyboardButton(text="📥 Tannarx Excel")],
-        [KeyboardButton(text="⭐ Sharhlar"), KeyboardButton(text="✅ Ulanishni tekshirish")],
-        [KeyboardButton(text="🔐 Xavfsizlik")],
-        [KeyboardButton(text="⬅️ Asosiy menyu")],
+        [KeyboardButton(text="📊 Excel hisobot")],
+        [KeyboardButton(text="🌙 Qisqa hisobot"), KeyboardButton(text="💰 Foyda")],
+        [KeyboardButton(text="📈 Tavsiyalar ta’siri"), KeyboardButton(text="📅 Avtohisobotlar")],
+        [KeyboardButton(text="🏠 Asosiy")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Hisobotlar",
 )
 
+SETTINGS_MENU_RU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🔔 Уведомления")],
+        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="🌐 Язык")],
+        [KeyboardButton(text="💰 Себестоимость и расходы"), KeyboardButton(text="🚚 Настройки поставки")],
+        [KeyboardButton(text="🔐 API и подключение"), KeyboardButton(text="🌐 Веб-кабинет")],
+        [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="💎 Подписка")],
+        [KeyboardButton(text="🏠 Главное")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Настройки",
+)
+
+SETTINGS_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🔔 Xabarnomalar")],
+        [KeyboardButton(text="🏪 Do‘konlar"), KeyboardButton(text="🌐 Til")],
+        [KeyboardButton(text="💰 Tannarx va xarajat"), KeyboardButton(text="🚚 Yetkazish sozlamalari")],
+        [KeyboardButton(text="🔐 API va ulanish"), KeyboardButton(text="🌐 Veb-kabinet")],
+        [KeyboardButton(text="ℹ️ Yordam"), KeyboardButton(text="💎 Obuna")],
+        [KeyboardButton(text="🏠 Asosiy")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Sozlamalar",
+)
+
+FINANCE_MENU_RU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📥 Себестоимость Excel")],
+        [KeyboardButton(text="🧮 Расходы и налоги"), KeyboardButton(text="💰 Прибыль")],
+        [KeyboardButton(text="🧾 Юнит-экономика")],
+        [KeyboardButton(text="⬅️ Настройки"), KeyboardButton(text="🏠 Главное")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Финансы",
+)
+
+FINANCE_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📥 Tannarx Excel")],
+        [KeyboardButton(text="🧮 Xarajat va soliq"), KeyboardButton(text="💰 Foyda")],
+        [KeyboardButton(text="🧾 Unit iqtisodiyot")],
+        [KeyboardButton(text="⬅️ Sozlamalar"), KeyboardButton(text="🏠 Asosiy")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Moliya",
+)
+
+CONNECTION_MENU_RU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="✅ Проверить подключение")],
+        [KeyboardButton(text="🔌 Обновить API-ключ"), KeyboardButton(text="🔐 Безопасность")],
+        [KeyboardButton(text="⬅️ Настройки"), KeyboardButton(text="🏠 Главное")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Подключение Uzum",
+)
+
+CONNECTION_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="✅ Ulanishni tekshirish")],
+        [KeyboardButton(text="🔌 API-kalitni yangilash"), KeyboardButton(text="🔐 Xavfsizlik")],
+        [KeyboardButton(text="⬅️ Sozlamalar"), KeyboardButton(text="🏠 Asosiy")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Uzum ulanishi",
+)
+
+CONNECT_INPUT_MENU_RU = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="❌ Отмена")]],
+    resize_keyboard=True,
+    input_field_placeholder="Вставьте API-ключ сюда",
+)
+
+CONNECT_INPUT_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="❌ Bekor qilish")]],
+    resize_keyboard=True,
+    input_field_placeholder="API-kalitni shu yerga kiriting",
+)
+
 ATTENTION_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔍 Проверить сейчас")],
+        [KeyboardButton(text="🔍 Проверить магазин")],
         [KeyboardButton(text="⚠️ Остатки"), KeyboardButton(text="🐢 Без продаж")],
         [KeyboardButton(text="🧾 Нет себестоимости"), KeyboardButton(text="📉 Низкая прибыль")],
-        [KeyboardButton(text="❌ Отмены"), KeyboardButton(text="⬅️ Главное меню")],
+        [KeyboardButton(text="❌ Отмены")],
+        [KeyboardButton(text="🏠 Главное")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Что проверить",
@@ -2710,10 +3772,11 @@ ATTENTION_MENU_RU = ReplyKeyboardMarkup(
 
 ATTENTION_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔍 Hozir tekshirish")],
+        [KeyboardButton(text="🔍 Do‘konni tekshirish")],
         [KeyboardButton(text="⚠️ Qoldiqlar"), KeyboardButton(text="🐢 Sotuv yo‘q")],
         [KeyboardButton(text="🧾 Tannarx yo‘q"), KeyboardButton(text="📉 Past foyda")],
-        [KeyboardButton(text="❌ Bekor qilishlar"), KeyboardButton(text="⬅️ Asosiy menyu")],
+        [KeyboardButton(text="❌ Bekor qilishlar")],
+        [KeyboardButton(text="🏠 Asosiy")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Nimani tekshiramiz",
@@ -2752,7 +3815,6 @@ ANALYTICS_MENU = MAIN_MENU_RU
 PRODUCTS_MENU = MAIN_MENU_RU
 ORDERS_MENU = MAIN_MENU_RU
 NOTIFICATIONS_MENU = MAIN_MENU_RU
-SETTINGS_MENU = MAIN_MENU_RU
 
 
 def _user_has_uzum_connection(telegram_id: int | None) -> bool:
@@ -2786,6 +3848,10 @@ def sales_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
     return SALES_MENU_UZ if get_user_language(telegram_id) == "uz" else SALES_MENU_RU
 
 
+def sales_more_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
+    return SALES_MORE_MENU_UZ if get_user_language(telegram_id) == "uz" else SALES_MORE_MENU_RU
+
+
 def stock_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
     return STOCK_MENU_UZ if get_user_language(telegram_id) == "uz" else STOCK_MENU_RU
 
@@ -2796,6 +3862,18 @@ def notify_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
 
 def report_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
     return REPORT_MENU_UZ if get_user_language(telegram_id) == "uz" else REPORT_MENU_RU
+
+
+def settings_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
+    return SETTINGS_MENU_UZ if get_user_language(telegram_id) == "uz" else SETTINGS_MENU_RU
+
+
+def finance_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
+    return FINANCE_MENU_UZ if get_user_language(telegram_id) == "uz" else FINANCE_MENU_RU
+
+
+def connection_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
+    return CONNECTION_MENU_UZ if get_user_language(telegram_id) == "uz" else CONNECTION_MENU_RU
 
 
 def attention_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
@@ -2813,6 +3891,10 @@ def sales_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
     return sales_menu_for_user(_message_user_id(message))
 
 
+def sales_more_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
+    return sales_more_menu_for_user(_message_user_id(message))
+
+
 def stock_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
     return stock_menu_for_user(_message_user_id(message))
 
@@ -2823,6 +3905,18 @@ def notify_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
 
 def report_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
     return report_menu_for_user(_message_user_id(message))
+
+
+def settings_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
+    return settings_menu_for_user(_message_user_id(message))
+
+
+def finance_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
+    return finance_menu_for_user(_message_user_id(message))
+
+
+def connection_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
+    return connection_menu_for_user(_message_user_id(message))
 
 
 def attention_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
@@ -2951,6 +4045,10 @@ class BarcodePrintStates(StatesGroup):
 
 class PaymentStates(StatesGroup):
     waiting_for_receipt = State()
+
+
+class ProductSettingsStates(StatesGroup):
+    waiting_for_value = State()
 
 
 def get_tg_id(message: Message) -> int:
@@ -3104,14 +4202,14 @@ async def connect_shop_by_staff(message: Message, shop_id_text: str, state: FSMC
                 "✅ <b>Do‘kon ulandi</b>\n\n"
                 f"Shop ID: <code>{shop_id}</code>\n"
                 "Xodim orqali kirish tasdiqlandi.\n\n"
-                "Endi savdolar, qoldiqlar va hisobotlardan foydalanishingiz mumkin."
+                "Boshlash uchun <b>🏠 Do‘kon holati</b> tugmasini bosing."
             )
         else:
             text_ok = (
                 "✅ <b>Магазин подключён</b>\n\n"
                 f"Shop ID: <code>{shop_id}</code>\n"
                 "Доступ через сотрудника подтверждён.\n\n"
-                "Теперь можно смотреть продажи, остатки и отчёты."
+                "Для начала нажмите <b>🏠 Обзор магазина</b>."
             )
         await message.answer(text_ok, reply_markup=menu_for_message(message))
         await notify_admins_staff_shop_connected(message, telegram_id, shop_id)
@@ -3153,23 +4251,29 @@ async def require_connection(message: Message) -> tuple[int, UzumClient, int] | 
         lang = get_user_language(telegram_id)
         if lang == "uz":
             text = (
-                "Avval do‘konni ulang.\n\n"
-                "<code>/connect</code> buyrug‘ini bosing va Uzum Seller API-kalitingizni yuboring.\n"
-                "Videoqo‘llanma: <code>/video</code>"
+                "🔌 <b>Avval do‘konni ulang</b>\n\n"
+                "Pastdagi <b>🎥 Qanday ulash kerak</b> videosini ko‘ring, so‘ng "
+                "<b>🔌 Do‘konni ulash</b> tugmasini bosing."
             )
         else:
             text = (
-                "Сначала подключите магазин.\n\n"
-                "Нажмите <code>/connect</code> и отправьте API-ключ из кабинета Uzum Seller.\n"
-                "Видеоинструкция: <code>/video</code>"
+                "🔌 <b>Сначала подключите магазин</b>\n\n"
+                "Посмотрите <b>🎥 Как подключить</b>, затем нажмите "
+                "<b>🔌 Подключить магазин</b>."
             )
         await message.answer(text, reply_markup=menu_for_message(message))
         return None
 
     if shop_id is None:
+        lang = get_user_language(telegram_id)
         await message.answer(
-            "Токен подключён, но основной магазин не выбран.\n"
-            "Напишите <code>/shops</code>, потом <code>/setshop SHOP_ID</code>.",
+            (
+                "API-kalit ulangan, lekin faol do‘kon tanlanmagan.\n"
+                "<b>⚙️ Sozlamalar → 🏪 Do‘konlar</b> bo‘limidan do‘konni tanlang."
+                if lang == "uz"
+                else "API-ключ подключён, но активный магазин не выбран.\n"
+                "Откройте <b>⚙️ Настройки → 🏪 Магазины</b> и выберите магазин."
+            ),
             reply_markup=menu_for_message(message),
         )
         return None
@@ -3184,7 +4288,8 @@ async def send_api_error(message: Message, error: Exception) -> None:
         user_text = (
             "🔐 <b>Uzum API-ключ не принят</b>\n\n"
             "Возможно, ключ неверный, удалён или истёк.\n"
-            "Создайте новый ключ в кабинете Uzum Seller и подключите его через <code>/reconnect</code>."
+            "Создайте новый ключ и откройте <b>⚙️ Настройки → 🔐 Подключение Uzum → "
+            "🔌 Обновить API-ключ</b>."
         )
     elif "403" in raw or "rbac" in low or "forbidden" in low:
         user_text = (
@@ -3248,6 +4353,152 @@ async def load_products(
     return all_products
 
 
+def _official_stock_number(raw: dict[str, Any], *names: str) -> float | None:
+    """Read a numeric stock field without confusing it with another quantity.
+
+    Uzum's current Product API exposes quantityActive (warehouse stock) and
+    quantityFbs (seller warehouse) as separate values.  Older bot versions
+    treated quantityActive as a combined total and then subtracted FBS from it,
+    which could produce misleading FBO/total figures.
+    """
+    if not isinstance(raw, dict):
+        return None
+    lower_keys = {str(key).lower(): key for key in raw}
+    for name in names:
+        actual = name if name in raw else lower_keys.get(name.lower())
+        if actual is None:
+            continue
+        value = _num_from_value(raw.get(actual))
+        if value is not None:
+            return value
+    return None
+
+
+def _stock_row_identity(row: dict[str, Any]) -> str:
+    """Stable SKU identity used to prevent double counting API duplicates."""
+    for field in ("sku_id", "barcode", "seller_item_code"):
+        value = row.get(field)
+        if value not in (None, "", 0, "0", "—"):
+            return f"{field}:{str(value).strip().lower()}"
+    return "fallback:" + "|".join(
+        str(row.get(field) or "").strip().lower()
+        for field in ("product_id", "sku_full_title", "sku_title", "product_title")
+    )
+
+
+def _normalize_current_stock_row(source: dict[str, Any]) -> dict[str, Any]:
+    """Normalize one Product API row using the documented current fields."""
+    row = dict(source)
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+
+    active = _official_stock_number(raw, "quantityActive")
+    fbs = _official_stock_number(raw, "quantityFbs")
+    if active is not None or fbs is not None:
+        # Official Swagger descriptions:
+        # quantityActive — active SKU units at the warehouse;
+        # quantityFbs — units available under Fulfillment by Seller.
+        fbo_units = max(0.0, float(active or 0.0))
+        fbs_units = max(0.0, float(fbs or 0.0))
+        row["active"] = fbo_units
+        row["fbo"] = fbo_units
+        row["fbs"] = fbs_units
+        row["total"] = fbo_units + fbs_units
+        row["stock_source"] = "quantityActive + quantityFbs"
+    else:
+        # Compatibility fallback for a different/older response shape.
+        fbo_units = max(0.0, float(_num_from_value(row.get("fbo")) or 0.0))
+        fbs_units = max(0.0, float(_num_from_value(row.get("fbs")) or 0.0))
+        total = _num_from_value(row.get("total"))
+        row["fbo"] = fbo_units
+        row["fbs"] = fbs_units
+        row["total"] = max(0.0, float(total)) if total is not None else fbo_units + fbs_units
+        row["stock_source"] = "compatibility"
+
+    # Uzum also exposes an official per-SKU average.  It is used only as a
+    # fallback when a Finance API row cannot be matched to this SKU.
+    row["avg_daily_sales_api"] = max(
+        0.0,
+        float(_official_stock_number(raw, "avgdsales", "avgDailySales") or 0.0),
+    )
+    row["avg_daily_active_api"] = max(
+        0.0,
+        float(_official_stock_number(raw, "avgdquantity", "avgDailyQuantity") or 0.0),
+    )
+    row["duplicate_count"] = max(1, int(row.get("duplicate_count") or 1))
+    return row
+
+
+def _normalize_current_stock_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Normalize and deduplicate current stock without summing repeated SKUs."""
+    merged: dict[str, dict[str, Any]] = {}
+    ordered_keys: list[str] = []
+    quantity_fields = (
+        "active",
+        "fbo",
+        "fbs",
+        "total",
+        "additional",
+        "sold",
+        "returned",
+        "missing",
+        "defected",
+        "pending",
+        "avg_daily_sales_api",
+        "avg_daily_active_api",
+    )
+    descriptive_fields = (
+        "product_id",
+        "sku_id",
+        "barcode",
+        "seller_item_code",
+        "product_title",
+        "sku_title",
+        "sku_full_title",
+        "category",
+        "price",
+        "market_price",
+        "status",
+    )
+
+    for source in rows:
+        row = _normalize_current_stock_row(source)
+        key = _stock_row_identity(row)
+        current = merged.get(key)
+        if current is None:
+            merged[key] = row
+            ordered_keys.append(key)
+            continue
+
+        current["duplicate_count"] = int(current.get("duplicate_count") or 1) + 1
+        # A repeated API row is the same SKU, not more physical stock.  Keep
+        # the greatest observed counter instead of adding it twice.
+        for field in quantity_fields:
+            current_value = _num_from_value(current.get(field))
+            row_value = _num_from_value(row.get(field))
+            if row_value is not None and (current_value is None or row_value > current_value):
+                current[field] = row_value
+        for field in descriptive_fields:
+            if current.get(field) in (None, "", "—") and row.get(field) not in (None, "", "—"):
+                current[field] = row.get(field)
+
+        # Rebuild total from the two documented live-stock components.
+        if current.get("stock_source") == "quantityActive + quantityFbs":
+            current["total"] = max(0.0, float(current.get("fbo") or 0.0)) + max(
+                0.0, float(current.get("fbs") or 0.0)
+            )
+
+    result = [merged[key] for key in ordered_keys]
+    duplicate_rows = sum(max(0, int(row.get("duplicate_count") or 1) - 1) for row in result)
+    if duplicate_rows:
+        logging.warning(
+            "Stock normalization removed %s duplicate SKU rows (raw=%s unique=%s)",
+            duplicate_rows,
+            len(rows),
+            len(result),
+        )
+    return result
+
+
 async def load_sku_rows(
     client: UzumClient,
     shop_id: int,
@@ -3258,7 +4509,7 @@ async def load_sku_rows(
     products = await load_products(
         client, shop_id, search_query=search_query, max_pages=max_pages, page_size=100
     )
-    return flatten_sku_rows(products)
+    return _normalize_current_stock_rows(flatten_sku_rows(products))
 
 
 async def connect_token(
@@ -3267,10 +4518,14 @@ async def connect_token(
     telegram_id = upsert_from_message(message)
     token = token.strip()
     if not token or len(token) < 20:
+        lang = get_user_language(telegram_id)
         await message.answer(
-            "Похоже, это не Uzum API-токен.\n"
-            "Отправьте полный токен или нажмите /cancel.",
-            reply_markup=menu_for_message(message),
+            (
+                "Bu API-kalitga o‘xshamaydi. To‘liq kalitni bitta xabar qilib yuboring."
+                if lang == "uz"
+                else "Похоже, это не API-ключ. Отправьте полный ключ одним сообщением."
+            ),
+            reply_markup=CONNECT_INPUT_MENU_UZ if lang == "uz" else CONNECT_INPUT_MENU_RU,
         )
         return
 
@@ -3279,12 +4534,16 @@ async def connect_token(
         data = await client.get_shops()
         shops = extract_items(data)
         if not shops:
+            lang = get_user_language(telegram_id)
             await message.answer(
-                "Токен сработал, но список магазинов не найден.\n"
-                "Ответ API:\n<code>"
-                + escape(compact_json_preview(data))
-                + "</code>",
-                reply_markup=menu_for_message(message),
+                (
+                    "Kalit qabul qilindi, lekin unga bog‘langan do‘kon topilmadi. "
+                    "Kalit huquqlarini tekshiring yoki boshqa kalit yuboring."
+                    if lang == "uz"
+                    else "Ключ принят, но доступных магазинов не найдено. "
+                    "Проверьте права ключа или отправьте другой ключ."
+                ),
+                reply_markup=CONNECT_INPUT_MENU_UZ if lang == "uz" else CONNECT_INPUT_MENU_RU,
             )
             return
 
@@ -3297,36 +4556,41 @@ async def connect_token(
             pass
 
         lang = get_user_language(telegram_id)
-        lines = [format_shop_line(shop) for shop in shops[:20]]
         if lang == "uz":
             text_ok = (
                 "✅ <b>Do‘kon ulandi</b>\n\n"
                 f"Topilgan do‘konlar: <b>{len(shops)}</b>\n"
-                + "\n".join(lines)
-                + "\n\nFaol do‘kon: "
+                "Faol do‘kon: "
                 + (f"<code>{default_shop_id}</code>" if default_shop_id else "tanlanmagan")
-                + "\n\nEndi asosiy bo‘limlardan foydalanishingiz mumkin:\n"
-                "💰 <b>Savdo</b> — bugun, kecha, 7/30 kun\n"
-                "📦 <b>Ombor</b> — qoldiq va prognoz\n"
-                "📊 <b>Hisobotlar</b> — Excel va tekshiruv"
+                + "\n\nTayyor. Boshlash uchun:\n"
+                "🏠 <b>Do‘kon holati</b> — asosiy raqamlar\n"
+                "🚨 <b>Hozir muhim</b> — birinchi navbatdagi muammolar\n"
+                "💰 <b>Savdo</b> va 📦 <b>Ombor</b> — batafsil ma’lumot"
             )
         else:
             text_ok = (
                 "✅ <b>Магазин подключён</b>\n\n"
                 f"Найдено магазинов: <b>{len(shops)}</b>\n"
-                + "\n".join(lines)
-                + "\n\nАктивный магазин: "
+                "Активный магазин: "
                 + (f"<code>{default_shop_id}</code>" if default_shop_id else "не выбран")
-                + "\n\nТеперь пользуйтесь основными разделами:\n"
-                "💰 <b>Продажи</b> — сегодня, вчера, 7/30 дней\n"
-                "📦 <b>Склад</b> — остатки и прогноз\n"
-                "📊 <b>Отчёты</b> — Excel и проверка подключения"
+                + "\n\nГотово. Начните с разделов:\n"
+                "🏠 <b>Обзор магазина</b> — главные цифры\n"
+                "🚨 <b>Важно сейчас</b> — проблемы в первую очередь\n"
+                "💰 <b>Продажи</b> и 📦 <b>Склад</b> — подробности"
             )
         await message.answer(text_ok, reply_markup=menu_for_message(message))
         if state:
             await state.clear()
     except Exception as e:
         await send_api_error(message, e)
+        if state:
+            lang = get_user_language(telegram_id)
+            await message.answer(
+                "Boshqa kalit yuboring yoki bekor qiling."
+                if lang == "uz"
+                else "Отправьте другой ключ или отмените подключение.",
+                reply_markup=CONNECT_INPUT_MENU_UZ if lang == "uz" else CONNECT_INPUT_MENU_RU,
+            )
 
 
 @dp.message(Command("language", "lang", "til"))
@@ -3603,43 +4867,58 @@ async def start(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     ensure_subscription(telegram_id)
     lang = get_user_language(telegram_id)
-    connected = "✅ подключён" if db.has_uzum_connection(telegram_id) else "❌ не подключён"
+    is_connected = db.has_uzum_connection(telegram_id)
+    connected = "✅ подключён" if is_connected else "❌ не подключён"
     if lang == "uz":
-        connected = "✅ ulangan" if db.has_uzum_connection(telegram_id) else "❌ ulanmagan"
+        connected = "✅ ulangan" if is_connected else "❌ ulanmagan"
     sub_line = subscription_status_text(telegram_id)
 
-    admin_part = ""
-
     if lang == "uz":
-        text = (
-            "👋 <b>Uzum Seller Assistant</b>\n\n"
-            "Sotuv, qoldiq va hisobotlarni Telegramda ko‘rish uchun yordamchi bot.\n\n"
-            f"Uzum API: {connected}\n"
-            f"Kirish: {sub_line}\n"
-            f"Til: <b>{language_title(lang)}</b>\n\n"
-            "🚀 <b>Boshlash uchun 3 qadam:</b>\n"
-            "1. <code>/video</code> — API ulash videosini ko‘ring\n"
-            "2. <code>/connect</code> — API-kalitni botga yuboring\n"
-            "3. <b>💰 Savdo</b> yoki <b>📦 Ombor</b> bo‘limini tanlang\n\n"
-            "Asosiy menyuda faqat eng kerakli bo‘limlar qoldirildi.\n"
-            "Yordam: <code>/support</code>"
-            + admin_part
-        )
+        if is_connected:
+            text = (
+                "👋 <b>Seller.pro.uz</b>\n\n"
+                f"Do‘kon: {connected}\n"
+                f"Kirish: {sub_line}\n\n"
+                "<b>Nimadan boshlash kerak?</b>\n"
+                "🏠 <b>Do‘kon holati</b> — asosiy raqamlarni bir joyda ko‘rish\n"
+                "🚨 <b>Hozir muhim</b> — nimaga e’tibor berish va nima qilish\n"
+                "💰 <b>Savdo</b> va 📦 <b>Ombor</b> — kundalik ishlar\n\n"
+                "Kerakli tugmani pastdan bosing 👇"
+            )
+        else:
+            text = (
+                "👋 <b>Seller.pro.uz</b>\n\n"
+                "Uzum do‘koningizni Telegram orqali nazorat qilish uchun yordamchi.\n\n"
+                f"Do‘kon: {connected}\n"
+                f"Kirish: {sub_line}\n\n"
+                "<b>Boshlash juda oson:</b>\n"
+                "1. <b>🎥 Qanday ulash kerak</b> — qisqa videoni ko‘ring\n"
+                "2. <b>🔌 Do‘konni ulash</b> — API-kalitni yuboring\n\n"
+                "Qolgan bo‘limlar ulanishdan keyin avtomatik ochiladi."
+            )
     else:
-        text = (
-            "👋 <b>Uzum Seller Assistant</b>\n\n"
-            "Помощник для селлеров Uzum: продажи, остатки, уведомления и отчёты прямо в Telegram.\n\n"
-            f"Uzum API: {connected}\n"
-            f"Доступ: {sub_line}\n"
-            f"Язык: <b>{language_title(lang)}</b>\n\n"
-            "🚀 <b>Начать в 3 шага:</b>\n"
-            "1. <code>/video</code> — посмотрите видеоинструкцию\n"
-            "2. <code>/connect</code> — отправьте API-ключ боту\n"
-            "3. Выберите раздел <b>💰 Продажи</b> или <b>📦 Склад</b>\n\n"
-            "В главном меню оставлены только самые нужные разделы, чтобы не путаться.\n"
-            "Поддержка: <code>/support</code>"
-            + admin_part
-        )
+        if is_connected:
+            text = (
+                "👋 <b>Seller.pro.uz</b>\n\n"
+                f"Магазин: {connected}\n"
+                f"Доступ: {sub_line}\n\n"
+                "<b>С чего начать?</b>\n"
+                "🏠 <b>Обзор магазина</b> — главные цифры на одном экране\n"
+                "🚨 <b>Важно сейчас</b> — что требует внимания и что сделать\n"
+                "💰 <b>Продажи</b> и 📦 <b>Склад</b> — ежедневная работа\n\n"
+                "Нажмите нужную кнопку внизу 👇"
+            )
+        else:
+            text = (
+                "👋 <b>Seller.pro.uz</b>\n\n"
+                "Помощник для контроля магазина Uzum прямо в Telegram.\n\n"
+                f"Магазин: {connected}\n"
+                f"Доступ: {sub_line}\n\n"
+                "<b>Начать очень просто:</b>\n"
+                "1. <b>🎥 Как подключить</b> — посмотрите короткое видео\n"
+                "2. <b>🔌 Подключить магазин</b> — отправьте API-ключ\n\n"
+                "Остальные разделы откроются автоматически после подключения."
+            )
     await message.answer(text, reply_markup=menu_for_message(message))
 
 
@@ -3684,15 +4963,13 @@ def api_already_connected_text(lang: str) -> str:
     if lang == "uz":
         return (
             "✅ <b>Do‘kon allaqachon ulangan</b>\n\n"
-            "Tasodifan <b>🔌 Ulash</b> tugmasini bossangiz ham, eski API-kalit o‘chmaydi.\n\n"
-            "API-kalitni almashtirish kerak bo‘lsa, faqat shunda <code>/reconnect</code> buyrug‘ini yuboring.\n"
-            "Ulanishni butunlay o‘chirish uchun: <code>/disconnect</code>"
+            "Amaldagi API-kalit xavfsiz saqlangan. Uni almashtirish kerak bo‘lsa:\n"
+            "<b>⚙️ Sozlamalar → 🔐 Uzum ulanishi → 🔌 API-kalitni yangilash</b>."
         )
     return (
         "✅ <b>Магазин уже подключён</b>\n\n"
-        "Если вы случайно нажали <b>🔌 Подключить</b>, ничего страшного — старый API-ключ не удалён и не слетит.\n\n"
-        "Чтобы заменить API-ключ, используйте только команду <code>/reconnect</code>.\n"
-        "Чтобы полностью удалить подключение: <code>/disconnect</code>"
+        "Текущий API-ключ сохранён и продолжает работать. Если его нужно заменить:\n"
+        "<b>⚙️ Настройки → 🔐 Подключение Uzum → 🔌 Обновить API-ключ</b>."
     )
 
 
@@ -3712,28 +4989,57 @@ async def connect_shop_command(message: Message, state: FSMContext) -> None:
     if lang == "uz":
         text = (
             "🔌 <b>Do‘konni ulash</b>\n\n"
-            "Do‘konni ulash uchun Uzum Seller kabinetidan API-kalit yarating va shu yerga yuboring.\n\n"
-            "🎥 Videoqo‘llanma: <code>/video</code>\n"
-            "📌 Yozma yo‘riqnoma: <code>/api_token</code>\n\n"
-            "API-kalitni keyingi xabarda yuboring.\n"
-            "Bekor qilish: <code>/cancel</code>"
+            "Uzum Seller kabinetida yaratilgan API-kalitni nusxalang va keyingi xabarda yuboring.\n\n"
+            "🔐 Kalit Telegram chatida ko‘rsatilmaydi va bot uni ishlashdan oldin tekshiradi."
         )
     else:
         text = (
             "🔌 <b>Подключение магазина</b>\n\n"
-            "Чтобы подключить магазин, создайте API-ключ в кабинете Uzum Seller и отправьте его сюда.\n\n"
-            "🎥 Видеоинструкция: <code>/video</code>\n"
-            "📌 Текстовая инструкция: <code>/api_token</code>\n\n"
-            "Отправьте API-ключ следующим сообщением.\n"
-            "Отмена: <code>/cancel</code>"
+            "Скопируйте API-ключ из кабинета Uzum Seller и отправьте его следующим сообщением.\n\n"
+            "🔐 Ключ не показывается в интерфейсе и будет проверен до сохранения."
         )
-    await message.answer(text, reply_markup=menu_for_message(message))
+    await message.answer(
+        text,
+        reply_markup=CONNECT_INPUT_MENU_UZ if lang == "uz" else CONNECT_INPUT_MENU_RU,
+    )
 
 
-@dp.message(F.text == "🔌 Подключить")
-@dp.message(F.text == "🔌 Ulash")
+@dp.message(F.text.in_({"🔌 Подключить", "🔌 Подключить магазин", "🔌 Ulash", "🔌 Do‘konni ulash"}))
 async def connect_shop_button(message: Message, state: FSMContext) -> None:
     await connect_shop_command(message, state)
+
+
+@dp.message(F.text.in_({"🔌 Обновить API-ключ", "🔌 API-kalitni yangilash"}))
+async def reconnect_shop_button(message: Message, state: FSMContext) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    await state.set_state(ConnectStates.waiting_for_token)
+    if lang == "uz":
+        text = (
+            "🔁 <b>API-kalitni yangilash</b>\n\n"
+            "Yangi API-kalitni keyingi xabarda yuboring. Eski ulanish faqat yangi kalit "
+            "muvaffaqiyatli tekshirilgandan keyin almashtiriladi."
+        )
+    else:
+        text = (
+            "🔁 <b>Обновление API-ключа</b>\n\n"
+            "Отправьте новый API-ключ следующим сообщением. Старое подключение заменится "
+            "только после успешной проверки нового ключа."
+        )
+    await message.answer(
+        text,
+        reply_markup=CONNECT_INPUT_MENU_UZ if lang == "uz" else CONNECT_INPUT_MENU_RU,
+    )
+
+
+@dp.message(ConnectStates.waiting_for_token, F.text.in_({"❌ Отмена", "❌ Bekor qilish"}))
+async def cancel_connect_button(message: Message, state: FSMContext) -> None:
+    telegram_id = upsert_from_message(message)
+    await state.clear()
+    await message.answer(
+        "Bekor qilindi." if get_user_language(telegram_id) == "uz" else "Подключение отменено.",
+        reply_markup=menu_for_message(message),
+    )
 
 
 @dp.message(ConnectStates.waiting_for_shop_id, F.text)
@@ -4054,281 +5360,6 @@ async def products(message: Message) -> None:
     await send_stock_list(message, mode="all")
 
 
-STOCK_PAGE_SIZE = int(os.getenv("STOCK_PAGE_SIZE", "10"))
-_stock_page_cache: dict[int, dict[str, Any]] = {}
-
-
-def _stock_page_markup(page: int, total_pages: int, lang: str) -> InlineKeyboardMarkup | None:
-    if total_pages <= 1:
-        return None
-    buttons: list[InlineKeyboardButton] = []
-    if page > 0:
-        buttons.append(InlineKeyboardButton(text="⬅️ Oldingi" if lang == "uz" else "⬅️ Назад", callback_data=f"stockpg:{page-1}"))
-    buttons.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="stockpg:noop"))
-    if page < total_pages - 1:
-        buttons.append(InlineKeyboardButton(text="Keyingi ➡️" if lang == "uz" else "След. страница ➡️", callback_data=f"stockpg:{page+1}"))
-    return InlineKeyboardMarkup(inline_keyboard=[buttons])
-
-
-def _stock_page_text(session: dict[str, Any], page: int) -> str:
-    rows = session["rows"]
-    mode = session["mode"]
-    title = session["title"]
-    lang = session["lang"]
-    page_size = session.get("page_size") or STOCK_PAGE_SIZE
-    total = len(rows)
-    total_pages = max(1, (total + page_size - 1) // page_size)
-    page = max(0, min(page, total_pages - 1))
-    start_i = page * page_size
-    chunk = rows[start_i:start_i + page_size]
-    lines = [format_sku_stock_line(row, mode=mode) for row in chunk]
-    start_n = start_i + 1 if total else 0
-    end_n = start_i + len(chunk)
-    if lang == "uz":
-        header = f"{title}\nKo‘rsatilmoqda: {start_n}–{end_n} / {total}\nSahifa: {page + 1}/{total_pages}"
-    else:
-        header = f"{title}\nПоказано: {start_n}–{end_n} из {total}\nСтраница: {page + 1}/{total_pages}"
-    return header + "\n\n" + "\n\n".join(lines)
-
-
-async def send_stock_list(message: Message, mode: str = "all") -> None:
-    req = await require_connection(message)
-    if req is None:
-        return
-    _, client, shop_id = req
-    search_query = parse_args(message.text or "")
-    lang = get_user_language(message.from_user.id if message.from_user else None)
-
-    try:
-        rows = await load_sku_rows(client, shop_id, search_query=search_query, max_pages=20)
-        if not rows:
-            text = "SKU qoldiqlari topilmadi." if lang == "uz" else "SKU-остатки не найдены."
-            await message.answer(text, reply_markup=menu_for_message(message))
-            return
-
-        if mode == "fbo":
-            rows = [r for r in rows if (r.get("fbo") or 0) > 0]
-            title = "📦 <b>FBO qoldiqlari / Uzum ombori</b>" if lang == "uz" else "📦 <b>Остатки FBO / склад Uzum</b>"
-        elif mode == "fbs":
-            rows = [r for r in rows if (r.get("fbs") or 0) > 0]
-            title = "📦 <b>FBS/DBS qoldiqlari / sotuvchi ombori</b>" if lang == "uz" else "📦 <b>Остатки FBS/DBS / склад продавца</b>"
-        else:
-            title = "📦 <b>SKU bo‘yicha qoldiqlar: FBO + FBS/DBS + jami</b>" if lang == "uz" else "📦 <b>Остатки по SKU: FBO + FBS/DBS + итого</b>"
-
-        if search_query:
-            title += (f"\nQidiruv: {escape(search_query)}" if lang == "uz" else f"\nПоиск: {escape(search_query)}")
-        if not rows:
-            empty = "Hech narsa topilmadi." if lang == "uz" else "Ничего не найдено."
-            await message.answer(title + "\n\n" + empty, reply_markup=menu_for_message(message))
-            return
-
-        user_id = message.from_user.id if message.from_user else 0
-        page_size = max(5, min(20, STOCK_PAGE_SIZE))
-        total_pages = max(1, (len(rows) + page_size - 1) // page_size)
-        _stock_page_cache[user_id] = {
-            "rows": rows,
-            "mode": mode,
-            "title": title,
-            "lang": lang,
-            "page_size": page_size,
-        }
-        await message.answer(
-            _stock_page_text(_stock_page_cache[user_id], 0),
-            reply_markup=_stock_page_markup(0, total_pages, lang),
-        )
-    except Exception as e:
-        await send_api_error(message, e)
-
-
-@dp.callback_query(F.data.startswith("stockpg:"))
-async def stock_page_callback(callback: CallbackQuery) -> None:
-    if not callback.from_user:
-        await callback.answer()
-        return
-    raw = (callback.data or "").split(":", 1)[-1]
-    if raw == "noop":
-        await callback.answer()
-        return
-    try:
-        page = int(raw)
-    except ValueError:
-        await callback.answer()
-        return
-    session = _stock_page_cache.get(callback.from_user.id)
-    lang = get_user_language(callback.from_user.id)
-    if not session:
-        await callback.answer("Список устарел. Нажмите Остатки заново." if lang != "uz" else "Ro‘yxat eskirdi. Qoldiqni qayta bosing.", show_alert=True)
-        return
-    rows = session["rows"]
-    page_size = session.get("page_size") or STOCK_PAGE_SIZE
-    total_pages = max(1, (len(rows) + page_size - 1) // page_size)
-    page = max(0, min(page, total_pages - 1))
-    try:
-        if callback.message:
-            await callback.message.edit_text(
-                _stock_page_text(session, page),
-                reply_markup=_stock_page_markup(page, total_pages, session.get("lang", lang)),
-            )
-        await callback.answer()
-    except Exception:
-        await callback.answer("Не получилось открыть страницу" if lang != "uz" else "Sahifani ochib bo‘lmadi", show_alert=True)
-
-
-
-
-# --- Универсальная постраничность для длинных списков ---
-LIST_PAGE_SIZE = int(os.getenv("LIST_PAGE_SIZE", "10") or "10")
-_paged_list_cache: dict[tuple[int, str], dict[str, Any]] = {}
-
-
-def _page_size_safe(value: int | None = None) -> int:
-    raw = value or LIST_PAGE_SIZE
-    return max(5, min(20, int(raw or 10)))
-
-
-def _section_text_and_markup(section: str, telegram_id: int, lang: str) -> tuple[str, ReplyKeyboardMarkup]:
-    if section == "sales":
-        text = "💰 <b>Savdo bo‘limi</b>\nKerakli davr yoki hisobotni tanlang 👇" if lang == "uz" else "💰 <b>Продажи</b>\nВыберите, что посмотреть 👇"
-        return text, sales_menu_for_user(telegram_id)
-    if section == "stock":
-        text = "📦 <b>Ombor</b>\nQoldiq, prognoz yoki yo‘qotishlarni tanlang 👇" if lang == "uz" else "📦 <b>Склад</b>\nОстатки, прогноз и потерянные товары 👇"
-        return text, stock_menu_for_user(telegram_id)
-    if section == "attention":
-        text = "🧠 <b>Nimani tekshirish kerak</b>\nKerakli bo‘limni tanlang 👇" if lang == "uz" else "🧠 <b>Что проверить</b>\nВыберите нужный раздел 👇"
-        return text, attention_menu_for_user(telegram_id)
-    if section == "reports":
-        text = "📊 <b>Hisobotlar</b>\nExcel, foyda va tayyor hisobotlar 👇" if lang == "uz" else "📊 <b>Отчёты</b>\nExcel, прибыль и готовые отчёты 👇"
-        return text, report_menu_for_user(telegram_id)
-    text = "🏠 <b>Asosiy menyu</b>" if lang == "uz" else "🏠 <b>Главное меню</b>"
-    return text, main_menu_for_user(telegram_id)
-
-
-def _paged_markup(kind: str, page: int, total_pages: int, lang: str, section: str = "main") -> InlineKeyboardMarkup | None:
-    rows: list[list[InlineKeyboardButton]] = []
-    if total_pages > 1:
-        nav: list[InlineKeyboardButton] = []
-        if page > 0:
-            nav.append(InlineKeyboardButton(text="⬅️ Oldingi" if lang == "uz" else "⬅️ Назад", callback_data=f"pglist:{kind}:{page-1}"))
-        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="pgnoop"))
-        if page < total_pages - 1:
-            nav.append(InlineKeyboardButton(text="Keyingi ➡️" if lang == "uz" else "След. страница ➡️", callback_data=f"pglist:{kind}:{page+1}"))
-        rows.append(nav)
-    rows.append([
-        InlineKeyboardButton(text="⬅️ Bo‘limga qaytish" if lang == "uz" else "⬅️ Назад в раздел", callback_data=f"pgsection:{section}"),
-        InlineKeyboardButton(text="🏠 Menyu" if lang == "uz" else "🏠 Меню", callback_data="pgmain"),
-    ])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-def _paged_text(session: dict[str, Any], page: int) -> str:
-    items: list[str] = session.get("items") or []
-    page_size = _page_size_safe(session.get("page_size"))
-    total = len(items)
-    total_pages = max(1, (total + page_size - 1) // page_size)
-    page = max(0, min(page, total_pages - 1))
-    start_i = page * page_size
-    chunk = items[start_i:start_i + page_size]
-    start_n = start_i + 1 if total else 0
-    end_n = start_i + len(chunk)
-    lang = session.get("lang", "ru")
-    title = session.get("title", "")
-    summary = [x for x in (session.get("summary") or []) if x]
-    if lang == "uz":
-        meta = f"Ko‘rsatilmoqda: <b>{start_n}–{end_n}</b> / <b>{total}</b>\nSahifa: <b>{page + 1}/{total_pages}</b>"
-    else:
-        meta = f"Показано: <b>{start_n}–{end_n}</b> из <b>{total}</b>\nСтраница: <b>{page + 1}/{total_pages}</b>"
-    parts = [title, *summary, meta]
-    if chunk:
-        parts.append("\n\n".join(chunk))
-    return "\n\n".join(parts)
-
-
-async def send_paginated_list(
-    message: Message,
-    *,
-    kind: str,
-    title: str,
-    items: list[str],
-    summary: list[str] | None = None,
-    empty_text: str | None = None,
-    section: str = "main",
-    page_size: int | None = None,
-    reply_markup: ReplyKeyboardMarkup | None = None,
-) -> None:
-    user_id = message.from_user.id if message.from_user else 0
-    lang = get_user_language(user_id)
-    if not items:
-        await message.answer(empty_text or ("Ma’lumot topilmadi." if lang == "uz" else "Данные не найдены."), reply_markup=reply_markup or menu_for_message(message))
-        return
-    session = {
-        "title": title,
-        "summary": summary or [],
-        "items": items,
-        "lang": lang,
-        "section": section,
-        "page_size": _page_size_safe(page_size),
-    }
-    _paged_list_cache[(user_id, kind)] = session
-    total_pages = max(1, (len(items) + session["page_size"] - 1) // session["page_size"])
-    await message.answer(
-        _paged_text(session, 0),
-        reply_markup=_paged_markup(kind, 0, total_pages, lang, section),
-    )
-
-
-@dp.callback_query(F.data == "pgnoop")
-async def paged_noop_callback(callback: CallbackQuery) -> None:
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "pgmain")
-async def paged_main_callback(callback: CallbackQuery) -> None:
-    uid = callback.from_user.id if callback.from_user else 0
-    lang = get_user_language(uid)
-    text, markup = _section_text_and_markup("main", uid, lang)
-    if callback.message:
-        await callback.message.answer(text, reply_markup=markup)
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("pgsection:"))
-async def paged_section_callback(callback: CallbackQuery) -> None:
-    uid = callback.from_user.id if callback.from_user else 0
-    lang = get_user_language(uid)
-    section = (callback.data or "").split(":", 1)[-1]
-    text, markup = _section_text_and_markup(section, uid, lang)
-    if callback.message:
-        await callback.message.answer(text, reply_markup=markup)
-    await callback.answer()
-
-
-@dp.callback_query(F.data.startswith("pglist:"))
-async def paged_list_callback(callback: CallbackQuery) -> None:
-    uid = callback.from_user.id if callback.from_user else 0
-    lang = get_user_language(uid)
-    try:
-        _, kind, raw_page = (callback.data or "").split(":", 2)
-        page = int(raw_page)
-    except Exception:
-        await callback.answer()
-        return
-    session = _paged_list_cache.get((uid, kind))
-    if not session:
-        await callback.answer("Ro‘yxat eskirdi. Bo‘limni qayta oching." if lang == "uz" else "Список устарел. Откройте раздел заново.", show_alert=True)
-        return
-    page_size = _page_size_safe(session.get("page_size"))
-    total_pages = max(1, (len(session.get("items") or []) + page_size - 1) // page_size)
-    page = max(0, min(page, total_pages - 1))
-    try:
-        if callback.message:
-            await callback.message.edit_text(
-                _paged_text(session, page),
-                reply_markup=_paged_markup(kind, page, total_pages, session.get("lang", lang), session.get("section", "main")),
-            )
-        await callback.answer()
-    except Exception:
-        await callback.answer("Sahifani ochib bo‘lmadi" if lang == "uz" else "Не получилось открыть страницу", show_alert=True)
-
 @dp.message(Command("stock"))
 async def stock(message: Message) -> None:
     await send_stock_list(message, mode="all")
@@ -4368,7 +5399,7 @@ async def lowstock(message: Message) -> None:
             return
 
         items = [format_sku_stock_line(row, mode="all") for row in low]
-        title = "⚠️ <b>Kam qoldiqdagi tovarlar</b>" if lang == "uz" else "⚠️ <b>Низкие остатки</b>"
+        title = f"⚠️ <b>Kam qoldiqdagi tovarlar</b>" if lang == "uz" else f"⚠️ <b>Низкие остатки</b>"
         summary = [
             f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
             f"📉 Chegara: ≤ <b>{threshold}</b> dona" if lang == "uz" else f"📉 Порог: ≤ <b>{threshold}</b> шт.",
@@ -4634,7 +5665,7 @@ async def _load_finance_orders(
     *,
     date_from_ms: int,
     date_to_ms: int,
-    max_pages: int = FINANCE_REPORT_MAX_PAGES,
+    max_pages: int = 10,
     page_size: int = 100,
 ) -> tuple[list[dict[str, Any]], Any | None]:
     rows: list[dict[str, Any]] = []
@@ -5667,6 +6698,8 @@ def _status_text_any(value: Any) -> str:
             or value.get("title")
             or value.get("name")
             or value.get("value")
+            or value.get("code")
+            or value.get("status")
             or "—"
         )
     if value in (None, ""):
@@ -6008,28 +7041,11 @@ async def cancellations_report(message: Message) -> None:
         problem_rows = [
             item
             for item in rows
-            if (
-                _has_cancel_event_status(_finance_status(item))
-                or _finance_cancelled_qty(item) > 0
-                or _is_returned_status(_finance_status(item))
-                or _finance_return_qty(item) > 0
-            )
+            if _is_cancelled_status(_finance_status(item)) or _is_returned_status(_finance_status(item))
         ]
-        cancelled = sum(
-            1
-            for item in problem_rows
-            if _has_cancel_event_status(_finance_status(item)) or _finance_cancelled_qty(item) > 0
-        )
-        returned = sum(
-            1
-            for item in problem_rows
-            if _is_returned_status(_finance_status(item)) or _finance_return_qty(item) > 0
-        )
-        amount = sum(
-            _finance_cancelled_revenue(item)
-            + _finance_gross_for_qty(item, _finance_return_qty(item))
-            for item in problem_rows
-        )
+        cancelled = sum(1 for item in problem_rows if _is_cancelled_status(_finance_status(item)))
+        returned = sum(1 for item in problem_rows if _is_returned_status(_finance_status(item)))
+        amount = sum(_finance_gross_revenue(item) for item in problem_rows)
         title = "🚫 <b>Bekor qilish va qaytarishlar — 30 kun</b>" if lang == "uz" else "🚫 <b>Отмены и возвраты — 30 дней</b>"
         summary = [
             f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
@@ -6186,11 +7202,17 @@ def _format_orders_counts(title: str, counts: dict[str, int]) -> str:
 
 def _build_stock_stats(rows: list[dict[str, Any]]) -> dict[str, float | int]:
     total_skus = len(rows)
+    product_ids = {
+        str(r.get("product_id"))
+        for r in rows
+        if r.get("product_id") not in (None, "", "—")
+    }
     total_units = 0.0
     fbo_units = 0.0
     fbs_units = 0.0
     low_count = 0
     zero_count = 0
+    with_stock_count = 0
     stock_value = 0.0
     active_count = 0
 
@@ -6207,16 +7229,20 @@ def _build_stock_stats(rows: list[dict[str, Any]]) -> dict[str, float | int]:
         stock_value += max(0.0, total) * max(0.0, price)
         if total <= 0:
             zero_count += 1
-        elif total <= LOW_STOCK_THRESHOLD:
-            low_count += 1
+        else:
+            with_stock_count += 1
+            if total <= LOW_STOCK_THRESHOLD:
+                low_count += 1
         if "RUN_OUT" not in status and total > 0:
             active_count += 1
 
     return {
+        "total_products": len(product_ids) if product_ids else total_skus,
         "total_skus": total_skus,
         "total_units": total_units,
         "fbo_units": fbo_units,
         "fbs_units": fbs_units,
+        "with_stock_count": with_stock_count,
         "low_count": low_count,
         "zero_count": zero_count,
         "stock_value": stock_value,
@@ -6279,13 +7305,16 @@ async def dashboard(message: Message) -> None:
             f"• Отменено: <b>{canceled_7}</b>\n"
             f"• Возвраты: <b>{returned_7}</b>\n\n"
             f"📦 <b>Остатки</b>\n"
-            f"• SKU: <b>{int(st['total_skus'])}</b>\n"
-            f"• Общий остаток: <b>{float(st['total_units']):.0f}</b> шт\n"
-            f"• FBO: <b>{float(st['fbo_units']):.0f}</b> шт / FBS: <b>{float(st['fbs_units']):.0f}</b> шт\n"
+            f"• Карточек / SKU-вариантов: <b>{int(st['total_products'])} / {int(st['total_skus'])}</b>\n"
+            f"• Доступно к продаже: <b>{float(st['total_units']):.0f} шт.</b>\n"
+            f"• Склад Uzum: <b>{float(st['fbo_units']):.0f}</b> шт. / ваш склад FBS/DBS: <b>{float(st['fbs_units']):.0f}</b> шт.\n"
+            f"• SKU с остатком: <b>{int(st['with_stock_count'])}</b>\n"
             f"• Заканчиваются ≤ {LOW_STOCK_THRESHOLD}: <b>{int(st['low_count'])}</b>\n"
             f"• Нет в наличии: <b>{int(st['zero_count'])}</b>\n"
-            f"• Примерная стоимость остатка: <b>{_format_money(float(st['stock_value']))}</b>\n\n"
-            f"Подробно: <code>/sales</code>, <code>/orders_summary</code>, <code>/lowstock</code>",
+            f"• Примерная стоимость доступного остатка: <b>{_format_money(float(st['stock_value']))}</b>\n\n"
+            "ℹ️ <i>Это сумма штук по всем SKU, а не количество карточек. "
+            "Ожидающие товары, брак и потери сюда не входят.</i>\n\n"
+            "Подробнее: <b>💰 Продажи</b>, <b>📦 Склад</b> или <b>🚨 Важно сейчас</b>.",
             reply_markup=menu_for_message(message),
         )
     except Exception as e:
@@ -6588,17 +7617,18 @@ async def reviews_check(message: Message) -> None:
 async def reviews_notify_status(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     lang = get_user_language(telegram_id)
+    enabled = product_setting_enabled(telegram_id, "notify_reviews")
     if lang == "uz":
         text = (
             "⭐ <b>Sharhlar xabarnomalari</b>\n\n"
-            f"Holat: {'✅ yoqilgan' if REVIEW_NOTIFICATIONS else '❌ o‘chirilgan'}\n"
+            f"Holat: {'✅ yoqilgan' if enabled else '❌ o‘chirilgan'}\n"
             f"Tekshiruv har <b>{REVIEW_CHECK_INTERVAL_SECONDS}</b> soniya\n\n"
             "Ishlashi uchun <code>/reviews_check</code> tekshiruvi muvaffaqiyatli bo‘lishi kerak."
         )
     else:
         text = (
             "⭐ <b>Уведомления о новых отзывах</b>\n\n"
-            f"Статус: {'✅ включены' if REVIEW_NOTIFICATIONS else '❌ выключены'}\n"
+            f"Статус: {'✅ включены' if enabled else '❌ выключены'}\n"
             f"Проверка каждые <b>{REVIEW_CHECK_INTERVAL_SECONDS}</b> сек.\n\n"
             "Будет работать только если <code>/reviews_check</code> найдёт рабочий метод отзывов."
         )
@@ -6653,7 +7683,7 @@ _reviews_watch_initialized: set[int] = set()
 
 
 async def check_new_reviews_once() -> None:
-    for group in connected_watch_groups():
+    for group in connected_watch_groups("notify_reviews"):
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(x) for x in group["telegram_ids"]]
@@ -6665,9 +7695,13 @@ async def check_new_reviews_once() -> None:
                 logging.warning("Reviews watcher: no access shop=%s path=%s error=%s", shop_id, path, str(error)[:300])
                 await asyncio.sleep(2)
                 continue
-        except Exception:
-            logging.exception("Reviews watcher: failed to check shop=%s users=%s", shop_id, telegram_ids)
-            await asyncio.sleep(3)
+        except Exception as error:
+            _log_watcher_api_failure(
+                "Reviews watcher",
+                error,
+                shop_id=shop_id,
+                telegram_ids=telegram_ids,
+            )
             continue
 
         keys_now = [_review_seen_key(item) for item in items]
@@ -7168,7 +8202,7 @@ async def video_instruction(message: Message) -> None:
             "Videoda qisqa ko‘rsatilgan:\n"
             "1. Uzum Seller kabinetida API kalit qayerda joylashgan.\n"
             "2. Yangi kalit qanday yaratiladi.\n"
-            "3. Kalit botga <code>/connect</code> orqali qanday ulanadi.\n\n"
+            "3. Kalit <b>🔌 Do‘konni ulash</b> tugmasi orqali qanday ulanadi.\n\n"
             "Videoni ko‘rish uchun pastdagi tugmani bosing 👇"
         )
     else:
@@ -7177,7 +8211,7 @@ async def video_instruction(message: Message) -> None:
             "В видео коротко показано:\n"
             "1. Где в кабинете Uzum Seller находятся ключи API.\n"
             "2. Как создать новый ключ.\n"
-            "3. Как подключить ключ к боту через <code>/connect</code>.\n\n"
+            "3. Как подключить ключ кнопкой <b>🔌 Подключить магазин</b>.\n\n"
             "Нажмите кнопку ниже, чтобы открыть видео 👇"
         )
     await message.answer(text, reply_markup=video_instruction_markup(lang) or menu_for_message(message))
@@ -7190,7 +8224,7 @@ async def api_token_help(message: Message) -> None:
     if lang == "uz":
         text = (
             "🔑 <b>Uzum API-kalitini botga ulash</b>\n\n"
-            "🎥 Videoqo‘llanma: <code>/video</code>\n\n"
+            "🎥 Videoqo‘llanma pastdagi tugma orqali ochiladi.\n\n"
             "API-kalitni faqat Uzum Seller kabinetidan olasiz.\n"
             "Bu kabinet paroli emas, uni istalgan vaqtda o‘chirishingiz mumkin.\n\n"
             "API-kalit qayerda:\n"
@@ -7199,14 +8233,14 @@ async def api_token_help(message: Message) -> None:
             "3. <b>API kalitlari</b> ni bosing.\n"
             "4. <b>Kalit yaratish</b> ni bosing.\n"
             "5. API-kalitni nusxa oling.\n"
-            "6. Botga qayting va <code>/connect</code> ni bosing.\n"
+            "6. Botga qayting va <b>🔌 Do‘konni ulash</b> tugmasini bosing.\n"
             "7. Kalitni bitta xabar qilib yuboring.\n\n"
             "⚠️ API-kalitni begonalarga yubormang. Bot uni himoyalangan ko‘rinishda saqlaydi va xabarni o‘chirishga harakat qiladi."
         )
     else:
         text = (
             "🔑 <b>Как подключить Uzum API к боту</b>\n\n"
-            "🎥 Видеоинструкция: <code>/video</code>\n\n"
+            "🎥 Видеоинструкция открывается кнопкой ниже.\n\n"
             "API-ключ создаётся только в вашем кабинете Uzum Seller.\n"
             "Это не пароль от кабинета, ключ можно удалить в любой момент.\n\n"
             "Где взять API-ключ:\n"
@@ -7215,7 +8249,7 @@ async def api_token_help(message: Message) -> None:
             "3. Нажмите <b>Ключи API</b>.\n"
             "4. Нажмите <b>Создать ключ</b>.\n"
             "5. Скопируйте API-ключ.\n"
-            "6. Вернитесь в бот и нажмите <code>/connect</code>.\n"
+            "6. Вернитесь в бот и нажмите <b>🔌 Подключить магазин</b>.\n"
             "7. Отправьте ключ одним сообщением.\n\n"
             "⚠️ Не отправляйте ключ посторонним. Бот хранит его защищённо и старается удалить сообщение с ключом после проверки."
         )
@@ -7232,8 +8266,8 @@ async def security(message: Message) -> None:
             "Uzum API-kalitingiz botda ko‘rsatilmaydi va sizga qayta xabar qilib yuborilmaydi.\n"
             "Ulangandan keyin bot kalit yuborilgan xabarni o‘chirishga harakat qiladi.\n"
             "Bazaga faqat himoyalangan versiya saqlanadi.\n\n"
-            "Istalgan vaqtda ulanishni <code>/disconnect</code> orqali o‘chirishingiz mumkin.\n"
-            "Kalitni almashtirish uchun <code>/reconnect</code> dan foydalaning."
+            "Kalitni almashtirish uchun <b>⚙️ Sozlamalar → 🔐 Uzum ulanishi → "
+            "🔌 API-kalitni yangilash</b> bo‘limidan foydalaning."
         )
     else:
         text = (
@@ -7241,10 +8275,10 @@ async def security(message: Message) -> None:
             "Ваш Uzum API-ключ не показывается в боте и не отправляется обратно сообщением.\n"
             "После подключения бот старается удалить сообщение, где был отправлен ключ.\n"
             "В базе хранится только защищённая версия ключа.\n\n"
-            "Вы можете в любой момент удалить подключение командой <code>/disconnect</code>.\n"
-            "Чтобы заменить ключ, используйте <code>/reconnect</code>."
+            "Чтобы заменить ключ, откройте <b>⚙️ Настройки → 🔐 Подключение Uzum → "
+            "🔌 Обновить API-ключ</b>."
         )
-    await message.answer(text, reply_markup=menu_for_message(message))
+    await message.answer(text, reply_markup=connection_menu_for_message(message))
 
 
 @dp.message(Command("support"))
@@ -7352,6 +8386,7 @@ async def admin_panel(message: Message) -> None:
 async def check_connection(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     ensure_subscription(telegram_id)
+    user = db.get_user(telegram_id)
     client = get_uzum_for_user(telegram_id)
     shop_id = db.get_default_shop_id(telegram_id)
     lines = [
@@ -8191,16 +9226,17 @@ def _build_stock_report_rows(
         for key in _sale_match_keys(item):
             sold_qty[key] = sold_qty.get(key, 0.0) + _finance_qty(item)
 
+    unique_keys_by_row = _unique_stock_match_keys(stock_rows)
     normalized: list[dict[str, Any]] = []
     lost: list[dict[str, Any]] = []
-    for row in stock_rows:
+    for row, row_keys in zip(stock_rows, unique_keys_by_row):
         total = float(_num_any(row.get("total")))
         fbo = float(_num_any(row.get("fbo")))
         fbs = float(_num_any(row.get("fbs")))
         price = float(_num_any(row.get("price")))
         missing = float(_num_any(row.get("missing")))
         defected = float(_num_any(row.get("defected")))
-        qty_7 = max([sold_qty.get(key, 0.0) for key in _stock_match_keys(row)] or [0.0])
+        qty_7 = max([sold_qty.get(key, 0.0) for key in row_keys] or [0.0])
         avg_day = qty_7 / 7.0
         days_left = round(total / avg_day, 1) if avg_day > 0 and total > 0 else None
         if total <= 0:
@@ -8302,25 +9338,33 @@ def _build_premium_actions(
         if item.get("loss_only") or item.get("archived"):
             continue
         if total <= 0:
+            recommended = int(item.get("recommended_qty") or 0)
             add(
                 "critical", "Нет в наличии", "Qoldiq yo‘q", title, sku,
                 "Карточка активна без доступного остатка.", "Kartada mavjud qoldiq yo‘q.",
-                "Пополнить склад или временно скрыть карточку.", "Omborni to‘ldiring yoki kartani vaqtincha yashiring.",
-                0, "Остатки",
+                (f"Поставить около {recommended} шт. или временно скрыть карточку." if recommended else "Проверить спрос и временно скрыть карточку."),
+                (f"Taxminan {recommended} dona yetkazing yoki kartani vaqtincha yashiring." if recommended else "Talabni tekshiring va kartani vaqtincha yashiring."),
+                float(item.get("risk_value") or 0), "Остатки + прогноз",
             )
         elif isinstance(days_left, (int, float)) and float(days_left) <= SMART_LOW_STOCK_DAYS:
+            recommended = int(item.get("recommended_qty") or 0)
+            reorder_date = item.get("reorder_date")
+            reorder_text = reorder_date.strftime("%d.%m.%Y") if isinstance(reorder_date, datetime) else "сейчас"
             add(
                 "critical", "Скоро закончится", "Tez tugaydi", title, sku,
                 f"Остатка примерно на {float(days_left):.1f} дня.", f"Qoldiq taxminan {float(days_left):.1f} kunga yetadi.",
-                "Срочно создать план поставки.", "Zudlik bilan yetkazib berish rejasini tuzing.",
-                price * total, "Прогноз остатков",
+                f"Заказать {recommended} шт. до {reorder_text}." if recommended else "Срочно проверить план поставки.",
+                f"{recommended} dona buyurtma qiling." if recommended else "Yetkazib berish rejasini tekshiring.",
+                float(item.get("risk_value") or 0), "Прогноз поставки",
             )
-        elif total <= LOW_STOCK_THRESHOLD:
+        elif total <= float(item.get("low_stock_threshold") or LOW_STOCK_THRESHOLD):
+            recommended = int(item.get("recommended_qty") or 0)
             add(
                 "warning", "Низкий остаток", "Kam qoldiq", title, sku,
                 f"Осталось {total:.0f} шт.", f"{total:.0f} dona qoldi.",
-                "Запланировать пополнение.", "Qoldiqni to‘ldirishni rejalashtiring.",
-                price * total, "Остатки",
+                f"Запланировать поставку {recommended} шт." if recommended else "Проверить необходимость пополнения.",
+                f"{recommended} dona yetkazishni rejalashtiring." if recommended else "To‘ldirish zarurligini tekshiring.",
+                float(item.get("risk_value") or 0), "Остатки + прогноз",
             )
         elif float(item.get("sold_7") or 0) <= 0:
             add(
@@ -8365,10 +9409,12 @@ def _build_premium_actions(
             "warning", "Отмены", "Bekor qilish", "Все товары", "",
             f"За 30 дней отменено позиций: {cancellations}.", f"30 kunda bekor qilingan pozitsiyalar: {cancellations}.",
             "Открыть лист «Отмены и возвраты» и проверить причины.", "«Bekor va qaytarish» varag‘ini ochib sabablarni tekshiring.",
-            0, "Finance API",
+            float(sales_stats.get("cancelled_value") or 0), "Finance API",
         )
     priority_order = {"critical": 0, "warning": 1, "info": 2}
-    actions.sort(key=lambda value: (priority_order.get(str(value.get("priority")), 9), -float(value.get("amount") or 0)))
+    for action in actions:
+        action["action_key"] = _business_action_key(action)
+    actions.sort(key=lambda value: (-float(value.get("amount") or 0), priority_order.get(str(value.get("priority")), 9)))
     return actions
 
 
@@ -8413,16 +9459,50 @@ async def _build_full_excel_report(
     stats_30 = _build_noorza_today_stats(rows_30)
     product_rows = _build_unit_rows_from_finance(rows_30, costs)
     profit_30 = _profit_summary_from_unit_rows(product_rows, stats_30)
+    finance_settings = ensure_finance_settings(telegram_id, shop_id)
+    business_profit = calculate_business_profit(
+        profit_30,
+        stats_30,
+        finance_settings,
+        days=30,
+    )
 
     stock_raw = await load_sku_rows(client, shop_id, max_pages=50)
     stock_rows, _ = _build_stock_report_rows(stock_raw, finance_by_period.get("7d", []))
+    product_settings = ensure_product_settings(telegram_id)
+    replenishment = build_replenishment_plan(stock_raw, rows_30, product_settings)
+    replenishment_by_key: dict[str, dict[str, Any]] = {}
+    for plan_item in replenishment:
+        for key in _stock_match_keys(plan_item.get("row") or {}):
+            replenishment_by_key[key] = plan_item
+    for stock_item in stock_rows:
+        stock_item["low_stock_threshold"] = int(product_settings.get("low_stock_threshold") or 0)
+        plan_item = next(
+            (
+                replenishment_by_key[key]
+                for key in _stock_match_keys(stock_item)
+                if key in replenishment_by_key
+            ),
+            None,
+        )
+        if plan_item:
+            stock_item.update({
+                "risk_value": float(plan_item.get("risk_value") or 0),
+                "recommended_qty": int(plan_item.get("recommended_qty") or 0),
+                "reorder_date": plan_item.get("reorder_date"),
+                "avg_daily": float(plan_item.get("avg_daily") or 0),
+            })
     loss_raw, unavailable_loss_filters = await _load_all_time_loss_rows(client, shop_id)
-    loss_raw = _attach_current_stock_to_losses(loss_raw, stock_raw)
     _, lost_rows = _build_stock_report_rows(loss_raw, finance_by_period.get("7d", []))
     stock_rows_for_actions = [
         {**row, "missing": 0, "defected": 0}
         for row in stock_rows
     ]
+    stats_30["cancelled_value"] = sum(
+        _finance_gross_revenue(item)
+        for item in rows_30
+        if _is_cancelled_status(_finance_status(item))
+    )
     actions = _build_premium_actions(stock_rows_for_actions + lost_rows, product_rows, stats_30)
 
     notes: list[str] = []
@@ -8444,8 +9524,10 @@ async def _build_full_excel_report(
         "shop_id": shop_id,
         "generated_at": generated_at,
         "cost_coverage": float(profit_30.get("coverage") or 0),
+        "business_profit": business_profit,
+        "finance_settings": finance_settings,
         "periods": period_payloads,
-        "sales": _normalize_finance_rows(rows_30),
+        "sales": [_normalize_finance_row(item) for item in rows_30],
         "daily": _daily_report_rows(rows_30, current_30_from, current_30_to),
         "products": product_rows,
         "stock": stock_rows,
@@ -8455,7 +9537,7 @@ async def _build_full_excel_report(
     }
     timestamp = generated_at.strftime("%Y-%m-%d_%H-%M")
     filename = Path(tempfile.gettempdir()) / f"uzum_premium_report_{shop_id}_{timestamp}.xlsx"
-    return build_premium_workbook(payload, filename, lang=lang)
+    return await asyncio.to_thread(build_premium_workbook, payload, filename, lang=lang)
 
 
 @dp.message(Command("report_excel"))
@@ -8643,10 +9725,11 @@ async def notify_status(message: Message) -> None:
     if req is None:
         return
     _, _, shop_id = req
+    enabled = product_setting_enabled(telegram_id, "notify_orders")
     initialized = telegram_id in _orders_watch_initialized
     await message.answer(
         "🔔 <b>Уведомления о новых заказах</b>\n\n"
-        f"Статус: {'✅ включены' if NEW_ORDER_NOTIFICATIONS else '❌ выключены'}\n"
+        f"Статус: {'✅ включены' if enabled else '❌ выключены'}\n"
         f"Магазин: <code>{shop_id}</code>\n"
         f"Проверка каждые: <b>{max(60, ORDER_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
         f"Состояние: {'заказы уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
@@ -8762,12 +9845,15 @@ async def lowstock_notify_status(message: Message) -> None:
     if req is None:
         return
     _, _, shop_id = req
-    initialized = _watch_is_initialized(telegram_id, shop_id, "low")
+    settings = ensure_product_settings(telegram_id)
+    enabled = bool(int(settings.get("notify_low_stock") or 0))
+    threshold = int(settings.get("low_stock_threshold") or 0)
+    initialized = telegram_id in _low_stock_watch_initialized
     await message.answer(
         "📉 <b>Уведомления о низких остатках</b>\n\n"
-        f"Статус: {'✅ включены' if LOW_STOCK_NOTIFICATIONS else '❌ выключены'}\n"
+        f"Статус: {'✅ включены' if enabled else '❌ выключены'}\n"
         f"Магазин: <code>{shop_id}</code>\n"
-        f"Порог: ≤ <b>{LOW_STOCK_THRESHOLD}</b> шт.\n"
+        f"Порог: ≤ <b>{threshold}</b> шт.\n"
         f"Проверка каждые: <b>{max(300, LOW_STOCK_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
         f"Состояние: {'остатки уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
         "Бот уведомит, когда товар впервые опустится до порога или ниже.",
@@ -8868,10 +9954,11 @@ async def outofstock_notify_status(message: Message) -> None:
     if req is None:
         return
     _, _, shop_id = req
-    initialized = _watch_is_initialized(telegram_id, shop_id, "zero")
+    enabled = product_setting_enabled(telegram_id, "notify_out_of_stock")
+    initialized = telegram_id in _out_of_stock_watch_initialized
     await message.answer(
         "❌ <b>Уведомления о нулевых остатках</b>\n\n"
-        f"Статус: {'✅ включены' if OUT_OF_STOCK_NOTIFICATIONS else '❌ выключены'}\n"
+        f"Статус: {'✅ включены' if enabled else '❌ выключены'}\n"
         f"Магазин: <code>{shop_id}</code>\n"
         f"Проверка каждые: <b>{max(300, OUT_OF_STOCK_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
         f"Состояние: {'нулевые остатки уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
@@ -9129,10 +10216,11 @@ async def sales_notify_status(message: Message) -> None:
     if req is None:
         return
     _, _, shop_id = req
-    initialized = _watch_is_initialized(telegram_id, shop_id, "finance")
+    enabled = product_setting_enabled(telegram_id, "notify_sales")
+    initialized = telegram_id in _sales_watch_initialized
     await message.answer(
         "💸 <b>Уведомления о новых продажах</b>\n\n"
-        f"Статус: {'✅ включены' if SALE_NOTIFICATIONS else '❌ выключены'}\n"
+        f"Статус: {'✅ включены' if enabled else '❌ выключены'}\n"
         f"Магазин: <code>{shop_id}</code>\n"
         f"Проверка каждые: <b>{max(60, SALE_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
         f"Состояние: {'продажи уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
@@ -9295,10 +10383,11 @@ async def stock_change_notify_status(message: Message) -> None:
     if req is None:
         return
     _, _, shop_id = req
-    initialized = _watch_is_initialized(telegram_id, shop_id, "change")
+    enabled = product_setting_enabled(telegram_id, "notify_stock_change")
+    initialized = telegram_id in _stock_change_watch_initialized
     await message.answer(
         "📦 <b>Уведомления об изменении остатков</b>\n\n"
-        f"Статус: {'✅ включены' if STOCK_CHANGE_NOTIFICATIONS else '❌ выключены'}\n"
+        f"Статус: {'✅ включены' if enabled else '❌ выключены'}\n"
         f"Магазин: <code>{shop_id}</code>\n"
         f"Проверка каждые: <b>{max(60, STOCK_CHANGE_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
         f"Состояние: {'остатки уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
@@ -9369,15 +10458,11 @@ async def _build_attention_summary(message: Message) -> str | None:
 
     # 3) Продажи/отмены сегодня и товары без продаж за DEAD_STOCK_DAYS
     date_today_from, date_today_to = _today_range_ms()
-    today_rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_today_from, date_to_ms=date_today_to, max_pages=min(FINANCE_REPORT_MAX_PAGES, 20), page_size=100)
-    cancels_today = sum(
-        1
-        for item in today_rows
-        if _has_cancel_event_status(_finance_status(item)) or _finance_cancelled_qty(item) > 0
-    )
+    today_rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_today_from, date_to_ms=date_today_to, max_pages=3, page_size=100)
+    cancels_today = sum(1 for item in today_rows if _is_cancelled_status(_finance_status(item)))
 
     date_from, date_to = _days_range_ms(DEAD_STOCK_DAYS)
-    sales_rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=FINANCE_REPORT_MAX_PAGES, page_size=100)
+    sales_rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=5, page_size=100)
     sold_keys: set[str] = set()
     for item in sales_rows:
         if not _is_cancelled_status(_finance_status(item)):
@@ -9489,6 +10574,22 @@ async def button_sales_section_simple(message: Message) -> None:
     await message.answer(text, reply_markup=sales_menu_for_message(message))
 
 
+@dp.message(F.text.in_({"✨ Ещё по продажам", "✨ Yana savdo tahlili"}))
+async def button_sales_more(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    text = (
+        "✨ <b>Qo‘shimcha savdo tahlili</b>\nKamroq ishlatiladigan batafsil vositalar."
+        if get_user_language(telegram_id) == "uz"
+        else "✨ <b>Дополнительная аналитика</b>\nЗдесь собраны подробные инструменты, которые нужны не каждый день."
+    )
+    await message.answer(text, reply_markup=sales_more_menu_for_message(message))
+
+
+@dp.message(F.text.in_({"⬅️ Продажи", "⬅️ Savdo"}))
+async def button_back_to_sales(message: Message) -> None:
+    await button_sales_section_simple(message)
+
+
 @dp.message(F.text == "📦 Ombor")
 @dp.message(F.text == "📦 Склад")
 async def button_stock_section_simple(message: Message) -> None:
@@ -9501,10 +10602,7 @@ async def button_stock_section_simple(message: Message) -> None:
 @dp.message(F.text == "🔔 Xabarnomalar")
 @dp.message(F.text == "🔔 Уведомления")
 async def button_notifications_section_simple(message: Message) -> None:
-    telegram_id = upsert_from_message(message)
-    lang = get_user_language(telegram_id)
-    text = "🔔 <b>Xabarnomalar</b>\nKerakli holatni tanlang 👇" if lang == "uz" else "🔔 <b>Уведомления</b>\nПроверьте, что включено 👇"
-    await message.answer(text, reply_markup=notify_menu_for_message(message))
+    await notification_hub_screen(message)
 
 
 @dp.message(F.text == "📊 Hisobotlar")
@@ -9514,6 +10612,46 @@ async def button_reports_section_simple(message: Message) -> None:
     lang = get_user_language(telegram_id)
     text = "📊 <b>Hisobotlar</b>\nExcel, foyda va tayyor hisobotlar 👇" if lang == "uz" else "📊 <b>Отчёты</b>\nExcel, прибыль и готовые отчёты 👇"
     await message.answer(text, reply_markup=report_menu_for_message(message))
+
+
+@dp.message(F.text.in_({"🏠 Обзор магазина", "🏠 Do‘kon holati"}))
+async def button_store_overview(message: Message) -> None:
+    await dashboard(message)
+
+
+@dp.message(F.text.in_({"🚨 Важно сейчас", "🚨 Hozir muhim"}))
+async def button_important_now(message: Message) -> None:
+    await business_control_center(message)
+
+
+@dp.message(F.text.in_({"🧮 Финансы", "🧮 Moliya"}))
+async def button_finance_section(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    text = (
+        "🧮 <b>Moliya</b>\nTannarx, xarajatlar va haqiqiy foydani boshqaring."
+        if get_user_language(telegram_id) == "uz"
+        else "🧮 <b>Финансы</b>\nСебестоимость, расходы и реальная прибыль — в одном месте."
+    )
+    await message.answer(text, reply_markup=finance_menu_for_message(message))
+
+
+@dp.message(F.text.in_({"🔐 Подключение Uzum", "🔐 Uzum ulanishi"}))
+async def button_connection_section(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    connected = db.has_uzum_connection(telegram_id)
+    if get_user_language(telegram_id) == "uz":
+        text = (
+            "🔐 <b>Uzum ulanishi</b>\n\n"
+            f"Holat: {'✅ ulangan' if connected else '❌ ulanmagan'}\n"
+            "Bu yerda ulanishni tekshirish yoki API-kalitni xavfsiz yangilash mumkin."
+        )
+    else:
+        text = (
+            "🔐 <b>Подключение Uzum</b>\n\n"
+            f"Статус: {'✅ подключено' if connected else '❌ не подключено'}\n"
+            "Здесь можно проверить соединение или безопасно обновить API-ключ."
+        )
+    await message.answer(text, reply_markup=connection_menu_for_message(message))
 
 
 @dp.message(F.text == "🧠 Tekshirish")
@@ -9542,6 +10680,8 @@ async def button_attention_section(message: Message) -> None:
 
 @dp.message(F.text == "🔍 Hozir tekshirish")
 @dp.message(F.text == "🔍 Проверить сейчас")
+@dp.message(F.text == "🔍 Do‘konni tekshirish")
+@dp.message(F.text == "🔍 Проверить магазин")
 async def button_attention_now(message: Message) -> None:
     await attention_report(message)
 
@@ -9638,6 +10778,8 @@ async def button_check_connection(message: Message) -> None:
 
 @dp.message(F.text == "⬅️ Asosiy menyu")
 @dp.message(F.text == "⬅️ Главное меню")
+@dp.message(F.text == "🏠 Asosiy")
+@dp.message(F.text == "🏠 Главное")
 @dp.message(F.text == "Menyu")
 @dp.message(F.text == "Меню")
 async def button_main_menu(message: Message) -> None:
@@ -10020,7 +11162,9 @@ async def button_30_days(message: Message) -> None:
 
 
 @dp.message(F.text == "📦 Qoldiq")
+@dp.message(F.text == "📦 Barcha qoldiq")
 @dp.message(F.text == "📦 Остатки")
+@dp.message(F.text == "📦 Все остатки")
 async def button_stock_short(message: Message) -> None:
     await stock(message)
 
@@ -10033,6 +11177,10 @@ async def button_lowstock_short(message: Message) -> None:
 
 @dp.message(F.text == "🧭 Yo‘qolganlar")
 @dp.message(F.text == "🧭 Потерянные")
+@dp.message(F.text == "🧭 Yo‘qolgan tovarlar")
+@dp.message(F.text == "🧭 Yo‘qotish va brak")
+@dp.message(F.text == "🧭 Потерянные товары")
+@dp.message(F.text == "🧭 Потери и брак")
 async def button_lost(message: Message) -> None:
     await lost_goods(message)
 
@@ -10049,37 +11197,51 @@ async def button_subscription(message: Message) -> None:
 async def button_help(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     lang = get_user_language(telegram_id)
+    connected = db.has_uzum_connection(telegram_id)
     if lang == "uz":
-        text = (
-            "ℹ️ <b>Yordam</b>\n\n"
-            "Botni ulash uchun:\n"
-            "1. <code>/video</code> — videoqo‘llanmani ko‘ring.\n"
-            "2. <code>/connect</code> — API-kalitni yuboring.\n"
-            "3. <b>💰 Savdo</b> yoki <b>📦 Ombor</b> bo‘limidan foydalaning.\n\n"
-            "Foydali buyruqlar:\n"
-            "• <code>/api_token</code> — API-kalit bo‘yicha yozma yo‘riqnoma\n"
-            "• <code>/check</code> — ulanishni tekshirish\n"
-            "• <code>/labels</code> — SKU etiketkalarini PDF qilib olish\n"
-            "• <code>/support</code> — yordam va administrator bilan aloqa"
-        )
+        if connected:
+            text = (
+                "ℹ️ <b>Qayerga bosish kerak?</b>\n\n"
+                "🏠 <b>Do‘kon holati</b> — asosiy ko‘rsatkichlar\n"
+                "💰 <b>Savdo</b> — davr, foyda va top tovarlar\n"
+                "📦 <b>Ombor</b> — qoldiq, yo‘qotish va yetkazish rejasi\n"
+                "🚨 <b>Hozir muhim</b> — birinchi navbatdagi muammolar\n"
+                "📊 <b>Hisobotlar</b> — Excel va tayyor xulosalar\n"
+                "⚙️ <b>Sozlamalar</b> — xabarnomalar, moliya va ulanish\n\n"
+                "Muammo bo‘lsa, pastdagi tugma orqali administratorga yozing."
+            )
+        else:
+            text = (
+                "ℹ️ <b>Do‘konni ulash</b>\n\n"
+                "1. Pastdagi videoni ko‘ring.\n"
+                "2. <b>🔌 Do‘konni ulash</b> tugmasini bosing.\n"
+                "3. Uzum Seller kabinetidagi API-kalitni yuboring.\n\n"
+                "Bot kalitni tekshiradi va asosiy menyuni avtomatik ochadi."
+            )
     else:
-        text = (
-            "ℹ️ <b>Помощь</b>\n\n"
-            "Чтобы подключить бота:\n"
-            "1. <code>/video</code> — посмотрите видеоинструкцию.\n"
-            "2. <code>/connect</code> — отправьте API-ключ.\n"
-            "3. Пользуйтесь разделами <b>💰 Продажи</b> и <b>📦 Склад</b>.\n\n"
-            "Полезные команды:\n"
-            "• <code>/api_token</code> — текстовая инструкция по API-ключу\n"
-            "• <code>/check</code> — проверить подключение\n"
-            "• <code>/labels</code> — получить PDF с этикетками SKU\n"
-            "• <code>/support</code> — поддержка и связь с администратором"
-        )
-    await message.answer(text, reply_markup=help_links_markup(lang) or menu_for_message(message))
+        if connected:
+            text = (
+                "ℹ️ <b>Куда нажимать?</b>\n\n"
+                "🏠 <b>Обзор магазина</b> — главные показатели\n"
+                "💰 <b>Продажи</b> — периоды, прибыль и топ товаров\n"
+                "📦 <b>Склад</b> — остатки, потери и план поставки\n"
+                "🚨 <b>Важно сейчас</b> — проблемы, требующие действий\n"
+                "📊 <b>Отчёты</b> — Excel и готовые сводки\n"
+                "⚙️ <b>Настройки</b> — уведомления, финансы и подключение\n\n"
+                "Если что-то не получается, напишите администратору кнопкой ниже."
+            )
+        else:
+            text = (
+                "ℹ️ <b>Как подключить магазин</b>\n\n"
+                "1. Посмотрите видео по кнопке ниже.\n"
+                "2. Нажмите <b>🔌 Подключить магазин</b>.\n"
+                "3. Отправьте API-ключ из кабинета Uzum Seller.\n\n"
+                "Бот проверит ключ и автоматически откроет рабочее меню."
+            )
+    await message.answer(text, reply_markup=help_links_markup(lang) or settings_menu_for_message(message))
 
 
-@dp.message(F.text == "🎥 Видеоинструкция")
-@dp.message(F.text == "🎥 API ulash videosi")
+@dp.message(F.text.in_({"🎥 Видеоинструкция", "🎥 Как подключить", "🎥 API ulash videosi", "🎥 Qanday ulash kerak"}))
 async def button_video_instruction(message: Message) -> None:
     await video_instruction(message)
 
@@ -10105,9 +11267,20 @@ async def section_notifications(message: Message) -> None:
     await notify_status(message)
 
 
-@dp.message(F.text == "⚙️ Настройки")
+@dp.message(F.text.in_({"⚙️ Настройки", "⚙️ Sozlamalar", "⬅️ Настройки", "⬅️ Sozlamalar"}))
 async def section_settings(message: Message) -> None:
-    await status(message)
+    telegram_id = upsert_from_message(message)
+    if get_user_language(telegram_id) == "uz":
+        text = (
+            "⚙️ <b>Sozlamalar</b>\n\n"
+            "Xabarnomalar, do‘konlar, moliya va Uzum ulanishini shu yerda boshqaring."
+        )
+    else:
+        text = (
+            "⚙️ <b>Настройки</b>\n\n"
+            "Уведомления, магазины, финансы и подключение Uzum собраны здесь."
+        )
+    await message.answer(text, reply_markup=settings_menu_for_message(message))
 
 
 @dp.message(F.text == "⭐ Отзывы")
@@ -10161,6 +11334,7 @@ async def button_orders(message: Message) -> None:
 
 @dp.message(F.text == "📊 Excel hisobot")
 @dp.message(F.text == "📊 Excel отчёт")
+@dp.message(F.text == "📊 Excel-отчёт")
 @dp.message(F.text == "📄 Excel-отчёт")
 async def button_excel_report(message: Message) -> None:
     await report_excel(message)
@@ -10302,22 +11476,77 @@ def _stock_row_price(row: dict[str, Any]) -> float:
     return float(value or 0.0)
 
 
+def _match_key(kind: str, value: Any) -> str | None:
+    if isinstance(value, dict):
+        value = pick(value, "id", "value", "title", "name", "code")
+    if isinstance(value, (list, tuple, set, dict)):
+        return None
+    normalized = " ".join(str(value or "").strip().lower().split())
+    if not normalized or normalized in {"-", "—", "none", "null", "0"}:
+        return None
+    return f"{kind}:{normalized}"
+
+
 def _sale_match_keys(item: dict[str, Any]) -> set[str]:
+    """Return typed Finance API identifiers for safe SKU matching."""
     keys: set[str] = set()
-    for value in (_finance_sku_title(item), _finance_title(item), str(_deep_pick_value(item, ("skuId", "sku", "barcode", "offerId")) or "")):
-        value = str(value or "").strip().lower()
-        if value and value != "-":
-            keys.add(value)
+
+    def add(kind: str, *names: str) -> None:
+        for name in names:
+            value = _deep_pick_value(item, (name,))
+            key = _match_key(kind, value)
+            if key:
+                keys.add(key)
+
+    add("id", "skuId", "sku_id", "offerId")
+    add("barcode", "barcode")
+    add("seller", "sellerSku", "sellerItemCode", "article")
+    add("variant", "skuTitle", "skuName", "skuFullTitle", "offerName")
+    add("product", "productTitle", "productName")
+
+    # Some Finance response variants expose only a generic `sku` or `title`.
+    generic_sku = _deep_pick_value(item, ("sku",))
+    for kind in ("id", "variant"):
+        key = _match_key(kind, generic_sku)
+        if key:
+            keys.add(key)
+    title_key = _match_key("product", _finance_title(item))
+    if title_key:
+        keys.add(title_key)
     return keys
 
 
 def _stock_match_keys(row: dict[str, Any]) -> set[str]:
+    """Return identifiers compatible with `_sale_match_keys`."""
     keys: set[str] = set()
-    for value in (_stock_row_sku(row), _stock_row_title(row)):
-        value = str(value or "").strip().lower()
-        if value:
-            keys.add(value)
+
+    def add(kind: str, *fields: str) -> None:
+        for field in fields:
+            key = _match_key(kind, row.get(field))
+            if key:
+                keys.add(key)
+
+    add("id", "sku_id", "skuId", "offerId")
+    add("barcode", "barcode")
+    add("seller", "seller_item_code", "sellerItemCode", "article")
+    add("variant", "sku_full_title", "sku_title", "skuFullTitle", "skuTitle", "sku")
+    add("product", "product_title", "productTitle", "title")
     return keys
+
+
+def _unique_stock_match_keys(stock_rows: list[dict[str, Any]]) -> list[set[str]]:
+    """Only keep aliases that identify one SKU within the current shop.
+
+    A product title can be shared by several size/color variants.  Matching a
+    sale by that non-unique title would incorrectly give the same sale to every
+    variant and inflate the forecast.
+    """
+    all_keys = [_stock_match_keys(row) for row in stock_rows]
+    counts: dict[str, int] = {}
+    for keys in all_keys:
+        for key in keys:
+            counts[key] = counts.get(key, 0) + 1
+    return [{key for key in keys if counts.get(key) == 1} for keys in all_keys]
 
 
 def _merge_noorza_stats(stats_list: list[dict[str, Any]]) -> dict[str, Any]:
@@ -10442,14 +11671,16 @@ async def balance_all_shops(message: Message) -> None:
 
 async def _top_products_for_shop(client: UzumClient, shop_id: int, days: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     date_from, date_to = _days_range_ms(days)
-    rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=FINANCE_REPORT_MAX_PAGES, page_size=100)
+    rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=5, page_size=100)
     groups: dict[str, dict[str, Any]] = {}
     for item in rows:
         if _is_cancelled_status(_finance_status(item)):
             continue
         title = _finance_title(item)
         sku = _finance_sku_title(item)
-        key = _finance_variant_key(item)
+        key = (sku or title or "-").strip().lower()
+        if not key:
+            key = title.strip().lower()
         entry = groups.setdefault(key, {"title": title, "sku": sku, "qty": 0.0, "revenue": 0.0, "payout": 0.0})
         gross = _finance_gross_revenue(item)
         commission = _finance_commission(item)
@@ -10521,7 +11752,7 @@ async def dead_stock(message: Message) -> None:
     await message.answer(f"⌛ {days} kun sotilmagan tovarlarni qidiryapman..." if lang == "uz" else f"⌛ Ищу товары с остатком, но без продаж за {days} дней...", reply_markup=sales_menu_for_message(message))
     try:
         date_from, date_to = _days_range_ms(days)
-        sales_rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=FINANCE_REPORT_MAX_PAGES, page_size=100)
+        sales_rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=5, page_size=100)
         sold_keys: set[str] = set()
         for item in sales_rows:
             if not _is_cancelled_status(_finance_status(item)):
@@ -10563,7 +11794,154 @@ async def dead_stock(message: Message) -> None:
         await send_api_error(message, e)
 
 
-@dp.message(Command("smart_lowstock", "forecast_stock"))
+def build_replenishment_plan(
+    stock_rows: list[dict[str, Any]],
+    sales_rows: list[dict[str, Any]],
+    settings: dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    """Build a seller-facing replenishment plan from 7/14/30-day velocity."""
+    now_local = now or datetime.now(UZT)
+    if now_local.tzinfo is None:
+        now_local = now_local.replace(tzinfo=UZT)
+    else:
+        now_local = now_local.astimezone(UZT)
+
+    velocity: dict[str, dict[int, float]] = {}
+    for item in sales_rows:
+        status = _finance_status(item)
+        if _is_cancelled_status(status) or _is_returned_status(status):
+            continue
+        qty = max(0.0, float(_finance_qty(item)))
+        if qty <= 0:
+            continue
+        dt = _finance_datetime_for_report(item)
+        if dt is not None:
+            dt_local = dt.replace(tzinfo=UZT) if dt.tzinfo is None else dt.astimezone(UZT)
+            age_days = max(0.0, (now_local - dt_local).total_seconds() / 86400.0)
+        else:
+            age_days = None
+        windows = (7, 14, 30) if age_days is None else tuple(day for day in (7, 14, 30) if age_days <= day)
+        for key in _sale_match_keys(item):
+            bucket = velocity.setdefault(key, {7: 0.0, 14: 0.0, 30: 0.0})
+            for day in windows:
+                bucket[day] += qty
+
+    unique_keys_by_row = _unique_stock_match_keys(stock_rows)
+
+    threshold = max(0, int(settings.get("low_stock_threshold") or LOW_STOCK_THRESHOLD))
+    lead_days = max(0, int(settings.get("lead_time_days") or 0))
+    safety_days = max(0, int(settings.get("safety_days") or 0))
+    target_days = max(1, int(settings.get("target_cover_days") or 30))
+    plan: list[dict[str, Any]] = []
+
+    for row, keys in zip(stock_rows, unique_keys_by_row):
+        total = max(0, _stock_row_total(row))
+        quantities = {
+            day: max([velocity.get(key, {}).get(day, 0.0) for key in keys] or [0.0])
+            for day in (7, 14, 30)
+        }
+        avg_7 = quantities[7] / 7.0
+        avg_14 = quantities[14] / 14.0
+        avg_30 = quantities[30] / 30.0
+        available = [(avg_7, 0.5), (avg_14, 0.3), (avg_30, 0.2)]
+        positive = [(value, weight) for value, weight in available if value > 0]
+        finance_avg_daily = (
+            sum(value * weight for value, weight in positive) / sum(weight for _, weight in positive)
+            if positive
+            else 0.0
+        )
+        api_avg_daily = max(0.0, float(_num_from_value(row.get("avg_daily_sales_api")) or 0.0))
+        if finance_avg_daily > 0:
+            avg_daily = finance_avg_daily
+            forecast_source = "finance_30d"
+        elif api_avg_daily > 0:
+            # Official Product API fallback.  It prevents a false "no sales"
+            # forecast when Finance API uses a different SKU representation.
+            avg_daily = api_avg_daily
+            forecast_source = "uzum_avgdsales"
+        else:
+            avg_daily = 0.0
+            forecast_source = "no_sales"
+        days_left = (float(total) / avg_daily) if avg_daily > 0 else None
+        reorder_in_days = (
+            max(0.0, float(days_left) - lead_days - safety_days)
+            if days_left is not None
+            else None
+        )
+        stockout_date = now_local + timedelta(days=days_left) if days_left is not None else None
+        reorder_date = now_local + timedelta(days=reorder_in_days) if reorder_in_days is not None else None
+        target_units = math.ceil(avg_daily * (target_days + lead_days + safety_days)) if avg_daily > 0 else total
+        recommended_qty = max(0, target_units - total)
+        if avg_daily <= 0 and total <= threshold:
+            recommended_qty = 0
+        price = max(0.0, _stock_row_price(row))
+        risk_days = max(0.0, float(lead_days + safety_days) - float(days_left or 0)) if avg_daily > 0 else 0.0
+        if total <= 0 and avg_daily > 0:
+            risk_days = max(risk_days, min(7.0, float(target_days)))
+        risk_value = avg_daily * risk_days * price
+        trend_percent = (
+            (avg_7 / avg_30 - 1.0) * 100.0
+            if forecast_source == "finance_30d" and avg_7 > 0 and avg_30 > 0
+            else None
+        )
+        urgent = bool(
+            total <= 0
+            or (days_left is not None and days_left <= lead_days + safety_days)
+            or total <= threshold
+        )
+        if recommended_qty <= 0 and not urgent:
+            continue
+        plan.append({
+            "row": row,
+            "title": _stock_row_title(row),
+            "sku": _stock_row_sku(row),
+            "total": total,
+            "sold_7": quantities[7],
+            "sold_14": quantities[14],
+            "sold_30": quantities[30],
+            "avg_daily": avg_daily,
+            "finance_avg_daily": finance_avg_daily,
+            "api_avg_daily": api_avg_daily,
+            "forecast_source": forecast_source,
+            "days_left": days_left,
+            "stockout_date": stockout_date,
+            "reorder_date": reorder_date,
+            "recommended_qty": recommended_qty,
+            "risk_value": risk_value,
+            "trend_percent": trend_percent,
+            "urgent": urgent,
+            "price": price,
+        })
+
+    plan.sort(key=lambda item: (
+        0 if item.get("urgent") else 1,
+        -float(item.get("risk_value") or 0),
+        float(item.get("days_left") if item.get("days_left") is not None else 999999),
+    ))
+    return plan
+
+
+def _split_replenishment_plan(
+    plan: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Separate real supply actions from low-stock rows without demand."""
+    actionable = [
+        item
+        for item in plan
+        if float(item.get("avg_daily") or 0.0) > 0
+        and int(item.get("recommended_qty") or 0) > 0
+    ]
+    no_demand = [
+        item
+        for item in plan
+        if float(item.get("avg_daily") or 0.0) <= 0
+    ]
+    return actionable, no_demand
+
+
+@dp.message(Command("smart_lowstock", "forecast_stock", "supply_plan", "replenishment"))
 async def smart_lowstock(message: Message) -> None:
     req = await require_connection(message)
     if req is None:
@@ -10573,55 +11951,164 @@ async def smart_lowstock(message: Message) -> None:
     lang = get_user_language(telegram_id)
     await message.answer("⌛ Qoldiq necha kunga yetishini hisoblayapman..." if lang == "uz" else "⌛ Считаю, на сколько дней хватит остатков...", reply_markup=stock_menu_for_message(message))
     try:
-        date_from, date_to = _days_range_ms(7)
-        sales_rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=FINANCE_REPORT_MAX_PAGES, page_size=100)
-        sold_qty: dict[str, float] = {}
-        for item in sales_rows:
-            if _is_cancelled_status(_finance_status(item)):
-                continue
-            keys = _sale_match_keys(item)
-            for key in keys:
-                sold_qty[key] = sold_qty.get(key, 0.0) + _finance_qty(item)
+        date_from, date_to = _days_range_ms(30)
+        sales_rows, _, _ = await _load_finance_range_flexible(client, shop_id, date_from, date_to)
         stock_rows = await load_sku_rows(client, shop_id, max_pages=50)
-        alerts: list[dict[str, Any]] = []
-        for row in stock_rows:
-            total = _stock_row_total(row)
-            if total <= 0:
-                continue
-            keys = _stock_match_keys(row)
-            qty_7 = max([sold_qty.get(k, 0.0) for k in keys] or [0.0])
-            avg_day = qty_7 / 7.0
-            days_left = 9999.0 if avg_day <= 0 else total / avg_day
-            if total <= LOW_STOCK_THRESHOLD or days_left <= SMART_LOW_STOCK_DAYS:
-                alerts.append({"row": row, "total": total, "qty_7": qty_7, "days_left": days_left})
-        alerts.sort(key=lambda x: (float(x.get("days_left") or 9999), int(x.get("total") or 0)))
+        settings = ensure_product_settings(telegram_id)
+        raw_plan = build_replenishment_plan(stock_rows, sales_rows, settings)
+        alerts, no_demand = _split_replenishment_plan(raw_plan)
+        lead_days = int(settings.get("lead_time_days") or 0)
+        safety_days = int(settings.get("safety_days") or 0)
+        target_days = int(settings.get("target_cover_days") or 30)
+        urgent_count = sum(
+            1
+            for item in alerts
+            if int(item.get("total") or 0) <= 0
+            or (
+                item.get("days_left") is not None
+                and float(item.get("days_left") or 0) <= lead_days + safety_days
+            )
+        )
+        finance_count = sum(1 for item in alerts if item.get("forecast_source") == "finance_30d")
+        api_average_count = sum(1 for item in alerts if item.get("forecast_source") == "uzum_avgdsales")
+
         if not alerts:
+            no_demand_note = (
+                f"\n\nℹ️ Past qoldiqli, ammo savdosiz SKU: <b>{len(no_demand)}</b>. "
+                "Ularga yetkazib berish tavsiya qilinmaydi."
+                if lang == "uz" and no_demand
+                else f"\n\nℹ️ SKU с низким остатком, но без спроса: <b>{len(no_demand)}</b>. "
+                "Поставлять их сейчас не нужно."
+                if no_demand
+                else ""
+            )
             text = (
-                f"⚠️ <b>Qoldiq prognozi</b>\n🏪 Do‘kon: <code>{shop_id}</code>\n\nKritik tovarlar topilmadi."
+                f"✅ <b>Yetkazib berish hozir kerak emas</b>\n"
+                f"🏪 Do‘kon: <code>{shop_id}</code>\n\n"
+                "Bot savdo tezligi va joriy qoldiq bo‘yicha yetkazib berish zaruratini topmadi."
+                f"{no_demand_note}"
                 if lang == "uz"
-                else f"⚠️ <b>Прогноз остатков</b>\n🏪 Магазин: <code>{shop_id}</code>\n\nКритичных товаров не нашёл."
+                else f"✅ <b>Поставка сейчас не требуется</b>\n"
+                f"🏪 Магазин: <code>{shop_id}</code>\n\n"
+                "По скорости продаж и текущему остатку товаров для пополнения не найдено."
+                f"{no_demand_note}"
             )
             await message.answer(text, reply_markup=stock_menu_for_message(message))
             return
-        title = "⚠️ <b>Qoldiq prognozi</b>" if lang == "uz" else "⚠️ <b>Прогноз остатков</b>"
+
+        title = "🚚 <b>Yetkazib berish rejasi</b>" if lang == "uz" else "🚚 <b>План поставки</b>"
         summary = [
             f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
-            f"Chegara: ≤ {LOW_STOCK_THRESHOLD} dona yoki {SMART_LOW_STOCK_DAYS} kundan kam" if lang == "uz" else f"Порог: ≤ {LOW_STOCK_THRESHOLD} шт. или хватит меньше чем на {SMART_LOW_STOCK_DAYS} дня",
+            (
+                f"🔴 Hozir buyurtma berish: <b>{urgent_count}</b> | "
+                f"Jami yetkazish: <b>{len(alerts)}</b> SKU"
+                if lang == "uz"
+                else f"🔴 Заказать сейчас: <b>{urgent_count}</b> | "
+                f"Всего к поставке: <b>{len(alerts)}</b> SKU"
+            ),
+            (
+                f"Hisob: yetkazish {lead_days} kun + xavfsizlik {safety_days} kun; "
+                f"yetkazilgandan keyin {target_days} kunlik zaxira."
+                if lang == "uz"
+                else f"Расчёт: доставка {lead_days} дн. + страховка {safety_days} дн.; "
+                f"после поставки — запас на {target_days} дн."
+            ),
+            (
+                f"Manba: Finance bo‘yicha {finance_count}, Uzum o‘rtacha tezligi bo‘yicha {api_average_count}."
+                if lang == "uz"
+                else f"Источник скорости: Finance — {finance_count}, средняя Uzum — {api_average_count}."
+            ),
+            (
+                f"ℹ️ Savdosiz past qoldiq: {len(no_demand)} SKU — yetkazishga kiritilmadi."
+                if lang == "uz" and no_demand
+                else f"ℹ️ Без спроса: {len(no_demand)} SKU — в поставку не включены."
+                if no_demand
+                else ""
+            ),
         ]
         items: list[str] = []
         for idx, item in enumerate(alerts, start=1):
-            row = item["row"]
-            title_item = escape(_short_text(_stock_row_title(row), 85))
-            sku = escape(_short_text(_stock_row_sku(row), 60))
-            days_left = float(item["days_left"])
+            title_item = escape(_short_text(item.get("title"), 85))
+            sku = escape(_short_text(item.get("sku"), 60))
+            days_left = item.get("days_left")
+            stockout = item.get("stockout_date")
+            reorder = item.get("reorder_date")
+            stockout_text = stockout.strftime("%d.%m.%Y") if isinstance(stockout, datetime) else "—"
+            reorder_now = (
+                not isinstance(reorder, datetime)
+                or reorder.date() <= datetime.now(UZT).date()
+            )
+            reorder_text = (
+                ("hozir" if lang == "uz" else "сейчас")
+                if reorder_now
+                else reorder.strftime("%d.%m.%Y")
+            )
+            trend = item.get("trend_percent")
+            trend_line = ""
+            if trend is not None and abs(float(trend)) >= 5:
+                if lang == "uz":
+                    trend_line = f"\n📈 So‘nggi trend: <b>{float(trend):+.0f}%</b>"
+                else:
+                    direction = "рост" if float(trend) > 0 else "снижение"
+                    trend_line = f"\n📈 Тренд спроса: <b>{direction} {abs(float(trend)):.0f}%</b>"
+            row = item.get("row") if isinstance(item.get("row"), dict) else {}
+            fbo = max(0, int(_num_from_value(row.get("fbo")) or 0))
+            fbs = max(0, int(_num_from_value(row.get("fbs")) or 0))
+            source = item.get("forecast_source")
+            risk_value = float(item.get("risk_value") or 0)
+            risk_line = ""
+            if risk_value > 0:
+                risk_line = (
+                    f"\n💸 Sotuv xavfi: <b>{_format_money(risk_value)}</b>"
+                    if lang == "uz"
+                    else f"\n💸 Возможная упущенная выручка: <b>{_format_money(risk_value)}</b>"
+                )
             if lang == "uz":
-                days_text = "7 kunda savdo yo‘q" if days_left > 9000 else f"taxminan {days_left:.1f} kun"
+                days_text = f"taxminan {float(days_left):.1f} kun"
                 sku_line = f"\n🔖 SKU: <code>{sku}</code>" if sku else ""
-                items.append(f"{idx}. <b>{title_item}</b>{sku_line}\n📦 Qoldiq: <b>{int(item['total'])} dona</b> | 7 kunda sotildi: <b>{float(item['qty_7']):.0f}</b> | Yetadi: <b>{days_text}</b>")
+                status_text = (
+                    "🔴 Qoldiq tugagan"
+                    if int(item.get("total") or 0) <= 0
+                    else "🔴 Hozir buyurtma bering"
+                    if float(days_left or 0) <= lead_days + safety_days
+                    else "🟡 Yetkazib berishni rejalashtiring"
+                )
+                speed_text = (
+                    f"{float(item['avg_daily']):.2f} dona/kun (Uzum o‘rtachasi)"
+                    if source == "uzum_avgdsales"
+                    else f"{float(item['avg_daily']):.2f} dona/kun; 7 kunda {float(item.get('sold_7') or 0):.0f}, 30 kunda {float(item.get('sold_30') or 0):.0f}"
+                )
+                items.append(
+                    f"{idx}. {status_text}\n<b>{title_item}</b>{sku_line}\n"
+                    f"📦 Hozir: <b>{int(item['total'])} dona</b> (Uzum {fbo} + FBS {fbs})\n"
+                    f"🛒 Savdo tezligi: <b>{speed_text}</b>\n"
+                    f"⏳ {days_text} yetadi — <b>{stockout_text}</b> gacha\n"
+                    f"✅ Amal: <b>{int(item['recommended_qty'])} dona</b> {reorder_text} buyurtma qiling"
+                    f"{trend_line}{risk_line}"
+                )
             else:
-                days_text = "нет продаж за 7 дней" if days_left > 9000 else f"примерно на {days_left:.1f} дн."
+                days_text = f"примерно на {float(days_left):.1f} дн."
                 sku_line = f"\n🔖 SKU: <code>{sku}</code>" if sku else ""
-                items.append(f"{idx}. <b>{title_item}</b>{sku_line}\n📦 Остаток: <b>{int(item['total'])} шт.</b> | Продажи за 7 дней: <b>{float(item['qty_7']):.0f}</b> | Хватит: <b>{days_text}</b>")
+                status_text = (
+                    "🔴 Товар уже закончился"
+                    if int(item.get("total") or 0) <= 0
+                    else "🔴 Заказать сейчас"
+                    if float(days_left or 0) <= lead_days + safety_days
+                    else "🟡 Запланировать поставку"
+                )
+                speed_text = (
+                    f"{float(item['avg_daily']):.2f} шт./день (средняя Uzum)"
+                    if source == "uzum_avgdsales"
+                    else f"{float(item['avg_daily']):.2f} шт./день; продано 7 дн.: {float(item.get('sold_7') or 0):.0f}, 30 дн.: {float(item.get('sold_30') or 0):.0f}"
+                )
+                items.append(
+                    f"{idx}. {status_text}\n<b>{title_item}</b>{sku_line}\n"
+                    f"📦 Сейчас: <b>{int(item['total'])} шт.</b> (Uzum {fbo} + FBS {fbs})\n"
+                    f"🛒 Скорость продаж: <b>{speed_text}</b>\n"
+                    f"⏳ Хватит {days_text} — до <b>{stockout_text}</b>\n"
+                    f"✅ Действие: заказать <b>{int(item['recommended_qty'])} шт.</b> — <b>{reorder_text}</b>"
+                    f"{trend_line}{risk_line}"
+                )
         await send_paginated_list(message, kind="forecast", title=title, summary=summary, items=items, section="stock", reply_markup=stock_menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
@@ -11280,6 +12767,50 @@ def _profit_summary_from_unit_rows(rows: list[dict[str, Any]], stats: dict[str, 
     }
 
 
+def calculate_business_profit(
+    cost_summary: dict[str, Any],
+    stats: dict[str, Any],
+    settings: dict[str, Any],
+    *,
+    days: int = 30,
+) -> dict[str, Any]:
+    """Apply seller-entered tax and operating expenses to the known SKU profit.
+
+    The result deliberately keeps cost coverage visible: if some SKUs have no
+    cost, net profit is an incomplete estimate and must not be presented as an
+    accounting fact.
+    """
+    period_ratio = max(0.0, float(days)) / 30.0
+    revenue = float(stats.get("revenue") or 0)
+    tax_percent = max(0.0, min(100.0, float(settings.get("tax_percent") or 0)))
+    tax_expense = revenue * tax_percent / 100.0
+    advertising = max(0.0, float(settings.get("advertising_monthly") or 0)) * period_ratio
+    storage = max(0.0, float(settings.get("storage_monthly") or 0)) * period_ratio
+    other = max(0.0, float(settings.get("other_monthly") or 0)) * period_ratio
+    known_profit = float(cost_summary.get("profit") or 0)
+    net_profit = known_profit - tax_expense - advertising - storage - other
+    coverage = max(0.0, min(1.0, float(cost_summary.get("coverage") or 0)))
+    return {
+        "days": int(days),
+        "revenue": revenue,
+        "commission": float(stats.get("commission") or 0),
+        "logistics": float(stats.get("logistics") or 0),
+        "payout_total": float(stats.get("payout_total") or 0),
+        "cost_total": float(cost_summary.get("cost_total") or 0),
+        "known_profit": known_profit,
+        "tax_expense": tax_expense,
+        "advertising_expense": advertising,
+        "storage_expense": storage,
+        "other_expense": other,
+        "operating_expenses": tax_expense + advertising + storage + other,
+        "net_profit": net_profit,
+        "net_margin": (net_profit / revenue * 100.0) if revenue > 0 else 0.0,
+        "coverage": coverage,
+        "complete": coverage >= 0.999,
+        "missing_count": int(cost_summary.get("missing_count") or 0),
+    }
+
+
 def _format_profit_report(shop_id: int, rows: list[dict[str, Any]], stats: dict[str, Any], lang: str = "ru") -> str:
     summary = _profit_summary_from_unit_rows(rows, stats)
     top_profit = sorted([r for r in rows if r.get("cost_per_unit") is not None], key=lambda r: float(r.get("profit") or 0), reverse=True)[:10]
@@ -11341,16 +12872,40 @@ async def profit_report(message: Message) -> None:
     try:
         rows, stats, _ = await _unit_economy_for_shop(client, telegram_id, shop_id, days=30)
         summary_stats = _profit_summary_from_unit_rows(rows, stats)
+        finance_settings = ensure_finance_settings(telegram_id, shop_id)
+        business_profit = calculate_business_profit(
+            summary_stats,
+            stats,
+            finance_settings,
+            days=30,
+        )
         known = sorted([r for r in rows if r.get("cost_per_unit") is not None], key=lambda r: float(r.get("profit") or 0), reverse=True)
-        title = "💰 <b>30 kunlik hisobiy foyda</b>" if lang == "uz" else "💰 <b>Расчётная прибыль за 30 дней</b>"
+        complete_profit = bool(business_profit.get("complete"))
+        title = (
+            "💰 <b>30 kunlik sof foyda</b>" if complete_profit else "💰 <b>Ma’lum tannarx bo‘yicha hisob</b>"
+        ) if lang == "uz" else (
+            "💰 <b>Чистая прибыль за 30 дней</b>" if complete_profit else "💰 <b>Расчёт по известной себестоимости</b>"
+        )
         summary = [
             f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
             f"💵 Tushum: <b>{_format_money(float(stats.get('revenue') or 0))}</b> | 📦 Tannarx: <b>{_format_money(float(summary_stats['cost_total']))}</b>" if lang == "uz" else f"💵 Выручка: <b>{_format_money(float(stats.get('revenue') or 0))}</b> | 📦 Себестоимость: <b>{_format_money(float(summary_stats['cost_total']))}</b>",
-            f"💰 Hisobiy foyda: <b>{_format_money(float(summary_stats['profit']))}</b> | 📈 Marja: <b>{float(summary_stats['margin']):.1f}%</b>" if lang == "uz" else f"💰 Расчётная прибыль: <b>{_format_money(float(summary_stats['profit']))}</b> | 📈 Маржа: <b>{float(summary_stats['margin']):.1f}%</b>",
+            f"🏛 Soliq: <b>{_format_money(float(business_profit['tax_expense']))}</b> | 📣 Reklama: <b>{_format_money(float(business_profit['advertising_expense']))}</b>" if lang == "uz" else f"🏛 Налог: <b>{_format_money(float(business_profit['tax_expense']))}</b> | 📣 Реклама: <b>{_format_money(float(business_profit['advertising_expense']))}</b>",
+            f"🏬 Saqlash: <b>{_format_money(float(business_profit['storage_expense']))}</b> | 🧾 Boshqa: <b>{_format_money(float(business_profit['other_expense']))}</b>" if lang == "uz" else f"🏬 Хранение: <b>{_format_money(float(business_profit['storage_expense']))}</b> | 🧾 Прочие: <b>{_format_money(float(business_profit['other_expense']))}</b>",
+            (f"💰 Sof foyda: <b>{_format_money(float(business_profit['net_profit']))}</b> | 📈 Marja: <b>{float(business_profit['net_margin']):.1f}%</b>" if complete_profit else f"💰 Ma’lum tannarx bo‘yicha natija: <b>{_format_money(float(business_profit['net_profit']))}</b>") if lang == "uz" else (f"💰 Чистая прибыль: <b>{_format_money(float(business_profit['net_profit']))}</b> | 📈 Маржа: <b>{float(business_profit['net_margin']):.1f}%</b>" if complete_profit else f"💰 Результат по известной себестоимости: <b>{_format_money(float(business_profit['net_profit']))}</b>"),
             f"📌 Tannarx bilan qamrov: <b>{float(summary_stats['coverage']) * 100:.1f}%</b>" if lang == "uz" else f"📌 Покрытие себестоимостью: <b>{float(summary_stats['coverage']) * 100:.1f}%</b>",
         ]
         if summary_stats["missing_count"]:
             summary.append(f"⚠️ Tannarx kiritilmagan SKU: <b>{summary_stats['missing_count']}</b>" if lang == "uz" else f"⚠️ Без себестоимости: <b>{summary_stats['missing_count']}</b> SKU")
+            summary.append(
+                "ℹ️ Natija yakuniy sof foyda emas: barcha SKU tannarxi kiritilmagan."
+                if lang == "uz"
+                else "ℹ️ Это не окончательная чистая прибыль: себестоимость заполнена не для всех SKU."
+            )
+        summary.append(
+            "⚙️ Xarajatlarni o‘zgartirish: <code>/finance_settings</code>"
+            if lang == "uz"
+            else "⚙️ Изменить налоги и расходы: <code>/finance_settings</code>"
+        )
         items: list[str] = []
         for idx, r in enumerate(known, start=1):
             title_item = escape(_short_text(str(r.get("title") or r.get("sku") or "-"), 70))
@@ -11402,6 +12957,8 @@ async def button_dead_stock(message: Message) -> None:
 
 @dp.message(F.text == "🌙 Ertalabki hisobot")
 @dp.message(F.text == "🌙 Утренний отчёт")
+@dp.message(F.text == "🌙 Qisqa hisobot")
+@dp.message(F.text == "🌙 Краткий отчёт")
 async def button_morning_report(message: Message) -> None:
     await morning_report(message)
 
@@ -11472,35 +13029,132 @@ def _connected_users_basic() -> list[dict[str, Any]]:
     return [dict(row) for row in rows if has_active_subscription(int(row["telegram_id"]))]
 
 
+async def _build_scheduled_period_text(
+    telegram_id: int,
+    client: UzumClient,
+    *,
+    days: int,
+    kind: str,
+) -> str:
+    lang = get_user_language(telegram_id)
+    now = datetime.now(UZT)
+    date_to = int(now.timestamp() * 1000)
+    date_from = int((now - timedelta(days=days)).timestamp() * 1000)
+    shift = days * 24 * 60 * 60 * 1000
+    stats, per_shop, shops_count = await _all_shops_finance_stats(telegram_id, client, date_from, date_to)
+    previous, _, _ = await _all_shops_finance_stats(
+        telegram_id,
+        client,
+        date_from - shift,
+        date_to - shift,
+    )
+    revenue_change = _format_change(
+        _percent_change(float(stats.get("revenue") or 0), float(previous.get("revenue") or 0)),
+        lang=lang,
+    )
+    payout_change = _format_change(
+        _percent_change(float(stats.get("payout_total") or 0), float(previous.get("payout_total") or 0)),
+        lang=lang,
+    )
+    top = list(stats.get("top_products") or [])[:3]
+    if lang == "uz":
+        title = "📅 <b>Haftalik boshqaruv hisoboti</b>" if kind == "weekly" else "🗓 <b>Oylik boshqaruv hisoboti</b>"
+        lines = [
+            title,
+            f"Davr: <b>{days} kun</b> | Do‘konlar: <b>{shops_count}</b>",
+            "",
+            f"🛒 Buyurtma: <b>{int(stats.get('orders') or 0)}</b> | 📦 Sotildi: <b>{float(stats.get('units') or 0):.0f}</b>",
+            f"❌ Bekor: <b>{int(stats.get('cancelled') or 0)}</b> | ↩️ Qaytarish: <b>{float(stats.get('returns') or 0):.0f}</b>",
+            f"💵 Tushum: <b>{_format_money(float(stats.get('revenue') or 0))}</b>",
+            f"✅ To‘lovga: <b>{_format_money(float(stats.get('payout_total') or 0))}</b>",
+            f"🔄 Oldingi davrga: tushum {revenue_change}, to‘lov {payout_change}",
+        ]
+        if per_shop:
+            lines.extend(["", "<b>Do‘konlar bo‘yicha:</b>", *per_shop[:10]])
+        if top:
+            lines.extend(["", "🏆 <b>Top-3:</b>"])
+            lines.extend(
+                f"{index}. {escape(_short_text(str(item.get('title') or '—'), 55))} — {_format_money(float(item.get('revenue') or 0))}"
+                for index, item in enumerate(top, start=1)
+            )
+        lines.extend(["", "💼 Keyingi qadamlar: /control_center"])
+        return "\n".join(lines)
+
+    title = "📅 <b>Еженедельный управленческий отчёт</b>" if kind == "weekly" else "🗓 <b>Ежемесячный управленческий отчёт</b>"
+    lines = [
+        title,
+        f"Период: <b>{days} дней</b> | Магазинов: <b>{shops_count}</b>",
+        "",
+        f"🛒 Заказов: <b>{int(stats.get('orders') or 0)}</b> | 📦 Продано: <b>{float(stats.get('units') or 0):.0f}</b>",
+        f"❌ Отмен: <b>{int(stats.get('cancelled') or 0)}</b> | ↩️ Возвратов: <b>{float(stats.get('returns') or 0):.0f}</b>",
+        f"💵 Выручка: <b>{_format_money(float(stats.get('revenue') or 0))}</b>",
+        f"✅ К выплате: <b>{_format_money(float(stats.get('payout_total') or 0))}</b>",
+        f"🔄 К предыдущему периоду: выручка {revenue_change}, выплата {payout_change}",
+    ]
+    if per_shop:
+        lines.extend(["", "<b>По магазинам:</b>", *per_shop[:10]])
+    if top:
+        lines.extend(["", "🏆 <b>Топ-3:</b>"])
+        lines.extend(
+            f"{index}. {escape(_short_text(str(item.get('title') or '—'), 55))} — {_format_money(float(item.get('revenue') or 0))}"
+            for index, item in enumerate(top, start=1)
+        )
+    lines.extend(["", "💼 Следующие действия: /control_center"])
+    return "\n".join(lines)
+
+
 async def daily_report_loop() -> None:
     await asyncio.sleep(90)
-    logging.info("Daily report loop started. Enabled: %s. Hour UZT: %s", DAILY_REPORTS, DAILY_REPORT_HOUR_UZT)
+    logging.info("Personal scheduled reports loop started")
     while True:
         try:
             now = datetime.now(UZT)
-            today_key = now.strftime("%Y-%m-%d")
-            if DAILY_REPORTS and now.hour == DAILY_REPORT_HOUR_UZT:
-                for row in _connected_users_basic():
-                    telegram_id = int(row["telegram_id"])
-                    key = (telegram_id, today_key)
-                    if key in _daily_report_sent or daily_report_was_sent(telegram_id, today_key):
+            for row in _connected_users_basic():
+                telegram_id = int(row["telegram_id"])
+                settings = ensure_product_settings(telegram_id)
+                due: list[tuple[str, str, int]] = []
+                if int(settings.get("daily_enabled") or 0) and now.hour >= int(settings.get("daily_hour") or 0):
+                    due.append(("daily", now.strftime("%Y-%m-%d"), 1))
+                if (
+                    int(settings.get("weekly_enabled") or 0)
+                    and now.weekday() == int(settings.get("weekly_weekday") or 0)
+                    and now.hour >= int(settings.get("weekly_hour") or 0)
+                ):
+                    iso = now.isocalendar()
+                    due.append(("weekly", f"{iso.year}-W{iso.week:02d}", 7))
+                if (
+                    int(settings.get("monthly_enabled") or 0)
+                    and now.day == int(settings.get("monthly_day") or 1)
+                    and now.hour >= int(settings.get("monthly_hour") or 0)
+                ):
+                    due.append(("monthly", now.strftime("%Y-%m"), 30))
+                if not due:
+                    continue
+                try:
+                    token = cipher.decrypt(row["uzum_token_encrypted"])
+                    client = UzumClient(token, UZUM_API_BASE_URL)
+                except Exception:
+                    logging.exception("Scheduled report: token failed user=%s", telegram_id)
+                    continue
+                for kind, period_key, days in due:
+                    if scheduled_report_was_sent(telegram_id, kind, period_key):
                         continue
                     try:
-                        token = cipher.decrypt(row["uzum_token_encrypted"])
-                        client = UzumClient(token, UZUM_API_BASE_URL)
-                        text = await _build_morning_report_text(telegram_id, client)
+                        text = (
+                            await _build_morning_report_text(telegram_id, client)
+                            if kind == "daily"
+                            else await _build_scheduled_period_text(telegram_id, client, days=days, kind=kind)
+                        )
                         await bot.send_message(telegram_id, text, reply_markup=main_menu_for_user(telegram_id))
-                        mark_daily_report_sent(telegram_id, today_key)
-                        _daily_report_sent.add(key)
+                        mark_scheduled_report_sent(telegram_id, kind, period_key)
+                        if kind == "daily":
+                            mark_daily_report_sent(telegram_id, period_key)
                         await asyncio.sleep(0.5)
                     except Exception:
-                        logging.exception("Daily report: failed to send for user=%s", telegram_id)
-            # Чистим старые ключи раз в сутки, чтобы память не росла.
-            if now.hour == 0:
-                _daily_report_sent.intersection_update({k for k in _daily_report_sent if k[1] == today_key})
+                        logging.exception("Scheduled report failed user=%s kind=%s", telegram_id, kind)
         except Exception:
-            logging.exception("Daily report loop error")
-        await asyncio.sleep(1800)
+            logging.exception("Scheduled report loop error")
+        await asyncio.sleep(600)
 
 
 async def subscription_reminder_loop() -> None:
@@ -11546,15 +13200,29 @@ async def subscription_reminder_loop() -> None:
 # Если один и тот же Uzum API-токен / магазин подключён у нескольких Telegram-пользователей
 # (например, владелец и жена), старые watcher-функции делали одинаковый запрос для каждого пользователя.
 # Ниже мы переопределяем check_*_once: один запрос на связку token+shop, потом рассылка всем пользователям группы.
-def connected_watch_groups() -> list[dict[str, Any]]:
+def connected_watch_groups(*setting_fields: str) -> list[dict[str, Any]]:
     groups: dict[str, dict[str, Any]] = {}
     for row in connected_users_for_order_watch():
         telegram_id = int(row["telegram_id"])
+        if setting_fields and not any(
+            product_setting_enabled(telegram_id, field)
+            for field in setting_fields
+        ):
+            continue
         shop_id = int(row["default_shop_id"])
         encrypted_token = row["uzum_token_encrypted"]
-        key = hashlib.sha1(f"{shop_id}:{encrypted_token}".encode("utf-8")).hexdigest()
+        # Fernet шифрует один и тот же токен каждый раз по-разному, поэтому
+        # группировка по зашифрованной строке не убирала дубли. Сравниваем только
+        # безопасные отпечатки расшифрованных токенов и сам токен нигде не сохраняем.
+        try:
+            raw_token = cipher.decrypt(encrypted_token)
+            token_fingerprint = hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
+        except Exception:
+            token_fingerprint = hashlib.sha256(str(encrypted_token).encode("utf-8")).hexdigest()
+        key = hashlib.sha1(f"{shop_id}:{token_fingerprint}".encode("utf-8")).hexdigest()
         if key not in groups:
             groups[key] = {
+                "watch_key": key,
                 "shop_id": shop_id,
                 "uzum_token_encrypted": encrypted_token,
                 "telegram_ids": [],
@@ -11564,8 +13232,70 @@ def connected_watch_groups() -> list[dict[str, Any]]:
     return list(groups.values())
 
 
+_WATCH_STOCK_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_WATCH_STOCK_CACHE_LOCKS: dict[str, tuple[Any, asyncio.Lock]] = {}
+
+
+def _watch_group_key(group: dict[str, Any]) -> str:
+    stored = str(group.get("watch_key") or "")
+    if stored:
+        return stored
+    return hashlib.sha1(
+        f"{group.get('shop_id')}:{group.get('uzum_token_encrypted')}".encode("utf-8")
+    ).hexdigest()
+
+
+def _watch_stock_cache_key(client: UzumClient, shop_id: int) -> str:
+    headers = getattr(client, "headers", {}) or {}
+    token = str(headers.get("Authorization") or "")
+    token_fingerprint = hashlib.sha1(token.encode("utf-8")).hexdigest() if token else str(id(client))
+    return f"{int(shop_id)}:{token_fingerprint}"
+
+
+def _watch_stock_cache_lock(cache_key: str) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    stored = _WATCH_STOCK_CACHE_LOCKS.get(cache_key)
+    if stored is None or stored[0] is not loop:
+        lock = asyncio.Lock()
+        _WATCH_STOCK_CACHE_LOCKS[cache_key] = (loop, lock)
+        return lock
+    return stored[1]
+
+
+async def _load_watch_stock_rows(
+    client: UzumClient,
+    shop_id: int,
+) -> list[dict[str, Any]]:
+    cache_key = _watch_stock_cache_key(client, shop_id)
+    now = time.monotonic()
+    cached = _WATCH_STOCK_CACHE.get(cache_key)
+    if cached and now - cached[0] < WATCH_STOCK_CACHE_SECONDS:
+        return cached[1]
+
+    async with _watch_stock_cache_lock(cache_key):
+        now = time.monotonic()
+        cached = _WATCH_STOCK_CACHE.get(cache_key)
+        if cached and now - cached[0] < WATCH_STOCK_CACHE_SECONDS:
+            return cached[1]
+        rows = await load_sku_rows(client, shop_id, max_pages=50)
+        _WATCH_STOCK_CACHE[cache_key] = (time.monotonic(), rows)
+        if len(_WATCH_STOCK_CACHE) > 100:
+            stale_before = time.monotonic() - WATCH_STOCK_CACHE_SECONDS * 3
+            for key, (saved_at, _) in list(_WATCH_STOCK_CACHE.items()):
+                if saved_at < stale_before:
+                    _WATCH_STOCK_CACHE.pop(key, None)
+                    _WATCH_STOCK_CACHE_LOCKS.pop(key, None)
+        logging.info(
+            "Watcher stock snapshot refreshed shop=%s skus=%s cache=%ss",
+            shop_id,
+            len(rows),
+            WATCH_STOCK_CACHE_SECONDS,
+        )
+        return rows
+
+
 async def check_new_orders_once() -> None:
-    for group in connected_watch_groups():
+    for group in connected_watch_groups("notify_orders"):
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(x) for x in group["telegram_ids"]]
@@ -11575,9 +13305,13 @@ async def check_new_orders_once() -> None:
             client = UzumClient(token, UZUM_API_BASE_URL)
             data = await client.get_fbs_orders(shop_id, status="CREATED", page=0, size=20)
             items = extract_items(data)
-        except Exception:
-            logging.exception("Order watcher optimized: failed to check shop=%s users=%s", shop_id, telegram_ids)
-            await asyncio.sleep(3)
+        except Exception as error:
+            _log_watcher_api_failure(
+                "Order watcher",
+                error,
+                shop_id=shop_id,
+                telegram_ids=telegram_ids,
+            )
             continue
 
         keys_now = [order_key(item) for item in items]
@@ -11618,8 +13352,7 @@ async def check_new_orders_once() -> None:
 
 
 async def check_low_stock_once() -> None:
-    threshold = max(0, LOW_STOCK_THRESHOLD)
-    for group in connected_watch_groups():
+    for group in connected_watch_groups("notify_low_stock"):
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(x) for x in group["telegram_ids"]]
@@ -11627,16 +13360,20 @@ async def check_low_stock_once() -> None:
         try:
             token = cipher.decrypt(encrypted_token)
             client = UzumClient(token, UZUM_API_BASE_URL)
-            rows = await load_sku_rows(client, shop_id, max_pages=50)
-        except Exception:
-            logging.exception("Low stock watcher optimized: failed to check shop=%s users=%s", shop_id, telegram_ids)
-            await asyncio.sleep(3)
+            rows = await _load_watch_stock_rows(client, shop_id)
+        except Exception as error:
+            _log_watcher_api_failure(
+                "Low stock watcher",
+                error,
+                shop_id=shop_id,
+                telegram_ids=telegram_ids,
+            )
             continue
 
-        low_rows = [r for r in rows if r.get("total") is not None and int(r.get("total") or 0) <= threshold]
-        low_keys_now = [stock_row_key(r) for r in low_rows]
-
         for telegram_id in telegram_ids:
+            threshold = max(0, int(ensure_product_settings(telegram_id).get("low_stock_threshold") or 0))
+            low_rows = [r for r in rows if r.get("total") is not None and int(r.get("total") or 0) <= threshold]
+            low_keys_now = [stock_row_key(r) for r in low_rows]
             known = _seen_low_stock_keys_by_user.setdefault(telegram_id, set())
             if telegram_id not in _low_stock_watch_initialized:
                 known.update(low_keys_now)
@@ -11672,7 +13409,7 @@ async def check_low_stock_once() -> None:
 
 
 async def check_out_of_stock_once() -> None:
-    for group in connected_watch_groups():
+    for group in connected_watch_groups("notify_out_of_stock"):
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(x) for x in group["telegram_ids"]]
@@ -11680,10 +13417,14 @@ async def check_out_of_stock_once() -> None:
         try:
             token = cipher.decrypt(encrypted_token)
             client = UzumClient(token, UZUM_API_BASE_URL)
-            rows = await load_sku_rows(client, shop_id, max_pages=50)
-        except Exception:
-            logging.exception("Out of stock watcher optimized: failed to check shop=%s users=%s", shop_id, telegram_ids)
-            await asyncio.sleep(3)
+            rows = await _load_watch_stock_rows(client, shop_id)
+        except Exception as error:
+            _log_watcher_api_failure(
+                "Out of stock watcher",
+                error,
+                shop_id=shop_id,
+                telegram_ids=telegram_ids,
+            )
             continue
 
         zero_rows = [r for r in rows if r.get("total") is not None and int(r.get("total") or 0) == 0]
@@ -11725,7 +13466,7 @@ async def check_out_of_stock_once() -> None:
 
 async def check_new_sales_once() -> None:
     date_from, date_to = _today_range_ms()
-    for group in connected_watch_groups():
+    for group in connected_watch_groups("notify_sales", "notify_cancellations"):
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(x) for x in group["telegram_ids"]]
@@ -11748,6 +13489,8 @@ async def check_new_sales_once() -> None:
 
         keys_now = [sale_key(item) for item in rows]
         for telegram_id in telegram_ids:
+            sales_enabled = product_setting_enabled(telegram_id, "notify_sales")
+            cancellations_enabled = product_setting_enabled(telegram_id, "notify_cancellations")
             known = _seen_sale_keys_by_user.setdefault(telegram_id, set())
             if telegram_id not in _sales_watch_initialized:
                 known.update(keys_now)
@@ -11785,7 +13528,7 @@ async def check_new_sales_once() -> None:
 
 
 async def check_stock_change_once() -> None:
-    for group in connected_watch_groups():
+    for group in connected_watch_groups("notify_stock_change"):
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(x) for x in group["telegram_ids"]]
@@ -11793,11 +13536,15 @@ async def check_stock_change_once() -> None:
         try:
             token = cipher.decrypt(encrypted_token)
             client = UzumClient(token, UZUM_API_BASE_URL)
-            rows = await load_sku_rows(client, shop_id, max_pages=20)
+            rows = await _load_watch_stock_rows(client, shop_id)
             snapshot_now = _stock_change_snapshot(rows)
-        except Exception:
-            logging.exception("Stock change watcher optimized: failed to check shop=%s users=%s", shop_id, telegram_ids)
-            await asyncio.sleep(3)
+        except Exception as error:
+            _log_watcher_api_failure(
+                "Stock change watcher",
+                error,
+                shop_id=shop_id,
+                telegram_ids=telegram_ids,
+            )
             continue
 
         for telegram_id in telegram_ids:
@@ -11882,6 +13629,7 @@ def build_cancel_message(item: dict[str, Any], shop_id: int | None = None, lang:
     unit_price = _deep_pick_number(item, ("sellPrice", "soldPrice", "price", "skuPrice", "productPrice"))
     status = escape(_finance_status(item))
     order_id = escape(_finance_order_id(item))
+    sale_id = escape(_finance_sale_id(item))
     date_text = escape(_format_finance_date(_finance_date_value(item)))
 
     if lang == "uz":
@@ -12019,10 +13767,11 @@ async def cancel_notify_status(message: Message) -> None:
         return
     _, _, shop_id = req
     lang = get_user_language(telegram_id)
+    enabled = product_setting_enabled(telegram_id, "notify_cancellations")
     if normalize_lang(lang) == "uz":
         text = (
             "❌ <b>Bekor qilingan buyurtmalar xabarnomasi</b>\n\n"
-            f"Holat: {'✅ yoqilgan' if CANCEL_NOTIFICATIONS else '❌ o‘chirilgan'}\n"
+            f"Holat: {'✅ yoqilgan' if enabled else '❌ o‘chirilgan'}\n"
             f"Do‘kon: <code>{shop_id}</code>\n"
             f"Tekshiruv: har <b>{max(60, SALE_CHECK_INTERVAL_SECONDS)}</b> soniyada\n\n"
             "Bot yangi bekor qilingan buyurtmalarni Finance API orqali kuzatadi."
@@ -12030,12 +13779,1199 @@ async def cancel_notify_status(message: Message) -> None:
     else:
         text = (
             "❌ <b>Уведомления об отменах</b>\n\n"
-            f"Статус: {'✅ включены' if CANCEL_NOTIFICATIONS else '❌ выключены'}\n"
+            f"Статус: {'✅ включены' if enabled else '❌ выключены'}\n"
             f"Магазин: <code>{shop_id}</code>\n"
             f"Проверка каждые: <b>{max(60, SALE_CHECK_INTERVAL_SECONDS)}</b> сек.\n\n"
             "Бот отслеживает новые отмены через Finance API."
         )
     await message.answer(text, reply_markup=main_menu_for_user(telegram_id))
+
+
+# --- Персональные уведомления, расписание, расходы и поставка ---
+AUTOMATION_BOOL_FIELDS = {
+    "notify_orders",
+    "notify_sales",
+    "notify_low_stock",
+    "notify_out_of_stock",
+    "notify_cancellations",
+    "notify_reviews",
+    "notify_stock_change",
+    "notify_losses",
+    "notify_defects",
+    "notify_fbo_acceptance",
+    "daily_enabled",
+    "weekly_enabled",
+    "monthly_enabled",
+}
+
+PRODUCT_NUMERIC_LIMITS: dict[str, tuple[float, float]] = {
+    "daily_hour": (0, 23),
+    "weekly_weekday": (1, 7),
+    "weekly_hour": (0, 23),
+    "monthly_day": (1, 28),
+    "monthly_hour": (0, 23),
+    "low_stock_threshold": (0, 100000),
+    "lead_time_days": (0, 90),
+    "safety_days": (0, 90),
+    "target_cover_days": (1, 365),
+}
+
+FINANCE_NUMERIC_LIMITS: dict[str, tuple[float, float]] = {
+    "tax_percent": (0, 100),
+    "advertising_monthly": (0, 10_000_000_000),
+    "storage_monthly": (0, 10_000_000_000),
+    "other_monthly": (0, 10_000_000_000),
+}
+
+
+def _toggle_icon(value: Any) -> str:
+    return "✅" if bool(int(value or 0)) else "▫️"
+
+
+def _weekday_name(value: Any, lang: str) -> str:
+    index = max(0, min(6, int(value or 0)))
+    ru = ("Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс")
+    uz = ("Du", "Se", "Ch", "Pa", "Ju", "Sh", "Ya")
+    return (uz if normalize_lang(lang) == "uz" else ru)[index]
+
+
+def _sales_mode_label(settings: dict[str, Any], lang: str, *, compact: bool = False) -> str:
+    mode = _sales_notification_mode_from_settings(settings)
+    uz = normalize_lang(lang) == "uz"
+    labels = {
+        "instant": ("⚡ Сразу", "⚡ Darhol"),
+        "hourly": ("🕐 Сводка раз в час", "🕐 Har soatda hisobot"),
+        "off": ("🔕 Выключены", "🔕 O‘chirilgan"),
+    }
+    ru_text, uz_text = labels[mode]
+    text = uz_text if uz else ru_text
+    if compact and mode == "hourly":
+        return "🕐 За час" if not uz else "🕐 Har soat"
+    return text
+
+
+NOTIFICATION_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
+    "sales": ("notify_cancellations", "notify_orders"),
+    "stock": (
+        "notify_low_stock",
+        "notify_out_of_stock",
+        "notify_stock_change",
+        "notify_losses",
+        "notify_defects",
+        "notify_fbo_acceptance",
+    ),
+    "reports": ("daily_enabled", "weekly_enabled", "monthly_enabled"),
+}
+
+
+def _enabled_count(settings: dict[str, Any], fields: Iterable[str]) -> tuple[int, int]:
+    field_list = list(fields)
+    enabled = sum(1 for field in field_list if bool(int(settings.get(field) or 0)))
+    return enabled, len(field_list)
+
+
+def notification_hub_text(telegram_id: int) -> str:
+    lang = get_user_language(telegram_id)
+    row = ensure_product_settings(telegram_id)
+    stock_on, stock_total = _enabled_count(row, NOTIFICATION_SECTION_FIELDS["stock"])
+    reports_on, reports_total = _enabled_count(row, NOTIFICATION_SECTION_FIELDS["reports"])
+    if lang == "uz":
+        return (
+            "🔔 <b>Xabarnomalar</b>\n\n"
+            f"💸 Savdo: <b>{_sales_mode_label(row, lang)}</b>\n"
+            f"📦 Ombor va yetkazish: <b>{stock_on}/{stock_total} yoqilgan</b>\n"
+            f"📅 Avtohisobotlar: <b>{reports_on}/{reports_total} yoqilgan</b>\n"
+            f"⭐ Sharhlar: {_toggle_icon(row.get('notify_reviews'))}\n\n"
+            "Sozlash uchun kerakli guruhni tanlang."
+        )
+    return (
+        "🔔 <b>Уведомления</b>\n\n"
+        f"💸 Продажи: <b>{_sales_mode_label(row, lang)}</b>\n"
+        f"📦 Склад и поставки: <b>{stock_on}/{stock_total} включено</b>\n"
+        f"📅 Автоотчёты: <b>{reports_on}/{reports_total} включено</b>\n"
+        f"⭐ Отзывы: {_toggle_icon(row.get('notify_reviews'))}\n\n"
+        "Выберите группу — увидите только относящиеся к ней настройки."
+    )
+
+
+def notification_hub_markup(telegram_id: int) -> InlineKeyboardMarkup:
+    lang = get_user_language(telegram_id)
+    row = ensure_product_settings(telegram_id)
+    uz = lang == "uz"
+    stock_on, stock_total = _enabled_count(row, NOTIFICATION_SECTION_FIELDS["stock"])
+    reports_on, reports_total = _enabled_count(row, NOTIFICATION_SECTION_FIELDS["reports"])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=(f"💸 Savdo · {_sales_mode_label(row, lang, compact=True)}" if uz else f"💸 Продажи · {_sales_mode_label(row, lang, compact=True)}"),
+            callback_data="notifyhub:sales",
+        )],
+        [
+            InlineKeyboardButton(
+                text=(f"📦 Ombor · {stock_on}/{stock_total}" if uz else f"📦 Склад · {stock_on}/{stock_total}"),
+                callback_data="notifyhub:stock",
+            ),
+            InlineKeyboardButton(
+                text=(f"📅 Hisobot · {reports_on}/{reports_total}" if uz else f"📅 Отчёты · {reports_on}/{reports_total}"),
+                callback_data="notifyhub:reports",
+            ),
+        ],
+        [InlineKeyboardButton(
+            text=f"{_toggle_icon(row.get('notify_reviews'))} {'Sharhlar' if uz else 'Отзывы'}",
+            callback_data="notifytoggle:main:notify_reviews",
+        )],
+    ])
+
+
+def notification_section_text(telegram_id: int, section: str) -> str:
+    lang = get_user_language(telegram_id)
+    row = ensure_product_settings(telegram_id)
+    uz = lang == "uz"
+    if section == "sales":
+        if uz:
+            return (
+                "💸 <b>Savdo va buyurtmalar</b>\n\n"
+                f"Savdo xabarlari: <b>{_sales_mode_label(row, lang)}</b>\n"
+                f"Bekor qilishlar: {_toggle_icon(row.get('notify_cancellations'))}\n"
+                f"Yangi FBS buyurtmalar: {_toggle_icon(row.get('notify_orders'))}\n\n"
+                "Kichik do‘kon uchun «Darhol», ko‘p savdo bo‘lsa «Har soat» rejimini tanlang."
+            )
+        return (
+            "💸 <b>Продажи и заказы</b>\n\n"
+            f"Продажи: <b>{_sales_mode_label(row, lang)}</b>\n"
+            f"Отмены: {_toggle_icon(row.get('notify_cancellations'))}\n"
+            f"Новые FBS-заказы: {_toggle_icon(row.get('notify_orders'))}\n\n"
+            "Для небольшого магазина выберите «Сразу», для большого — «Сводка раз в час»."
+        )
+    if section == "stock":
+        if uz:
+            return (
+                "📦 <b>Ombor va yetkazish</b>\n\n"
+                f"Kam qoldiq: {_toggle_icon(row.get('notify_low_stock'))} (≤ {int(row.get('low_stock_threshold') or 0)})\n"
+                f"Tovar tugashi: {_toggle_icon(row.get('notify_out_of_stock'))}\n"
+                f"Qoldiq o‘zgarishi: {_toggle_icon(row.get('notify_stock_change'))}\n"
+                f"Yo‘qotish: {_toggle_icon(row.get('notify_losses'))}\n"
+                f"Yaroqsiz tovar: {_toggle_icon(row.get('notify_defects'))}\n"
+                f"FBO qabuli va farqlar PDF: {_toggle_icon(row.get('notify_fbo_acceptance'))}"
+            )
+        return (
+            "📦 <b>Склад и поставки</b>\n\n"
+            f"Низкий остаток: {_toggle_icon(row.get('notify_low_stock'))} (≤ {int(row.get('low_stock_threshold') or 0)})\n"
+            f"Товар закончился: {_toggle_icon(row.get('notify_out_of_stock'))}\n"
+            f"Изменение остатка: {_toggle_icon(row.get('notify_stock_change'))}\n"
+            f"Потери: {_toggle_icon(row.get('notify_losses'))}\n"
+            f"Брак: {_toggle_icon(row.get('notify_defects'))}\n"
+            f"Приёмка FBO и PDF с расхождениями: {_toggle_icon(row.get('notify_fbo_acceptance'))}"
+        )
+    if uz:
+        return (
+            "📅 <b>Avtohisobotlar</b>\n\n"
+            f"Kunlik: {_toggle_icon(row.get('daily_enabled'))} {int(row.get('daily_hour') or 0):02d}:00\n"
+            f"Haftalik: {_toggle_icon(row.get('weekly_enabled'))} {_weekday_name(row.get('weekly_weekday'), lang)} {int(row.get('weekly_hour') or 0):02d}:00\n"
+            f"Oylik: {_toggle_icon(row.get('monthly_enabled'))} {int(row.get('monthly_day') or 1)}-kun {int(row.get('monthly_hour') or 0):02d}:00\n\n"
+            "Vaqt zonasi: Asia/Tashkent."
+        )
+    return (
+        "📅 <b>Автоматические отчёты</b>\n\n"
+        f"Ежедневный: {_toggle_icon(row.get('daily_enabled'))} {int(row.get('daily_hour') or 0):02d}:00\n"
+        f"Еженедельный: {_toggle_icon(row.get('weekly_enabled'))} {_weekday_name(row.get('weekly_weekday'), lang)} {int(row.get('weekly_hour') or 0):02d}:00\n"
+        f"Ежемесячный: {_toggle_icon(row.get('monthly_enabled'))} {int(row.get('monthly_day') or 1)} числа в {int(row.get('monthly_hour') or 0):02d}:00\n\n"
+        "Часовой пояс: Asia/Tashkent."
+    )
+
+
+def notification_section_markup(telegram_id: int, section: str) -> InlineKeyboardMarkup:
+    lang = get_user_language(telegram_id)
+    row = ensure_product_settings(telegram_id)
+    uz = lang == "uz"
+
+    def toggle(field: str, ru: str, uz_text: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(
+            text=f"{_toggle_icon(row.get(field))} {uz_text if uz else ru}",
+            callback_data=f"notifytoggle:{section}:{field}",
+        )
+
+    back = InlineKeyboardButton(
+        text="⬅️ Xabarnomalar" if uz else "⬅️ Все уведомления",
+        callback_data="notifyhub:main",
+    )
+    if section == "sales":
+        rows = [
+            [InlineKeyboardButton(
+                text=f"💸 {_sales_mode_label(row, lang, compact=True)}",
+                callback_data="salesmode:menu:sales",
+            )],
+            [
+                toggle("notify_cancellations", "Отмены", "Bekor qilish"),
+                toggle("notify_orders", "FBS-заказы", "FBS buyurtma"),
+            ],
+            [back],
+        ]
+    elif section == "stock":
+        rows = [
+            [
+                toggle("notify_low_stock", "Низкий остаток", "Kam qoldiq"),
+                toggle("notify_out_of_stock", "Закончился", "Tugadi"),
+            ],
+            [toggle("notify_stock_change", "Изменение остатка", "Qoldiq o‘zgarishi")],
+            [toggle("notify_losses", "Потери", "Yo‘qotish"), toggle("notify_defects", "Брак", "Yaroqsiz")],
+            [toggle("notify_fbo_acceptance", "Приёмка FBO", "FBO qabuli")],
+            [InlineKeyboardButton(
+                text=("📉 Qoldiq chegarasi" if uz else "📉 Порог низкого остатка"),
+                callback_data="notifyedit:stock:low_stock_threshold",
+            )],
+            [back],
+        ]
+    else:
+        rows = [
+            [toggle("daily_enabled", "Ежедневный", "Kunlik")],
+            [toggle("weekly_enabled", "Еженедельный", "Haftalik")],
+            [toggle("monthly_enabled", "Ежемесячный", "Oylik")],
+            [InlineKeyboardButton(text=("🕘 Kunlik vaqt" if uz else "🕘 Время ежедневного"), callback_data="notifyedit:reports:daily_hour")],
+            [
+                InlineKeyboardButton(text=("📅 Hafta kuni" if uz else "📅 День недели"), callback_data="notifyedit:reports:weekly_weekday"),
+                InlineKeyboardButton(text=("🕘 Hafta vaqti" if uz else "🕘 Время недельного"), callback_data="notifyedit:reports:weekly_hour"),
+            ],
+            [
+                InlineKeyboardButton(text=("🗓 Oy kuni" if uz else "🗓 День месяца"), callback_data="notifyedit:reports:monthly_day"),
+                InlineKeyboardButton(text=("🕘 Oy vaqti" if uz else "🕘 Время месячного"), callback_data="notifyedit:reports:monthly_hour"),
+            ],
+            [back],
+        ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def automation_settings_text(telegram_id: int) -> str:
+    lang = get_user_language(telegram_id)
+    row = ensure_product_settings(telegram_id)
+    if lang == "uz":
+        return (
+            "⚙️ <b>Shaxsiy avtomatlashtirish</b>\n\n"
+            "Har bir tugma faqat sizning Telegram hisobingiz uchun ishlaydi.\n\n"
+            f"💸 Savdo xabarlari: <b>{_sales_mode_label(row, lang)}</b>\n"
+            f"🚫 Bekor qilish: {_toggle_icon(row.get('notify_cancellations'))}\n"
+            f"🧭 Yangi yo‘qotish: {_toggle_icon(row.get('notify_losses'))}\n"
+            f"🧪 Yangi yaroqsiz: {_toggle_icon(row.get('notify_defects'))}\n"
+            f"🚚 FBO qabuli: {_toggle_icon(row.get('notify_fbo_acceptance'))}\n"
+            f"📉 Kam qoldiq: {_toggle_icon(row.get('notify_low_stock'))} (≤ {int(row.get('low_stock_threshold') or 0)})\n"
+            f"❌ Qoldiq tugashi: {_toggle_icon(row.get('notify_out_of_stock'))}\n"
+            f"⭐ Sharhlar: {_toggle_icon(row.get('notify_reviews'))}\n"
+            f"🔔 Yangi FBS buyurtma: {_toggle_icon(row.get('notify_orders'))}\n"
+            f"📦 Qoldiq o‘zgarishi: {_toggle_icon(row.get('notify_stock_change'))}\n\n"
+            f"🌅 Kunlik: {_toggle_icon(row.get('daily_enabled'))} {int(row.get('daily_hour') or 0):02d}:00\n"
+            f"📅 Haftalik: {_toggle_icon(row.get('weekly_enabled'))} {_weekday_name(row.get('weekly_weekday'), lang)} {int(row.get('weekly_hour') or 0):02d}:00\n"
+            f"🗓 Oylik: {_toggle_icon(row.get('monthly_enabled'))} {int(row.get('monthly_day') or 1)}-kun {int(row.get('monthly_hour') or 0):02d}:00\n\n"
+            "Vaqt zonasi: <b>Asia/Tashkent</b>."
+        )
+    return (
+        "⚙️ <b>Персональная автоматизация</b>\n\n"
+        "Каждая настройка действует только для вашего Telegram-аккаунта.\n\n"
+        f"💸 Уведомления о продажах: <b>{_sales_mode_label(row, lang)}</b>\n"
+        f"🚫 Отмены: {_toggle_icon(row.get('notify_cancellations'))}\n"
+        f"🧭 Новые потери: {_toggle_icon(row.get('notify_losses'))}\n"
+        f"🧪 Новый брак: {_toggle_icon(row.get('notify_defects'))}\n"
+        f"🚚 Приёмка FBO: {_toggle_icon(row.get('notify_fbo_acceptance'))}\n"
+        f"📉 Низкие остатки: {_toggle_icon(row.get('notify_low_stock'))} (≤ {int(row.get('low_stock_threshold') or 0)})\n"
+        f"❌ Товар закончился: {_toggle_icon(row.get('notify_out_of_stock'))}\n"
+        f"⭐ Отзывы: {_toggle_icon(row.get('notify_reviews'))}\n"
+        f"🔔 Новые FBS-заказы: {_toggle_icon(row.get('notify_orders'))}\n"
+        f"📦 Изменения остатков: {_toggle_icon(row.get('notify_stock_change'))}\n\n"
+        f"🌅 Ежедневный отчёт: {_toggle_icon(row.get('daily_enabled'))} {int(row.get('daily_hour') or 0):02d}:00\n"
+        f"📅 Еженедельный: {_toggle_icon(row.get('weekly_enabled'))} {_weekday_name(row.get('weekly_weekday'), lang)} {int(row.get('weekly_hour') or 0):02d}:00\n"
+        f"🗓 Ежемесячный: {_toggle_icon(row.get('monthly_enabled'))} {int(row.get('monthly_day') or 1)} числа в {int(row.get('monthly_hour') or 0):02d}:00\n\n"
+        "Часовой пояс: <b>Asia/Tashkent</b>."
+    )
+
+
+def automation_settings_markup(telegram_id: int) -> InlineKeyboardMarkup:
+    lang = get_user_language(telegram_id)
+    row = ensure_product_settings(telegram_id)
+    uz = lang == "uz"
+
+    def toggle(field: str, ru: str, uz_text: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(
+            text=f"{_toggle_icon(row.get(field))} {uz_text if uz else ru}",
+            callback_data=f"autotoggle:{field}",
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"💸 {_sales_mode_label(row, lang, compact=True)}",
+            callback_data="salesmode:menu",
+        ), toggle("notify_cancellations", "Отмены", "Bekor")],
+        [toggle("notify_losses", "Потери", "Yo‘qotish"), toggle("notify_defects", "Брак", "Yaroqsiz")],
+        [toggle("notify_fbo_acceptance", "Приёмка FBO", "FBO qabuli")],
+        [toggle("notify_low_stock", "Низкий остаток", "Kam qoldiq"), toggle("notify_out_of_stock", "Закончился", "Tugadi")],
+        [toggle("notify_reviews", "Отзывы", "Sharh"), toggle("notify_orders", "FBS-заказы", "FBS buyurtma")],
+        [toggle("notify_stock_change", "Движение склада", "Ombor harakati")],
+        [toggle("daily_enabled", "Ежедневный", "Kunlik"), toggle("weekly_enabled", "Еженедельный", "Haftalik")],
+        [toggle("monthly_enabled", "Ежемесячный", "Oylik")],
+        [InlineKeyboardButton(text=("🕘 Kunlik vaqt" if uz else "🕘 Время ежедневного"), callback_data="autoedit:daily_hour"),
+         InlineKeyboardButton(text=("📅 Hafta kuni" if uz else "📅 День недели"), callback_data="autoedit:weekly_weekday")],
+        [InlineKeyboardButton(text=("🕘 Hafta vaqti" if uz else "🕘 Время недельного"), callback_data="autoedit:weekly_hour"),
+         InlineKeyboardButton(text=("🗓 Oy kuni" if uz else "🗓 День месяца"), callback_data="autoedit:monthly_day")],
+        [InlineKeyboardButton(text=("🕘 Oy vaqti" if uz else "🕘 Время месячного"), callback_data="autoedit:monthly_hour"),
+         InlineKeyboardButton(text=("📉 Qoldiq chegarasi" if uz else "📉 Порог остатка"), callback_data="autoedit:low_stock_threshold")],
+    ])
+
+
+def sales_mode_selection_text(telegram_id: int) -> str:
+    lang = get_user_language(telegram_id)
+    settings = ensure_product_settings(telegram_id)
+    shop_id = db.get_default_shop_id(telegram_id)
+    shop_text = str(shop_id) if shop_id is not None else "—"
+    if normalize_lang(lang) == "uz":
+        return (
+            "💸 <b>Savdo xabarlari rejimi</b>\n\n"
+            f"🏪 Faol do‘kon: <code>{shop_text}</code>\n"
+            f"Hozir: <b>{_sales_mode_label(settings, lang)}</b>\n\n"
+            "⚡ <b>Darhol</b> — har bir yangi savdo alohida xabar bo‘lib keladi. "
+            "Savdosi kam do‘konlar uchun qulay.\n\n"
+            "🕐 <b>Har soatda hisobot</b> — bot savdolarni yig‘adi va soatiga bitta xabar yuboradi: "
+            "buyurtmalar, dona, tushum, komissiya, logistika, to‘lov va top tovarlar.\n\n"
+            "🚫 Bekor qilingan buyurtmalar tanlangan rejimdan qat’i nazar alohida tezkor xabar bo‘lib keladi."
+        )
+    return (
+        "💸 <b>Режим уведомлений о продажах</b>\n\n"
+        f"🏪 Активный магазин: <code>{shop_text}</code>\n"
+        f"Сейчас: <b>{_sales_mode_label(settings, lang)}</b>\n\n"
+        "⚡ <b>Сразу</b> — каждая новая продажа приходит отдельным сообщением. "
+        "Удобно для небольших магазинов.\n\n"
+        "🕐 <b>Сводка раз в час</b> — бот собирает продажи и присылает одно сообщение: "
+        "заказы, количество товаров, выручка, комиссия, логистика, выплата и топ товаров.\n\n"
+        "🚫 Отмены остаются отдельными срочными уведомлениями независимо от выбранного режима."
+    )
+
+
+def sales_mode_selection_markup(telegram_id: int, *, back_to: str = "automation") -> InlineKeyboardMarkup:
+    lang = get_user_language(telegram_id)
+    uz = normalize_lang(lang) == "uz"
+    mode = get_sales_notification_mode(telegram_id)
+
+    def option(value: str, ru: str, uz_text: str) -> InlineKeyboardButton:
+        marker = "✅" if mode == value else "▫️"
+        return InlineKeyboardButton(
+            text=f"{marker} {uz_text if uz else ru}",
+            callback_data=f"salesmode:{value}:{back_to}",
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [option("instant", "⚡ Сразу", "⚡ Darhol"), option("hourly", "🕐 За час", "🕐 Har soat")],
+        [option("off", "🔕 Выключить", "🔕 O‘chirish")],
+        [InlineKeyboardButton(text="⬅️ Ortga" if uz else "⬅️ Назад", callback_data=f"salesmode:back:{back_to}")],
+    ])
+
+
+def supply_settings_text(telegram_id: int) -> str:
+    lang = get_user_language(telegram_id)
+    row = ensure_product_settings(telegram_id)
+    if lang == "uz":
+        return (
+            "🚚 <b>Yetkazib berish hisob-kitobi</b>\n\n"
+            f"Yetkazish muddati: <b>{int(row.get('lead_time_days') or 0)} kun</b>\n"
+            f"Xavfsizlik zaxirasi: <b>{int(row.get('safety_days') or 0)} kun</b>\n"
+            f"Maqsadli qamrov: <b>{int(row.get('target_cover_days') or 30)} kun</b>\n"
+            f"Kam qoldiq chegarasi: <b>{int(row.get('low_stock_threshold') or 0)} dona</b>\n\n"
+            "Bot 7/14/30 kunlik savdo tezligini hisobga oladi."
+        )
+    return (
+        "🚚 <b>Параметры планирования поставки</b>\n\n"
+        f"Срок поставки: <b>{int(row.get('lead_time_days') or 0)} дн.</b>\n"
+        f"Страховой запас: <b>{int(row.get('safety_days') or 0)} дн.</b>\n"
+        f"Целевой запас: <b>{int(row.get('target_cover_days') or 30)} дн.</b>\n"
+        f"Порог низкого остатка: <b>{int(row.get('low_stock_threshold') or 0)} шт.</b>\n\n"
+        "Прогноз учитывает скорость продаж за 7, 14 и 30 дней."
+    )
+
+
+def supply_settings_markup(telegram_id: int) -> InlineKeyboardMarkup:
+    lang = get_user_language(telegram_id)
+    uz = lang == "uz"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=("🚚 Yetkazish kuni" if uz else "🚚 Срок поставки"), callback_data="autoedit:lead_time_days")],
+        [InlineKeyboardButton(text=("🛡 Xavfsizlik zaxirasi" if uz else "🛡 Страховой запас"), callback_data="autoedit:safety_days")],
+        [InlineKeyboardButton(text=("📦 Maqsadli zaxira" if uz else "📦 Целевой запас"), callback_data="autoedit:target_cover_days")],
+        [InlineKeyboardButton(text=("📉 Kam qoldiq" if uz else "📉 Порог остатка"), callback_data="autoedit:low_stock_threshold")],
+    ])
+
+
+def finance_settings_text(telegram_id: int, shop_id: int) -> str:
+    lang = get_user_language(telegram_id)
+    row = ensure_finance_settings(telegram_id, shop_id)
+    if lang == "uz":
+        return (
+            "🧮 <b>Sof foyda sozlamalari</b>\n\n"
+            f"🏪 Do‘kon: <code>{shop_id}</code>\n"
+            f"🏛 Soliq: <b>{float(row.get('tax_percent') or 0):.2f}%</b>\n"
+            f"📣 Reklama / oy: <b>{_format_money(float(row.get('advertising_monthly') or 0))}</b>\n"
+            f"🏬 Saqlash / oy: <b>{_format_money(float(row.get('storage_monthly') or 0))}</b>\n"
+            f"🧾 Boshqa / oy: <b>{_format_money(float(row.get('other_monthly') or 0))}</b>\n\n"
+            "Bu xarajatlar foyda hisobotiga va Excel fayliga qo‘shiladi."
+        )
+    return (
+        "🧮 <b>Настройки чистой прибыли</b>\n\n"
+        f"🏪 Магазин: <code>{shop_id}</code>\n"
+        f"🏛 Налог: <b>{float(row.get('tax_percent') or 0):.2f}%</b>\n"
+        f"📣 Реклама в месяц: <b>{_format_money(float(row.get('advertising_monthly') or 0))}</b>\n"
+        f"🏬 Хранение в месяц: <b>{_format_money(float(row.get('storage_monthly') or 0))}</b>\n"
+        f"🧾 Другие расходы в месяц: <b>{_format_money(float(row.get('other_monthly') or 0))}</b>\n\n"
+        "Эти расходы учитываются в отчёте прибыли и управленческом Excel."
+    )
+
+
+def finance_settings_markup(telegram_id: int) -> InlineKeyboardMarkup:
+    lang = get_user_language(telegram_id)
+    uz = lang == "uz"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=("🏛 Soliq %" if uz else "🏛 Налог %"), callback_data="autoedit:tax_percent")],
+        [InlineKeyboardButton(text=("📣 Reklama" if uz else "📣 Реклама"), callback_data="autoedit:advertising_monthly")],
+        [InlineKeyboardButton(text=("🏬 Saqlash" if uz else "🏬 Хранение"), callback_data="autoedit:storage_monthly")],
+        [InlineKeyboardButton(text=("🧾 Boshqa xarajat" if uz else "🧾 Другие расходы"), callback_data="autoedit:other_monthly")],
+    ])
+
+
+@dp.message(Command("automation", "notification_settings", "auto_reports"))
+@dp.message(F.text.in_({"⚙️ Настроить уведомления", "⚙️ Xabarnomalarni sozlash", "📅 Автоотчёты", "📅 Avtohisobotlar"}))
+async def automation_settings_screen(message: Message) -> None:
+    section = "reports" if str(message.text or "") in {"📅 Автоотчёты", "📅 Avtohisobotlar"} else "main"
+    await notification_hub_screen(message, section=section)
+
+
+async def notification_hub_screen(message: Message, *, section: str = "main") -> None:
+    telegram_id = upsert_from_message(message)
+    if not await require_active_subscription(message, telegram_id):
+        return
+    if section in NOTIFICATION_SECTION_FIELDS:
+        text = notification_section_text(telegram_id, section)
+        markup = notification_section_markup(telegram_id, section)
+    else:
+        text = notification_hub_text(telegram_id)
+        markup = notification_hub_markup(telegram_id)
+    await message.answer(text, reply_markup=markup)
+
+
+@dp.callback_query(F.data.startswith("notifyhub:"))
+async def notification_hub_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user:
+        return
+    telegram_id = int(callback.from_user.id)
+    section = str(callback.data or "").split(":", 1)[-1]
+    if section != "main" and section not in NOTIFICATION_SECTION_FIELDS:
+        await callback.answer("Неизвестный раздел", show_alert=True)
+        return
+    if callback.message:
+        if section == "main":
+            await callback.message.edit_text(
+                notification_hub_text(telegram_id),
+                reply_markup=notification_hub_markup(telegram_id),
+            )
+        else:
+            await callback.message.edit_text(
+                notification_section_text(telegram_id, section),
+                reply_markup=notification_section_markup(telegram_id, section),
+            )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("notifytoggle:"))
+async def notification_hub_toggle_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user:
+        return
+    telegram_id = int(callback.from_user.id)
+    parts = str(callback.data or "").split(":")
+    if len(parts) != 3:
+        await callback.answer("Неизвестная настройка", show_alert=True)
+        return
+    section, field = parts[1], parts[2]
+    allowed = field == "notify_reviews" and section == "main"
+    if section in NOTIFICATION_SECTION_FIELDS and field in NOTIFICATION_SECTION_FIELDS[section]:
+        allowed = True
+    if not allowed or field not in AUTOMATION_BOOL_FIELDS:
+        await callback.answer("Неизвестная настройка", show_alert=True)
+        return
+    row = ensure_product_settings(telegram_id)
+    update_product_setting(telegram_id, field, 0 if int(row.get(field) or 0) else 1)
+    if callback.message:
+        if section == "main":
+            await callback.message.edit_text(
+                notification_hub_text(telegram_id),
+                reply_markup=notification_hub_markup(telegram_id),
+            )
+        else:
+            await callback.message.edit_text(
+                notification_section_text(telegram_id, section),
+                reply_markup=notification_section_markup(telegram_id, section),
+            )
+    await callback.answer("Saqlandi" if get_user_language(telegram_id) == "uz" else "Сохранено")
+
+
+@dp.message(Command("sales_notify_mode", "sales_notifications"))
+async def sales_mode_screen(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    if not await require_active_subscription(message, telegram_id):
+        return
+    await message.answer(
+        sales_mode_selection_text(telegram_id),
+        reply_markup=sales_mode_selection_markup(telegram_id),
+    )
+
+
+@dp.callback_query(F.data.startswith("salesmode:"))
+async def sales_mode_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user:
+        return
+    telegram_id = int(callback.from_user.id)
+    parts = str(callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    back_to = parts[2] if len(parts) > 2 else "automation"
+    lang = get_user_language(telegram_id)
+
+    if action == "menu":
+        if callback.message:
+            await callback.message.edit_text(
+                sales_mode_selection_text(telegram_id),
+                reply_markup=sales_mode_selection_markup(telegram_id, back_to=back_to),
+            )
+        await callback.answer()
+        return
+
+    if action == "back":
+        if callback.message:
+            if back_to == "sales":
+                await callback.message.edit_text(
+                    notification_section_text(telegram_id, "sales"),
+                    reply_markup=notification_section_markup(telegram_id, "sales"),
+                )
+            else:
+                await callback.message.edit_text(
+                    automation_settings_text(telegram_id),
+                    reply_markup=automation_settings_markup(telegram_id),
+                )
+        await callback.answer()
+        return
+
+    if action not in SALES_NOTIFICATION_MODES:
+        await callback.answer(
+            "Noma’lum rejim" if normalize_lang(lang) == "uz" else "Неизвестный режим",
+            show_alert=True,
+        )
+        return
+
+    set_sales_notification_mode(telegram_id, action)
+    shop_id = db.get_default_shop_id(telegram_id)
+    if shop_id is not None:
+        reset_sales_digest_schedule(
+            telegram_id,
+            int(shop_id),
+            now=_utc_now(),
+            clear_queue=True,
+        )
+    if callback.message:
+        if back_to == "sales":
+            await callback.message.edit_text(
+                notification_section_text(telegram_id, "sales"),
+                reply_markup=notification_section_markup(telegram_id, "sales"),
+            )
+        else:
+            await callback.message.edit_text(
+                automation_settings_text(telegram_id),
+                reply_markup=automation_settings_markup(telegram_id),
+            )
+    labels = {
+        "instant": ("Режим: продажи сразу", "Rejim: savdolar darhol"),
+        "hourly": ("Режим: сводка раз в час", "Rejim: har soatda hisobot"),
+        "off": ("Уведомления о продажах выключены", "Savdo xabarlari o‘chirildi"),
+    }
+    ru_text, uz_text = labels[action]
+    await callback.answer(uz_text if normalize_lang(lang) == "uz" else ru_text)
+
+
+@dp.message(Command("loss_defect_notify_status", "warehouse_loss_notifications"))
+@dp.message(F.text.in_({"🧭 Потери и брак", "🧭 Yo‘qotish va yaroqsiz"}))
+async def loss_defect_notification_status(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    telegram_id, _, shop_id = req
+    settings = ensure_product_settings(telegram_id)
+    lang = get_user_language(telegram_id)
+    initialized = operational_watcher_initialized(telegram_id, shop_id, "loss_defect")
+    if lang == "uz":
+        text = (
+            "🧭 <b>Yo‘qotish va yaroqsiz tovar xabarnomalari</b>\n\n"
+            f"Do‘kon: <code>{shop_id}</code>\n"
+            f"Yo‘qotish: {_toggle_icon(settings.get('notify_losses'))}\n"
+            f"Yaroqsiz: {_toggle_icon(settings.get('notify_defects'))}\n"
+            f"Tekshiruv: har <b>{max(300, LOSS_DEFECT_CHECK_INTERVAL_SECONDS)}</b> soniyada\n"
+            f"Holat: {'boshlang‘ich ma’lumot saqlangan' if initialized else 'keyingi tekshiruvda boshlanadi'}\n\n"
+            "Bot quantityMissing va quantityDefected oshganda xabar beradi."
+        )
+    else:
+        text = (
+            "🧭 <b>Уведомления о потерях и браке</b>\n\n"
+            f"Магазин: <code>{shop_id}</code>\n"
+            f"Потери: {_toggle_icon(settings.get('notify_losses'))}\n"
+            f"Брак: {_toggle_icon(settings.get('notify_defects'))}\n"
+            f"Проверка каждые: <b>{max(300, LOSS_DEFECT_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
+            f"Состояние: {'исходные значения сохранены' if initialized else 'инициализация при следующей проверке'}\n\n"
+            "Бот уведомит при увеличении quantityMissing или quantityDefected."
+        )
+    await message.answer(text, reply_markup=notify_menu_for_message(message))
+
+
+@dp.message(Command("fbo_acceptance_notify_status", "fbo_acceptance_notifications"))
+@dp.message(F.text.in_({"🚚 Приёмка FBO", "🚚 FBO qabuli"}))
+async def fbo_acceptance_notification_status(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    telegram_id, _, shop_id = req
+    settings = ensure_product_settings(telegram_id)
+    lang = get_user_language(telegram_id)
+    initialized = operational_watcher_initialized(telegram_id, shop_id, "fbo_acceptance")
+    if lang == "uz":
+        text = (
+            "🚚 <b>FBO qabul xabarnomalari</b>\n\n"
+            f"Do‘kon: <code>{shop_id}</code>\n"
+            f"Holat: {_toggle_icon(settings.get('notify_fbo_acceptance'))}\n"
+            f"Tekshiruv: har <b>{max(300, FBO_ACCEPTANCE_CHECK_INTERVAL_SECONDS)}</b> soniyada\n"
+            f"Nazorat: {'faol' if initialized else 'keyingi tekshiruvda boshlanadi'}\n\n"
+            "To‘liq qabul qilinsa qisqa xabar, farq bo‘lsa muammoli tovarlar PDF fayli keladi."
+        )
+    else:
+        text = (
+            "🚚 <b>Уведомления о приёмке FBO</b>\n\n"
+            f"Магазин: <code>{shop_id}</code>\n"
+            f"Статус: {_toggle_icon(settings.get('notify_fbo_acceptance'))}\n"
+            f"Проверка каждые: <b>{max(300, FBO_ACCEPTANCE_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
+            f"Контроль: {'активен' if initialized else 'инициализация при следующей проверке'}\n\n"
+            "При полной приёмке придёт краткое уведомление, при расхождении — PDF со списком товаров."
+        )
+    await message.answer(text, reply_markup=notify_menu_for_message(message))
+
+
+@dp.message(Command("supply_settings", "replenishment_settings"))
+@dp.message(F.text.in_({
+    "⚙️ Параметры поставки",
+    "⚙️ Yetkazish sozlamasi",
+    "🚚 Настройки поставки",
+    "🚚 Yetkazish sozlamalari",
+}))
+async def supply_settings_screen(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    if not await require_active_subscription(message, telegram_id):
+        return
+    await message.answer(supply_settings_text(telegram_id), reply_markup=supply_settings_markup(telegram_id))
+
+
+@dp.message(Command("finance_settings", "expenses_settings"))
+@dp.message(F.text.in_({"🧮 Расходы и налоги", "🧮 Xarajat va soliq"}))
+async def finance_settings_screen(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    telegram_id, _, shop_id = req
+    await message.answer(
+        finance_settings_text(telegram_id, shop_id),
+        reply_markup=finance_settings_markup(telegram_id),
+    )
+
+
+@dp.callback_query(F.data.startswith("autotoggle:"))
+async def automation_toggle_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user:
+        return
+    telegram_id = int(callback.from_user.id)
+    field = str(callback.data or "").split(":", 1)[-1]
+    if field not in AUTOMATION_BOOL_FIELDS:
+        await callback.answer("Неизвестная настройка", show_alert=True)
+        return
+    row = ensure_product_settings(telegram_id)
+    update_product_setting(telegram_id, field, 0 if int(row.get(field) or 0) else 1)
+    if callback.message:
+        await callback.message.edit_text(
+            automation_settings_text(telegram_id),
+            reply_markup=automation_settings_markup(telegram_id),
+        )
+    await callback.answer("Сохранено")
+
+
+@dp.callback_query(F.data.startswith("autoedit:"))
+@dp.callback_query(F.data.startswith("notifyedit:"))
+async def automation_edit_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user:
+        return
+    telegram_id = int(callback.from_user.id)
+    parts = str(callback.data or "").split(":")
+    if parts and parts[0] == "notifyedit" and len(parts) == 3:
+        return_section = parts[1]
+        field = parts[2]
+    else:
+        field = parts[1] if len(parts) > 1 else ""
+        if field in {"lead_time_days", "safety_days", "target_cover_days"}:
+            return_section = "supply"
+        elif field in FINANCE_NUMERIC_LIMITS:
+            return_section = "finance"
+        else:
+            return_section = "automation"
+    if field not in PRODUCT_NUMERIC_LIMITS and field not in FINANCE_NUMERIC_LIMITS:
+        await callback.answer("Неизвестная настройка", show_alert=True)
+        return
+    lang = get_user_language(telegram_id)
+    prompts_ru = {
+        "daily_hour": "Введите час ежедневного отчёта: от 0 до 23.",
+        "weekly_weekday": "Введите день недели: 1 — понедельник, 7 — воскресенье.",
+        "weekly_hour": "Введите час еженедельного отчёта: от 0 до 23.",
+        "monthly_day": "Введите день месяца: от 1 до 28.",
+        "monthly_hour": "Введите час ежемесячного отчёта: от 0 до 23.",
+        "low_stock_threshold": "Введите порог низкого остатка в штуках.",
+        "lead_time_days": "Через сколько дней товар обычно приезжает на склад?",
+        "safety_days": "На сколько дней нужен страховой запас?",
+        "target_cover_days": "На сколько дней продаж формировать рекомендуемую поставку?",
+        "tax_percent": "Введите налог в процентах, например 4.",
+        "advertising_monthly": "Введите средние расходы на рекламу за месяц в сумах.",
+        "storage_monthly": "Введите расходы на хранение за месяц в сумах.",
+        "other_monthly": "Введите другие ежемесячные расходы в сумах.",
+    }
+    prompts_uz = {
+        "daily_hour": "Kunlik hisobot soatini kiriting: 0 dan 23 gacha.",
+        "weekly_weekday": "Hafta kunini kiriting: 1 — dushanba, 7 — yakshanba.",
+        "weekly_hour": "Haftalik hisobot soatini kiriting: 0 dan 23 gacha.",
+        "monthly_day": "Oy kunini kiriting: 1 dan 28 gacha.",
+        "monthly_hour": "Oylik hisobot soatini kiriting: 0 dan 23 gacha.",
+        "low_stock_threshold": "Kam qoldiq chegarasini dona bilan kiriting.",
+        "lead_time_days": "Tovar omborga odatda necha kunda yetib keladi?",
+        "safety_days": "Necha kunlik xavfsizlik zaxirasi kerak?",
+        "target_cover_days": "Tavsiya etilgan yetkazish necha kunlik savdoga yetsin?",
+        "tax_percent": "Soliq foizini kiriting, masalan 4.",
+        "advertising_monthly": "Bir oylik reklama xarajatini so‘mda kiriting.",
+        "storage_monthly": "Bir oylik saqlash xarajatini so‘mda kiriting.",
+        "other_monthly": "Boshqa oylik xarajatlarni so‘mda kiriting.",
+    }
+    await state.set_state(ProductSettingsStates.waiting_for_value)
+    await state.update_data(product_setting_field=field, product_setting_return_section=return_section)
+    if callback.message:
+        await callback.message.answer(
+            (prompts_uz if lang == "uz" else prompts_ru)[field],
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="❌ Bekor qilish" if lang == "uz" else "❌ Отмена",
+                    callback_data="settingeditcancel",
+                )
+            ]]),
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settingeditcancel")
+async def automation_edit_cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user:
+        return
+    telegram_id = int(callback.from_user.id)
+    await state.clear()
+    if callback.message:
+        await callback.message.edit_text(
+            "Bekor qilindi." if get_user_language(telegram_id) == "uz" else "Изменение отменено."
+        )
+    await callback.answer()
+
+
+@dp.message(ProductSettingsStates.waiting_for_value)
+async def product_setting_value_received(message: Message, state: FSMContext) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    data = await state.get_data()
+    field = str(data.get("product_setting_field") or "")
+    return_section = str(data.get("product_setting_return_section") or "automation")
+    raw = str(message.text or "").strip().replace(" ", "").replace(",", ".")
+    try:
+        value = float(raw)
+    except ValueError:
+        await message.answer("Son kiriting." if lang == "uz" else "Введите число.")
+        return
+    limits = PRODUCT_NUMERIC_LIMITS.get(field) or FINANCE_NUMERIC_LIMITS.get(field)
+    if not limits or not (limits[0] <= value <= limits[1]):
+        await message.answer(
+            f"Qiymat {limits[0]:g} dan {limits[1]:g} gacha bo‘lishi kerak."
+            if lang == "uz" and limits
+            else f"Допустимое значение: от {limits[0]:g} до {limits[1]:g}." if limits
+            else "Неизвестная настройка.",
+        )
+        return
+    if field == "weekly_weekday":
+        value -= 1
+    if field in PRODUCT_NUMERIC_LIMITS:
+        update_product_setting(telegram_id, field, int(value))
+        await state.clear()
+        if field in {"lead_time_days", "safety_days", "target_cover_days"}:
+            await message.answer(supply_settings_text(telegram_id), reply_markup=supply_settings_markup(telegram_id))
+        elif return_section in NOTIFICATION_SECTION_FIELDS:
+            await message.answer(
+                notification_section_text(telegram_id, return_section),
+                reply_markup=notification_section_markup(telegram_id, return_section),
+            )
+        else:
+            await message.answer(automation_settings_text(telegram_id), reply_markup=automation_settings_markup(telegram_id))
+        return
+    shop_id = db.get_default_shop_id(telegram_id)
+    if shop_id is None:
+        await state.clear()
+        await message.answer("Avval do‘konni ulang." if lang == "uz" else "Сначала подключите магазин.", reply_markup=menu_for_message(message))
+        return
+    update_finance_setting(telegram_id, int(shop_id), field, value)
+    await state.clear()
+    await message.answer(
+        finance_settings_text(telegram_id, int(shop_id)),
+        reply_markup=finance_settings_markup(telegram_id),
+    )
+
+
+# --- Денежный центр действий и прозрачная оценка пользы ---
+def _finance_rows_for_last_days(
+    rows: list[dict[str, Any]],
+    days: int,
+    *,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    now_local = now or datetime.now(UZT)
+    if now_local.tzinfo is not None:
+        now_naive = now_local.astimezone(UZT).replace(tzinfo=None)
+    else:
+        now_naive = now_local
+    cutoff = now_naive - timedelta(days=max(1, int(days)))
+    dated: list[dict[str, Any]] = []
+    unknown: list[dict[str, Any]] = []
+    for item in rows:
+        dt = _finance_datetime_for_report(item)
+        if dt is None:
+            unknown.append(item)
+        elif dt >= cutoff:
+            dated.append(item)
+    return dated if dated else unknown
+
+
+async def _collect_business_control_data(
+    telegram_id: int,
+    client: UzumClient,
+    shop_id: int,
+) -> dict[str, Any]:
+    date_from, date_to = _days_range_ms(30)
+    finance_rows, _, source_info = await _load_finance_range_flexible(
+        client,
+        shop_id,
+        date_from,
+        date_to,
+    )
+    stats = _build_noorza_today_stats(finance_rows)
+    stats["cancelled_value"] = sum(
+        _finance_gross_revenue(item)
+        for item in finance_rows
+        if _is_cancelled_status(_finance_status(item))
+    )
+    costs = get_unit_cost_map(telegram_id, shop_id)
+    product_rows = _build_unit_rows_from_finance(finance_rows, costs)
+    stock_raw = await load_sku_rows(client, shop_id, max_pages=50)
+    sales_7 = _finance_rows_for_last_days(finance_rows, 7)
+    stock_rows, _ = _build_stock_report_rows(stock_raw, sales_7)
+    settings = ensure_product_settings(telegram_id)
+    replenishment = build_replenishment_plan(stock_raw, finance_rows, settings)
+    plan_by_key: dict[str, dict[str, Any]] = {}
+    for plan_item in replenishment:
+        for key in _stock_match_keys(plan_item.get("row") or {}):
+            plan_by_key[key] = plan_item
+    for stock_item in stock_rows:
+        stock_item["low_stock_threshold"] = int(settings.get("low_stock_threshold") or 0)
+        plan_item = next(
+            (plan_by_key[key] for key in _stock_match_keys(stock_item) if key in plan_by_key),
+            None,
+        )
+        if plan_item:
+            stock_item.update({
+                "risk_value": float(plan_item.get("risk_value") or 0),
+                "recommended_qty": int(plan_item.get("recommended_qty") or 0),
+                "reorder_date": plan_item.get("reorder_date"),
+                "avg_daily": float(plan_item.get("avg_daily") or 0),
+                "days_left": plan_item.get("days_left"),
+            })
+
+    loss_filters: list[str] = []
+    try:
+        loss_raw, loss_filters = await _load_all_time_loss_rows(client, shop_id)
+        _, lost_rows = _build_stock_report_rows(loss_raw, sales_7)
+    except Exception:
+        logging.exception("Control center: all-time losses failed user=%s shop=%s", telegram_id, shop_id)
+        lost_rows = []
+
+    stock_for_actions = [{**row, "missing": 0, "defected": 0} for row in stock_rows]
+    actions = _build_premium_actions(stock_for_actions + lost_rows, product_rows, stats)
+    visible_actions = sync_business_actions(telegram_id, shop_id, actions)
+    return {
+        "actions": visible_actions,
+        "all_actions": actions,
+        "replenishment": replenishment,
+        "stats": stats,
+        "products": product_rows,
+        "stock": stock_rows,
+        "lost": lost_rows,
+        "source_info": source_info,
+        "loss_filters": loss_filters,
+        "generated_at": datetime.now(UZT),
+    }
+
+
+def _business_center_text(
+    telegram_id: int,
+    shop_id: int,
+    data: dict[str, Any],
+) -> str:
+    lang = get_user_language(telegram_id)
+    actions = list(data.get("actions") or [])
+    total_effect = sum(max(0.0, float(item.get("amount") or 0)) for item in actions)
+    critical = sum(1 for item in actions if item.get("priority") == "critical")
+    warnings = sum(1 for item in actions if item.get("priority") == "warning")
+    generated = data.get("generated_at")
+    generated_text = generated.strftime("%d.%m.%Y %H:%M") if isinstance(generated, datetime) else "—"
+    if lang == "uz":
+        lines = [
+            "🚨 <b>Hozir muhim</b>",
+            f"🏪 Do‘kon: <code>{shop_id}</code>",
+            f"🕒 Yangilandi: {generated_text}",
+            "",
+            f"💰 Potensial xavf summasi: <b>{_format_money(total_effect)}</b>",
+            f"🔴 Jiddiy: <b>{critical}</b> | 🟡 Diqqat: <b>{warnings}</b>",
+        ]
+        if not actions:
+            lines.extend(["", "✅ Hozir faol muammo topilmadi yoki ular vaqtincha yashirilgan."])
+        else:
+            lines.extend(["", "<b>Avval nima qilish kerak:</b>"])
+            for index, action in enumerate(actions[:8], start=1):
+                amount = float(action.get("amount") or 0)
+                amount_text = _format_money(amount) if amount > 0 else "baholanmagan"
+                lines.extend([
+                    "",
+                    f"{index}. <b>{escape(str(action.get('category_uz') or 'Vazifa'))}</b> — <b>{amount_text}</b>",
+                    f"📦 {escape(_short_text(str(action.get('title') or '—'), 75))}",
+                    f"⚠️ {escape(str(action.get('problem_uz') or ''))}",
+                    f"➡️ {escape(str(action.get('recommendation_uz') or ''))}",
+                ])
+        lines.extend(["", "ℹ️ Summa — kafolatlangan tejash emas, mavjud ma’lumotlar bo‘yicha potensial ta’sir."])
+        return "\n".join(lines)
+
+    lines = [
+        "🚨 <b>Важно сейчас</b>",
+        f"🏪 Магазин: <code>{shop_id}</code>",
+        f"🕒 Обновлено: {generated_text}",
+        "",
+        f"💰 Потенциально под риском: <b>{_format_money(total_effect)}</b>",
+        f"🔴 Критично: <b>{critical}</b> | 🟡 Внимание: <b>{warnings}</b>",
+    ]
+    if not actions:
+        lines.extend(["", "✅ Активных проблем сейчас не найдено либо они временно отложены."])
+    else:
+        lines.extend(["", "<b>Что сделать в первую очередь:</b>"])
+        for index, action in enumerate(actions[:8], start=1):
+            amount = float(action.get("amount") or 0)
+            amount_text = _format_money(amount) if amount > 0 else "эффект не оценён"
+            lines.extend([
+                "",
+                f"{index}. <b>{escape(str(action.get('category_ru') or 'Задача'))}</b> — <b>{amount_text}</b>",
+                f"📦 {escape(_short_text(str(action.get('title') or '—'), 75))}",
+                f"⚠️ {escape(str(action.get('problem_ru') or ''))}",
+                f"➡️ {escape(str(action.get('recommendation_ru') or ''))}",
+            ])
+    lines.extend(["", "ℹ️ Сумма — потенциальный эффект по доступным данным, а не гарантированная экономия."])
+    return "\n".join(lines)
+
+
+def _business_center_markup(
+    telegram_id: int,
+    shop_id: int,
+    actions: list[dict[str, Any]],
+) -> InlineKeyboardMarkup:
+    lang = get_user_language(telegram_id)
+    uz = lang == "uz"
+    rows: list[list[InlineKeyboardButton]] = []
+    for index, action in enumerate(actions[:3], start=1):
+        key = str(action.get("action_key") or "")
+        rows.append([
+            InlineKeyboardButton(
+                text=f"✅ {index} {'bajarildi' if uz else 'решено'}",
+                callback_data=f"biz:resolved:{shop_id}:{key}",
+            ),
+            InlineKeyboardButton(
+                text=f"⏰ {index} {'3 kun' if uz else 'на 3 дня'}",
+                callback_data=f"biz:snoozed:{shop_id}:{key}",
+            ),
+        ])
+    rows.append([
+        InlineKeyboardButton(text=("🔄 Yangilash" if uz else "🔄 Обновить"), callback_data=f"biz:refresh:{shop_id}"),
+        InlineKeyboardButton(text=("📈 Bot foydasi" if uz else "📈 Польза бота"), callback_data=f"biz:value:{shop_id}"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _render_business_center(
+    target: Message,
+    telegram_id: int,
+    client: UzumClient,
+    shop_id: int,
+    *,
+    edit: bool = False,
+) -> dict[str, Any]:
+    data = await _collect_business_control_data(telegram_id, client, shop_id)
+    text = _business_center_text(telegram_id, shop_id, data)
+    markup = _business_center_markup(telegram_id, shop_id, list(data.get("actions") or []))
+    if edit:
+        try:
+            await target.edit_text(text, reply_markup=markup)
+        except Exception:
+            await target.answer(text, reply_markup=markup)
+    else:
+        await target.answer(text, reply_markup=markup)
+    return data
+
+
+@dp.message(Command("control_center", "business_actions", "money_actions"))
+@dp.message(F.text.in_({"💼 Центр действий", "💼 Amallar markazi"}))
+async def business_control_center(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    telegram_id, client, shop_id = req
+    lang = get_user_language(telegram_id)
+    await message.answer(
+        "⌛ Do‘kon tekshirilmoqda..." if lang == "uz" else "⌛ Проверяю магазин и расставляю приоритеты...",
+        reply_markup=attention_menu_for_message(message),
+    )
+    try:
+        await _render_business_center(message, telegram_id, client, shop_id)
+    except Exception as exc:
+        await send_api_error(message, exc)
+
+
+def _business_value_text(
+    telegram_id: int,
+    shop_id: int,
+    data: dict[str, Any],
+) -> str:
+    lang = get_user_language(telegram_id)
+    actions = list(data.get("actions") or [])
+    active_total = sum(max(0.0, float(item.get("amount") or 0)) for item in actions)
+    resolved_total = resolved_business_value(telegram_id, shop_id)
+    categories: dict[str, float] = {}
+    for item in actions:
+        name = str(
+            (item.get("category_uz") if lang == "uz" else item.get("category_ru"))
+            or "—"
+        )
+        categories[name] = categories.get(name, 0.0) + max(0.0, float(item.get("amount") or 0))
+    top_categories = sorted(categories.items(), key=lambda pair: pair[1], reverse=True)[:5]
+    if lang == "uz":
+        lines = [
+            "📈 <b>Botning biznes uchun foydasi</b>",
+            f"🏪 Do‘kon: <code>{shop_id}</code>",
+            "",
+            f"🎯 Hozir nazoratdagi potensial summa: <b>{_format_money(active_total)}</b>",
+            f"✅ Shu oy bajarilgan vazifalar summasi: <b>{_format_money(resolved_total)}</b>",
+            f"📋 Faol vazifalar: <b>{len(actions)}</b>",
+        ]
+        if top_categories:
+            lines.extend(["", "<b>Asosiy manbalar:</b>"])
+            lines.extend(f"• {escape(name)}: <b>{_format_money(amount)}</b>" for name, amount in top_categories)
+        lines.extend(["", "ℹ️ Bu ko‘rsatkichlar potensial ta’sir va bajarilgan vazifalarni ko‘rsatadi; bankdagi haqiqiy tejash emas."])
+        return "\n".join(lines)
+    lines = [
+        "📈 <b>Польза бота для бизнеса</b>",
+        f"🏪 Магазин: <code>{shop_id}</code>",
+        "",
+        f"🎯 Сейчас под контролем: <b>{_format_money(active_total)}</b>",
+        f"✅ Сумма отмеченных решёнными задач за месяц: <b>{_format_money(resolved_total)}</b>",
+        f"📋 Активных задач: <b>{len(actions)}</b>",
+    ]
+    if top_categories:
+        lines.extend(["", "<b>Основные источники потенциального эффекта:</b>"])
+        lines.extend(f"• {escape(name)}: <b>{_format_money(amount)}</b>" for name, amount in top_categories)
+    lines.extend(["", "ℹ️ Это оценка потенциального влияния и выполненных задач, а не подтверждённая банковская экономия."])
+    return "\n".join(lines)
+
+
+@dp.message(Command("bot_value", "value_report", "roi"))
+@dp.message(F.text.in_({"📈 Польза бота", "📈 Bot foydasi", "📈 Эффект рекомендаций", "📈 Tavsiyalar ta’siri"}))
+async def business_value_report(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    telegram_id, client, shop_id = req
+    lang = get_user_language(telegram_id)
+    await message.answer("⌛ Foyda hisoblanmoqda..." if lang == "uz" else "⌛ Считаю потенциальную пользу...", reply_markup=attention_menu_for_message(message))
+    try:
+        data = await _collect_business_control_data(telegram_id, client, shop_id)
+        await message.answer(
+            _business_value_text(telegram_id, shop_id, data),
+            reply_markup=_business_center_markup(telegram_id, shop_id, list(data.get("actions") or [])),
+        )
+    except Exception as exc:
+        await send_api_error(message, exc)
+
+
+def _user_has_shop(telegram_id: int, shop_id: int) -> bool:
+    return any(int(row["shop_id"]) == int(shop_id) for row in db.list_shops(telegram_id))
+
+
+@dp.callback_query(F.data.startswith("biz:"))
+async def business_action_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user or not callback.message:
+        return
+    telegram_id = int(callback.from_user.id)
+    parts = str(callback.data or "").split(":")
+    if len(parts) < 3 or not parts[2].isdigit():
+        await callback.answer("Некорректная команда", show_alert=True)
+        return
+    operation = parts[1]
+    shop_id = int(parts[2])
+    if not _user_has_shop(telegram_id, shop_id):
+        await callback.answer("Магазин недоступен", show_alert=True)
+        return
+    lang = get_user_language(telegram_id)
+    if operation in {"resolved", "snoozed"}:
+        if len(parts) < 4:
+            await callback.answer("Задача не найдена", show_alert=True)
+            return
+        ok = update_business_action_state(telegram_id, shop_id, parts[3], operation)
+        if not ok:
+            await callback.answer(
+                "Vazifa topilmadi yoki allaqachon yangilangan"
+                if lang == "uz"
+                else "Задача не найдена или уже обновлена",
+                show_alert=True,
+            )
+            return
+        await callback.answer(
+            ("Bajarildi" if operation == "resolved" else "3 kunga qoldirildi")
+            if lang == "uz"
+            else ("Отмечено решённым" if operation == "resolved" else "Отложено на 3 дня"),
+        )
+    else:
+        await callback.answer("Yangilanmoqda..." if lang == "uz" else "Обновляю...")
+    client = get_uzum_for_user(telegram_id)
+    if client is None:
+        return
+    try:
+        data = await _collect_business_control_data(telegram_id, client, shop_id)
+        if operation == "value":
+            text = _business_value_text(telegram_id, shop_id, data)
+        else:
+            text = _business_center_text(telegram_id, shop_id, data)
+        await callback.message.edit_text(
+            text,
+            reply_markup=_business_center_markup(telegram_id, shop_id, list(data.get("actions") or [])),
+        )
+    except Exception:
+        logging.exception("Business action callback failed user=%s shop=%s", telegram_id, shop_id)
+
+
+@dp.message(F.text.in_({"🚚 План поставки", "🚚 Yetkazib berish rejasi"}))
+async def supply_plan_button(message: Message) -> None:
+    await smart_lowstock(message)
 
 
 @dp.message(F.text)
@@ -12049,32 +14985,31 @@ async def friendly_auto_start(message: Message, state: FSMContext) -> None:
     if current_state:
         if lang == "uz":
             await message.answer(
-                "Men sizni tushundim. Agar jarayonni bekor qilmoqchi bo‘lsangiz, <code>/cancel</code> yuboring.\n"
-                "Asosiy menyu quyida 👇",
+                "Hozir bot avvalgi amal uchun ma’lumot kutmoqda. Oldingi ko‘rsatmaga muvofiq javob bering "
+                "yoki ekrandagi <b>Bekor qilish</b> tugmasini bosing.",
                 reply_markup=menu_for_message(message),
             )
         else:
             await message.answer(
-                "Я вас понял. Если хотите отменить текущий шаг, отправьте <code>/cancel</code>.\n"
-                "Главное меню ниже 👇",
+                "Сейчас бот ждёт данные для предыдущего действия. Ответьте по подсказке выше "
+                "или нажмите кнопку <b>Отмена</b>, если она показана.",
                 reply_markup=menu_for_message(message),
             )
         return
 
     ensure_subscription(telegram_id)
+    connected = db.has_uzum_connection(telegram_id)
     if lang == "uz":
         text = (
-            "👋 <b>Uzum Seller Assistant</b>\n\n"
-            "Botdan foydalanishni boshlash uchun pastdagi menyudan kerakli bo‘limni tanlang.\n\n"
-            "🔌 Agar do‘kon hali ulanmagan bo‘lsa — <b>Ulash</b> tugmasini bosing.\n"
-            "🎥 API ulash videosi ham menyuda bor."
+            "Bu xabarni amal sifatida tanimadim. Kerakli bo‘limni pastdagi tugmalar orqali tanlang 👇"
+            if connected
+            else "Avval <b>🎥 Qanday ulash kerak</b>, so‘ng <b>🔌 Do‘konni ulash</b> tugmasini bosing 👇"
         )
     else:
         text = (
-            "👋 <b>Uzum Seller Assistant</b>\n\n"
-            "Чтобы начать пользоваться ботом, выберите нужный раздел в меню ниже.\n\n"
-            "🔌 Если магазин ещё не подключён — нажмите <b>Подключить</b>.\n"
-            "🎥 Видеоинструкция по API тоже есть в меню."
+            "Не распознал это как действие. Выберите нужный раздел кнопкой внизу 👇"
+            if connected
+            else "Сначала нажмите <b>🎥 Как подключить</b>, затем <b>🔌 Подключить магазин</b> 👇"
         )
     await message.answer(text, reply_markup=menu_for_message(message))
 
@@ -12584,23 +15519,511 @@ def save_sale_statuses(telegram_id: int, shop_id: int, statuses: dict[str, str])
                 for identity, status in statuses.items()
             ],
         )
+        conn.execute(
+            """
+            DELETE FROM sale_status_watch
+            WHERE telegram_id = ? AND shop_id = ? AND updated_at < ?
+            """,
+            (
+                int(telegram_id),
+                int(shop_id),
+                _dt_to_db(_utc_now() - timedelta(days=30)) or "",
+            ),
+        )
         conn.commit()
 
 
 init_sale_status_watch_table()
 
 
+def _sales_digest_product_title(item: dict[str, Any]) -> str:
+    for field in ("productTitle", "productName", "offerName", "title", "name", "skuTitle"):
+        value = _deep_pick_value(item, (field,))
+        if isinstance(value, dict):
+            value = pick(value, "title", "name", "value")
+        if value not in (None, ""):
+            return str(value)
+    return _finance_title(item)
+
+
+def _sales_digest_event(
+    item: dict[str, Any],
+    *,
+    detected_at: datetime | None = None,
+) -> dict[str, Any]:
+    normalized = _normalize_finance_row(item)
+    sold_at = normalized.get("date")
+    if isinstance(sold_at, datetime) and sold_at.tzinfo is None:
+        sold_at = sold_at.replace(tzinfo=UZT)
+    detected = detected_at or _utc_now()
+    payout = max(0.0, float(normalized.get("payout") or 0))
+    return {
+        "event_key": sale_key(item),
+        "identity_key": finance_identity_key(item),
+        "order_id": str(normalized.get("order_id") or "-"),
+        "product_title": _sales_digest_product_title(item),
+        "sku_title": str(normalized.get("sku") or _finance_sku_title(item) or "-"),
+        "quantity": max(0.0, float(normalized.get("qty") or 0)),
+        "revenue": max(0.0, float(normalized.get("revenue") or 0)),
+        "commission": max(0.0, float(normalized.get("commission") or 0)),
+        "logistics": max(0.0, float(normalized.get("logistics") or 0)),
+        "payout": payout,
+        "sold_at": _dt_to_db(sold_at) if isinstance(sold_at, datetime) else None,
+        "detected_at": _dt_to_db(detected) or "",
+    }
+
+
+def enqueue_sales_digest_events(
+    telegram_id: int,
+    shop_id: int,
+    items: list[dict[str, Any]],
+    *,
+    detected_at: datetime | None = None,
+) -> int:
+    if not items:
+        return 0
+    init_product_value_tables()
+    detected = detected_at or _utc_now()
+    events = [_sales_digest_event(item, detected_at=detected) for item in items]
+    cutoff = _dt_to_db(detected - timedelta(days=7)) or ""
+    with db.connect() as conn:
+        before = conn.total_changes
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO sales_digest_queue (
+                telegram_id, shop_id, event_key, identity_key, order_id,
+                product_title, sku_title, quantity, revenue, commission,
+                logistics, payout, sold_at, detected_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    int(telegram_id),
+                    int(shop_id),
+                    event["event_key"],
+                    event["identity_key"],
+                    event["order_id"],
+                    event["product_title"],
+                    event["sku_title"],
+                    event["quantity"],
+                    event["revenue"],
+                    event["commission"],
+                    event["logistics"],
+                    event["payout"],
+                    event["sold_at"],
+                    event["detected_at"],
+                )
+                for event in events
+            ],
+        )
+        inserted = conn.total_changes - before
+        conn.execute(
+            """
+            DELETE FROM sales_digest_queue
+            WHERE telegram_id = ? AND shop_id = ? AND detected_at < ?
+            """,
+            (int(telegram_id), int(shop_id), cutoff),
+        )
+        conn.commit()
+    return max(0, int(inserted))
+
+
+def discard_sales_digest_events(
+    telegram_id: int,
+    shop_id: int,
+    identity_keys: Iterable[str],
+) -> int:
+    values = sorted({str(value) for value in identity_keys if str(value)})
+    if not values:
+        return 0
+    init_product_value_tables()
+    deleted = 0
+    with db.connect() as conn:
+        for offset in range(0, len(values), 500):
+            chunk = values[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            cursor = conn.execute(
+                f"""
+                DELETE FROM sales_digest_queue
+                WHERE telegram_id = ? AND shop_id = ?
+                  AND identity_key IN ({placeholders})
+                """,
+                (int(telegram_id), int(shop_id), *chunk),
+            )
+            deleted += max(0, int(cursor.rowcount or 0))
+        conn.commit()
+    return deleted
+
+
+def reset_sales_digest_schedule(
+    telegram_id: int,
+    shop_id: int,
+    *,
+    now: datetime | None = None,
+    clear_queue: bool = False,
+) -> None:
+    init_product_value_tables()
+    now_text = _dt_to_db(now or _utc_now()) or ""
+    with db.connect() as conn:
+        if clear_queue:
+            conn.execute(
+                "DELETE FROM sales_digest_queue WHERE telegram_id = ? AND shop_id = ?",
+                (int(telegram_id), int(shop_id)),
+            )
+        conn.execute(
+            """
+            INSERT INTO sales_digest_state
+                (telegram_id, shop_id, last_sent_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id, shop_id) DO UPDATE SET
+                last_sent_at = excluded.last_sent_at,
+                updated_at = excluded.updated_at
+            """,
+            (int(telegram_id), int(shop_id), now_text, now_text),
+        )
+        conn.commit()
+
+
+def get_sales_digest_last_sent(
+    telegram_id: int,
+    shop_id: int,
+    *,
+    now: datetime | None = None,
+) -> datetime:
+    init_product_value_tables()
+    current = now or _utc_now()
+    with db.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT last_sent_at
+            FROM sales_digest_state
+            WHERE telegram_id = ? AND shop_id = ?
+            """,
+            (int(telegram_id), int(shop_id)),
+        ).fetchone()
+    parsed = _dt_from_db(row["last_sent_at"]) if row else None
+    if parsed is not None:
+        return parsed
+    reset_sales_digest_schedule(telegram_id, shop_id, now=current)
+    return current
+
+
+def _sales_digest_summary_from_events(
+    events: list[dict[str, Any]],
+    *,
+    shop_id: int,
+    period_start: datetime,
+    period_end: datetime,
+) -> dict[str, Any]:
+    order_ids = {
+        str(event.get("order_id"))
+        for event in events
+        if str(event.get("order_id") or "") not in {"", "-", "—"}
+    }
+    products: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in events:
+        title = str(event.get("product_title") or "Без названия")
+        sku = str(event.get("sku_title") or "-")
+        product = products.setdefault(
+            (title, sku),
+            {"title": title, "sku": sku, "quantity": 0.0, "revenue": 0.0},
+        )
+        product["quantity"] = float(product["quantity"]) + float(event.get("quantity") or 0)
+        product["revenue"] = float(product["revenue"]) + float(event.get("revenue") or 0)
+    positions = len(events)
+    revenue = sum(float(event.get("revenue") or 0) for event in events)
+    orders = len(order_ids) or positions
+    return {
+        "shop_id": int(shop_id),
+        "positions": positions,
+        "orders": orders,
+        "units": sum(float(event.get("quantity") or 0) for event in events),
+        "revenue": revenue,
+        "commission": sum(float(event.get("commission") or 0) for event in events),
+        "logistics": sum(float(event.get("logistics") or 0) for event in events),
+        "payout": sum(float(event.get("payout") or 0) for event in events),
+        "average_check": revenue / max(1, orders),
+        "product_count": len(products),
+        "top_products": sorted(
+            products.values(),
+            key=lambda value: (float(value.get("revenue") or 0), float(value.get("quantity") or 0)),
+            reverse=True,
+        )[:5],
+        "period_start": period_start,
+        "period_end": period_end,
+    }
+
+
+def summarize_sales_digest_items(
+    items: list[dict[str, Any]],
+    *,
+    shop_id: int,
+    period_start: datetime,
+    period_end: datetime,
+) -> dict[str, Any]:
+    events = [_sales_digest_event(item, detected_at=period_end) for item in items]
+    return _sales_digest_summary_from_events(
+        events,
+        shop_id=shop_id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+
+
+def load_sales_digest_summary(
+    telegram_id: int,
+    shop_id: int,
+    *,
+    period_start: datetime,
+    period_end: datetime,
+) -> dict[str, Any]:
+    init_product_value_tables()
+    params = (int(telegram_id), int(shop_id))
+    with db.connect() as conn:
+        totals = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS positions,
+                COUNT(DISTINCT CASE
+                    WHEN order_id IS NOT NULL AND order_id NOT IN ('', '-', '—')
+                    THEN order_id END
+                ) AS orders,
+                COALESCE(SUM(quantity), 0) AS units,
+                COALESCE(SUM(revenue), 0) AS revenue,
+                COALESCE(SUM(commission), 0) AS commission,
+                COALESCE(SUM(logistics), 0) AS logistics,
+                COALESCE(SUM(payout), 0) AS payout,
+                COUNT(DISTINCT COALESCE(product_title, '') || char(31) || COALESCE(sku_title, ''))
+                    AS product_count
+            FROM sales_digest_queue
+            WHERE telegram_id = ? AND shop_id = ?
+            """,
+            params,
+        ).fetchone()
+        top_rows = conn.execute(
+            """
+            SELECT
+                COALESCE(product_title, 'Без названия') AS title,
+                COALESCE(sku_title, '-') AS sku,
+                COALESCE(SUM(quantity), 0) AS quantity,
+                COALESCE(SUM(revenue), 0) AS revenue
+            FROM sales_digest_queue
+            WHERE telegram_id = ? AND shop_id = ?
+            GROUP BY product_title, sku_title
+            ORDER BY revenue DESC, quantity DESC
+            LIMIT 5
+            """,
+            params,
+        ).fetchall()
+    positions = int(totals["positions"] or 0) if totals else 0
+    orders = int(totals["orders"] or 0) if totals else 0
+    revenue = float(totals["revenue"] or 0) if totals else 0.0
+    return {
+        "shop_id": int(shop_id),
+        "positions": positions,
+        "orders": orders or positions,
+        "units": float(totals["units"] or 0) if totals else 0.0,
+        "revenue": revenue,
+        "commission": float(totals["commission"] or 0) if totals else 0.0,
+        "logistics": float(totals["logistics"] or 0) if totals else 0.0,
+        "payout": float(totals["payout"] or 0) if totals else 0.0,
+        "average_check": revenue / max(1, orders or positions),
+        "product_count": int(totals["product_count"] or 0) if totals else 0,
+        "top_products": [dict(row) for row in top_rows],
+        "period_start": period_start,
+        "period_end": period_end,
+    }
+
+
+def _sales_digest_period_text(start: datetime, end: datetime, lang: str) -> str:
+    start_local = start.astimezone(UZT) if start.tzinfo else start.replace(tzinfo=UZT)
+    end_local = end.astimezone(UZT) if end.tzinfo else end.replace(tzinfo=UZT)
+    if start_local.date() == end_local.date():
+        return f"{start_local:%d.%m.%Y}, {start_local:%H:%M}–{end_local:%H:%M}"
+    return f"{start_local:%d.%m %H:%M}–{end_local:%d.%m %H:%M}"
+
+
+def build_sales_digest_message(
+    summary: dict[str, Any],
+    *,
+    lang: str = "ru",
+    burst: bool = False,
+) -> str:
+    uz = normalize_lang(lang) == "uz"
+    period = _sales_digest_period_text(
+        summary.get("period_start") or _utc_now(),
+        summary.get("period_end") or _utc_now(),
+        lang,
+    )
+    positions = int(summary.get("positions") or 0)
+    orders = int(summary.get("orders") or positions)
+    units = float(summary.get("units") or 0)
+    product_count = int(summary.get("product_count") or 0)
+    top_products = list(summary.get("top_products") or [])
+    if uz:
+        lines = [
+            "🔥 <b>Savdolar oqimi bo‘yicha hisobot</b>" if burst else "🕐 <b>Soatlik savdo hisoboti</b>",
+            f"🏪 Do‘kon: <code>{int(summary.get('shop_id') or 0)}</code>",
+            f"🕒 Davr: <b>{period}</b>",
+            "",
+            f"🧾 Buyurtmalar: <b>{orders}</b> | Pozitsiyalar: <b>{positions}</b>",
+            f"📦 Sotildi: <b>{units:g} dona</b>",
+            f"💵 Tushum: <b>{_format_money(float(summary.get('revenue') or 0))}</b>",
+            f"🧮 O‘rtacha chek: <b>{_format_money(float(summary.get('average_check') or 0))}</b>",
+            f"🏷 Komissiya: <b>{_format_money(float(summary.get('commission') or 0))}</b>",
+            f"🚚 Logistika: <b>{_format_money(float(summary.get('logistics') or 0))}</b>",
+            f"✅ To‘lovga: <b>{_format_money(float(summary.get('payout') or 0))}</b>",
+        ]
+        if top_products:
+            lines.extend(["", "🏆 <b>Top tovarlar:</b>"])
+            for index, product in enumerate(top_products, start=1):
+                title = escape(_short_text(str(product.get("title") or product.get("sku") or "-"), 55))
+                lines.append(
+                    f"{index}. {title} — <b>{float(product.get('quantity') or 0):g} dona</b> · "
+                    f"{_format_money(float(product.get('revenue') or 0))}"
+                )
+        if product_count > len(top_products):
+            lines.append(f"Yana tovarlar: <b>{product_count - len(top_products)}</b>")
+        return "\n".join(lines)
+
+    lines = [
+        "🔥 <b>Сводка по потоку продаж</b>" if burst else "🕐 <b>Продажи за час</b>",
+        f"🏪 Магазин: <code>{int(summary.get('shop_id') or 0)}</code>",
+        f"🕒 Период: <b>{period}</b>",
+        "",
+        f"🧾 Заказов: <b>{orders}</b> | Позиций: <b>{positions}</b>",
+        f"📦 Продано: <b>{units:g} шт.</b>",
+        f"💵 Выручка: <b>{_format_money(float(summary.get('revenue') or 0))}</b>",
+        f"🧮 Средний чек: <b>{_format_money(float(summary.get('average_check') or 0))}</b>",
+        f"🏷 Комиссия: <b>{_format_money(float(summary.get('commission') or 0))}</b>",
+        f"🚚 Логистика: <b>{_format_money(float(summary.get('logistics') or 0))}</b>",
+        f"✅ К выплате: <b>{_format_money(float(summary.get('payout') or 0))}</b>",
+    ]
+    if top_products:
+        lines.extend(["", "🏆 <b>Топ товаров:</b>"])
+        for index, product in enumerate(top_products, start=1):
+            title = escape(_short_text(str(product.get("title") or product.get("sku") or "-"), 55))
+            lines.append(
+                f"{index}. {title} — <b>{float(product.get('quantity') or 0):g} шт.</b> · "
+                f"{_format_money(float(product.get('revenue') or 0))}"
+            )
+    if product_count > len(top_products):
+        lines.append(f"Ещё товаров: <b>{product_count - len(top_products)}</b>")
+    return "\n".join(lines)
+
+
+def mark_sales_digest_sent(
+    telegram_id: int,
+    shop_id: int,
+    *,
+    sent_at: datetime | None = None,
+    clear_queue: bool = True,
+) -> None:
+    init_product_value_tables()
+    now_text = _dt_to_db(sent_at or _utc_now()) or ""
+    with db.connect() as conn:
+        if clear_queue:
+            conn.execute(
+                "DELETE FROM sales_digest_queue WHERE telegram_id = ? AND shop_id = ?",
+                (int(telegram_id), int(shop_id)),
+            )
+        conn.execute(
+            """
+            INSERT INTO sales_digest_state
+                (telegram_id, shop_id, last_sent_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id, shop_id) DO UPDATE SET
+                last_sent_at = excluded.last_sent_at,
+                updated_at = excluded.updated_at
+            """,
+            (int(telegram_id), int(shop_id), now_text, now_text),
+        )
+        conn.commit()
+
+
+async def maybe_send_hourly_sales_digest(
+    telegram_id: int,
+    shop_id: int,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    current = now or _utc_now()
+    last_sent = get_sales_digest_last_sent(telegram_id, shop_id, now=current)
+    if current - last_sent < timedelta(seconds=SALES_DIGEST_INTERVAL_SECONDS):
+        return False
+    summary = load_sales_digest_summary(
+        telegram_id,
+        shop_id,
+        period_start=last_sent,
+        period_end=current,
+    )
+    if int(summary.get("positions") or 0) <= 0:
+        mark_sales_digest_sent(
+            telegram_id,
+            shop_id,
+            sent_at=current,
+            clear_queue=False,
+        )
+        return False
+    try:
+        await bot.send_message(
+            telegram_id,
+            build_sales_digest_message(
+                summary,
+                lang=get_user_language(telegram_id),
+            ),
+            reply_markup=main_menu_for_user(telegram_id),
+        )
+    except Exception:
+        logging.exception(
+            "Hourly sales digest: delivery failed user=%s shop=%s events=%s",
+            telegram_id,
+            shop_id,
+            summary.get("positions"),
+        )
+        return False
+    mark_sales_digest_sent(telegram_id, shop_id, sent_at=current)
+    logging.info(
+        "Hourly sales digest sent user=%s shop=%s orders=%s positions=%s units=%s revenue=%s",
+        telegram_id,
+        shop_id,
+        summary.get("orders"),
+        summary.get("positions"),
+        summary.get("units"),
+        summary.get("revenue"),
+    )
+    return True
+
+
+_sales_watch_initialized_scopes: set[tuple[int, int]] = set()
+_sales_full_scan_at_by_group: dict[str, float] = {}
+
+
 # Финальное переопределение. sales_watch_loop использует именно эту версию.
 async def check_new_sales_once() -> None:
     now = _utc_now()
-    # Проверяем не только сегодня: покупатель может отменить вчерашний или более старый заказ.
-    date_from = int((now - timedelta(days=7)).timestamp() * 1000)
     date_to = int(now.timestamp() * 1000)
 
-    for group in connected_watch_groups():
+    for group in connected_watch_groups("notify_sales", "notify_cancellations"):
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(x) for x in group["telegram_ids"]]
+        watch_key = _watch_group_key(group)
+        last_full_scan = _sales_full_scan_at_by_group.get(watch_key)
+        full_scan = (
+            last_full_scan is None
+            or time.monotonic() - last_full_scan >= SALES_WATCH_FULL_SCAN_INTERVAL_SECONDS
+        )
+        if full_scan:
+            # Полная сверка нужна для отмен старых заказов, но раз в час достаточно.
+            date_from = int((now - timedelta(days=7)).timestamp() * 1000)
+            max_pages = 10
+        else:
+            # Частый опрос смотрит только свежее окно и создаёт заметно меньше страниц API.
+            date_from = int(
+                (now - timedelta(hours=SALES_WATCH_FAST_LOOKBACK_HOURS)).timestamp() * 1000
+            )
+            max_pages = 5
 
         try:
             token = cipher.decrypt(encrypted_token)
@@ -12610,26 +16033,34 @@ async def check_new_sales_once() -> None:
                 shop_id,
                 date_from_ms=date_from,
                 date_to_ms=date_to,
-                max_pages=10,
+                max_pages=max_pages,
                 page_size=100,
             )
-        except Exception:
-            logging.exception(
-                "Sales/cancel watcher: failed to check shop=%s users=%s",
-                shop_id,
-                telegram_ids,
+            if full_scan:
+                _sales_full_scan_at_by_group[watch_key] = time.monotonic()
+                logging.info(
+                    "Sales watcher full reconciliation completed shop=%s rows=%s next_full_in=%ss",
+                    shop_id,
+                    len(rows),
+                    SALES_WATCH_FULL_SCAN_INTERVAL_SECONDS,
+                )
+        except Exception as error:
+            _log_watcher_api_failure(
+                "Sales/cancel watcher",
+                error,
+                shop_id=shop_id,
+                telegram_ids=telegram_ids,
             )
-            await asyncio.sleep(3)
             continue
 
-        keys_now = [sale_key(item) for item in rows]
         identity_status_now = {
             finance_identity_key(item): _finance_status(item)
             for item in rows
         }
 
         for telegram_id in telegram_ids:
-            known = _seen_sale_keys_by_user.setdefault(telegram_id, set())
+            sales_mode = get_sales_notification_mode(telegram_id)
+            cancellations_enabled = product_setting_enabled(telegram_id, "notify_cancellations")
             status_memory = _sale_status_by_user.setdefault(telegram_id, {})
 
             # Загружаем статусы из SQLite. Они не пропадают после SIGTERM.
@@ -12637,65 +16068,134 @@ async def check_new_sales_once() -> None:
             if saved_statuses:
                 status_memory.update(saved_statuses)
 
-            first_ever_snapshot = not saved_statuses and telegram_id not in _sales_watch_initialized
+            # Первый снимок фиксируется отдельно, поэтому даже магазин без единой продажи
+            # не потеряет свою первую будущую продажу после перезапуска бота.
+            sales_baseline_ready = operational_watcher_initialized(
+                telegram_id,
+                shop_id,
+                "sales",
+            )
+            first_ever_snapshot = not saved_statuses and not sales_baseline_ready
 
             cancel_rows: list[dict[str, Any]] = []
-            if CANCEL_NOTIFICATIONS and not first_ever_snapshot:
+            if cancellations_enabled and not first_ever_snapshot:
                 for item in rows:
                     ident = finance_identity_key(item)
                     current_status = _finance_status(item)
                     previous_status = status_memory.get(ident)
-
-                    # Уведомляем только о реальном переходе известной строки в отмену.
                     if (
-                        previous_status is not None
-                        and _is_cancelled_status(current_status)
-                        and not _is_cancelled_status(str(previous_status))
+                        _is_cancelled_status(current_status)
+                        and (
+                            previous_status is None
+                            or not _is_cancelled_status(str(previous_status))
+                        )
                     ):
                         cancel_rows.append(item)
 
-            # Новые продажи по-прежнему отслеживаем, но отменённые как продажу не отправляем.
-            if telegram_id not in _sales_watch_initialized:
-                known.update(keys_now)
-                _sales_watch_initialized.add(telegram_id)
-                logging.info(
-                    "Sales watcher initialized for user=%s shop=%s sales_rows=%s saved_statuses=%s",
-                    telegram_id,
-                    shop_id,
-                    len(keys_now),
-                    len(saved_statuses),
-                )
+            if first_ever_snapshot:
                 new_rows: list[dict[str, Any]] = []
             else:
                 new_rows = [
-                    item for item, key in zip(rows, keys_now)
-                    if key not in known and not _is_cancelled_status(_finance_status(item))
+                    item
+                    for item in rows
+                    if finance_identity_key(item) not in saved_statuses
+                    and not _is_cancelled_status(_finance_status(item))
+                    and not _is_returned_status(_finance_status(item))
                 ]
-                known.update(keys_now)
+
+            scope = (telegram_id, shop_id)
+            if scope not in _sales_watch_initialized_scopes:
+                _sales_watch_initialized_scopes.add(scope)
+                _sales_watch_initialized.add(telegram_id)
+                logging.info(
+                    "Sales watcher initialized for user=%s shop=%s sales_rows=%s "
+                    "saved_statuses=%s mode=%s",
+                    telegram_id,
+                    shop_id,
+                    len(rows),
+                    len(saved_statuses),
+                    sales_mode,
+                )
+
+            no_longer_sales = [
+                finance_identity_key(item)
+                for item in rows
+                if _is_cancelled_status(_finance_status(item))
+                or _is_returned_status(_finance_status(item))
+            ]
+            if no_longer_sales:
+                discard_sales_digest_events(
+                    telegram_id,
+                    shop_id,
+                    no_longer_sales,
+                )
+
+            if sales_mode == "hourly" and new_rows:
+                inserted = enqueue_sales_digest_events(
+                    telegram_id,
+                    shop_id,
+                    new_rows,
+                    detected_at=now,
+                )
+                logging.info(
+                    "Hourly sales digest queued user=%s shop=%s detected=%s inserted=%s",
+                    telegram_id,
+                    shop_id,
+                    len(new_rows),
+                    inserted,
+                )
 
             status_memory.update(identity_status_now)
             save_sale_statuses(telegram_id, shop_id, identity_status_now)
+            if not sales_baseline_ready:
+                mark_operational_watcher_initialized(
+                    telegram_id,
+                    shop_id,
+                    "sales",
+                )
 
-            if len(known) > 5000:
-                _seen_sale_keys_by_user[telegram_id] = set(keys_now)
+            if sales_mode == "instant":
+                for item in new_rows[:INSTANT_SALE_BURST_LIMIT]:
+                    try:
+                        await bot.send_message(
+                            telegram_id,
+                            build_new_sale_message(
+                                item,
+                                shop_id=shop_id,
+                                lang=get_user_language(telegram_id),
+                            ),
+                            reply_markup=main_menu_for_user(telegram_id),
+                        )
+                        await asyncio.sleep(0.15)
+                    except Exception:
+                        logging.exception(
+                            "Sales watcher: failed to send sale notification to %s",
+                            telegram_id,
+                        )
 
-            for item in new_rows[:10]:
-                try:
-                    await bot.send_message(
-                        telegram_id,
-                        build_new_sale_message(
-                            item,
-                            shop_id=shop_id,
-                            lang=get_user_language(telegram_id),
-                        ),
-                        reply_markup=main_menu_for_user(telegram_id),
+                overflow = new_rows[INSTANT_SALE_BURST_LIMIT:]
+                if overflow:
+                    summary = summarize_sales_digest_items(
+                        overflow,
+                        shop_id=shop_id,
+                        period_start=now - timedelta(seconds=max(60, SALE_CHECK_INTERVAL_SECONDS)),
+                        period_end=now,
                     )
-                    await asyncio.sleep(0.15)
-                except Exception:
-                    logging.exception(
-                        "Sales watcher: failed to send sale notification to %s",
-                        telegram_id,
-                    )
+                    try:
+                        await bot.send_message(
+                            telegram_id,
+                            build_sales_digest_message(
+                                summary,
+                                lang=get_user_language(telegram_id),
+                                burst=True,
+                            ),
+                            reply_markup=main_menu_for_user(telegram_id),
+                        )
+                    except Exception:
+                        logging.exception(
+                            "Sales watcher: failed to send burst summary to %s",
+                            telegram_id,
+                        )
 
             for item in cancel_rows[:10]:
                 try:
@@ -12722,9 +16222,1056 @@ async def check_new_sales_once() -> None:
                         telegram_id,
                     )
 
+            if len(cancel_rows) > 10:
+                lang = get_user_language(telegram_id)
+                extra = len(cancel_rows) - 10
+                text = (
+                    f"➕ Yana bekor qilingan buyurtmalar: <b>{extra}</b>\n"
+                    "Batafsil: <code>/balance</code>"
+                    if normalize_lang(lang) == "uz"
+                    else f"➕ Ещё отмен за эту проверку: <b>{extra}</b>\n"
+                    "Подробно: <code>/balance</code>"
+                )
+                try:
+                    await bot.send_message(
+                        telegram_id,
+                        text,
+                        reply_markup=main_menu_for_user(telegram_id),
+                    )
+                except Exception:
+                    logging.exception(
+                        "Sales watcher: failed to send cancel overflow to %s",
+                        telegram_id,
+                    )
+
+            if sales_mode == "hourly":
+                await maybe_send_hourly_sales_digest(
+                    telegram_id,
+                    shop_id,
+                    now=now,
+                )
+
         await asyncio.sleep(0.5)
 
 
+# --- Операционные уведомления: потери/брак и приёмка FBO ---
+def _loss_watch_snapshot(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    snapshot: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        key = _loss_row_key(row)
+        snapshot[key] = {
+            "sku_key": key,
+            "product_title": str(
+                row.get("product_title")
+                or row.get("sku_full_title")
+                or row.get("sku_title")
+                or "Без названия"
+            ),
+            "sku_title": str(row.get("sku_full_title") or row.get("sku_title") or ""),
+            "sku_id": str(row.get("sku_id") or row.get("seller_item_code") or ""),
+            "barcode": str(row.get("barcode") or ""),
+            "missing_qty": _loss_qty(row, "missing"),
+            "defected_qty": _loss_qty(row, "defected"),
+            "price": max(0.0, float(_num_from_value(row.get("price")) or 0)),
+        }
+    return snapshot
+
+
+def calculate_loss_defect_changes(
+    previous: dict[str, dict[str, Any]],
+    current: dict[str, dict[str, Any]],
+    *,
+    notify_losses: bool,
+    notify_defects: bool,
+) -> list[dict[str, Any]]:
+    changes: list[dict[str, Any]] = []
+    for key, item in current.items():
+        old = previous.get(key) or {}
+        missing_delta = max(
+            0,
+            int(item.get("missing_qty") or 0) - int(old.get("missing_qty") or 0),
+        )
+        defected_delta = max(
+            0,
+            int(item.get("defected_qty") or 0) - int(old.get("defected_qty") or 0),
+        )
+        visible_missing = missing_delta if notify_losses else 0
+        visible_defected = defected_delta if notify_defects else 0
+        if visible_missing <= 0 and visible_defected <= 0:
+            continue
+        price = max(0.0, float(item.get("price") or 0))
+        changes.append({
+            **item,
+            "sku_key": key,
+            "missing_delta": visible_missing,
+            "defected_delta": visible_defected,
+            "estimated_value": price * (visible_missing + visible_defected),
+        })
+    changes.sort(
+        key=lambda item: (
+            -float(item.get("estimated_value") or 0),
+            -(int(item.get("missing_delta") or 0) + int(item.get("defected_delta") or 0)),
+            str(item.get("product_title") or ""),
+        )
+    )
+    return changes
+
+
+def build_loss_defect_notification(
+    shop_id: int,
+    changes: list[dict[str, Any]],
+    *,
+    lang: str = "ru",
+) -> str:
+    shown = changes[:15]
+    total_missing = sum(int(item.get("missing_delta") or 0) for item in changes)
+    total_defected = sum(int(item.get("defected_delta") or 0) for item in changes)
+    total_value = sum(float(item.get("estimated_value") or 0) for item in changes)
+    if normalize_lang(lang) == "uz":
+        lines = [
+            "🚨 <b>FBO omborida yangi yo‘qotish yoki yaroqsiz tovar</b>",
+            f"🏪 Do‘kon: <code>{shop_id}</code>",
+            f"🧭 Yangi yo‘qotish: <b>+{total_missing} dona</b>",
+            f"🧪 Yangi yaroqsiz: <b>+{total_defected} dona</b>",
+        ]
+        if total_value > 0:
+            lines.append(f"💰 Sotuv narxi bo‘yicha baho: <b>{_format_money(total_value)}</b>")
+        for index, item in enumerate(shown, start=1):
+            sku = item.get("sku_id") or item.get("barcode") or item.get("sku_title") or "—"
+            lines.extend([
+                "",
+                f"{index}. <b>{escape(_short_text(item.get('product_title'), 70))}</b>",
+                f"SKU: <code>{escape(_short_text(sku, 80))}</code>",
+            ])
+            if int(item.get("missing_delta") or 0) > 0:
+                lines.append(
+                    f"🧭 Yo‘qotildi: <b>+{int(item['missing_delta'])}</b> "
+                    f"(jami {int(item.get('missing_qty') or 0)})"
+                )
+            if int(item.get("defected_delta") or 0) > 0:
+                lines.append(
+                    f"🧪 Yaroqsiz: <b>+{int(item['defected_delta'])}</b> "
+                    f"(jami {int(item.get('defected_qty') or 0)})"
+                )
+        if len(changes) > len(shown):
+            lines.extend(["", f"Yana o‘zgarishlar: <b>{len(changes) - len(shown)}</b>"])
+        lines.extend(["", "Barcha yig‘ma yo‘qotishlar: <code>/lost</code>"])
+        return "\n".join(lines)
+
+    lines = [
+        "🚨 <b>Новые потери или брак на складе FBO</b>",
+        f"🏪 Магазин: <code>{shop_id}</code>",
+        f"🧭 Новые потери: <b>+{total_missing} шт.</b>",
+        f"🧪 Новый брак: <b>+{total_defected} шт.</b>",
+    ]
+    if total_value > 0:
+        lines.append(f"💰 Оценка по цене продажи: <b>{_format_money(total_value)}</b>")
+    for index, item in enumerate(shown, start=1):
+        sku = item.get("sku_id") or item.get("barcode") or item.get("sku_title") or "—"
+        lines.extend([
+            "",
+            f"{index}. <b>{escape(_short_text(item.get('product_title'), 70))}</b>",
+            f"SKU: <code>{escape(_short_text(sku, 80))}</code>",
+        ])
+        if int(item.get("missing_delta") or 0) > 0:
+            lines.append(
+                f"🧭 Потеряно: <b>+{int(item['missing_delta'])}</b> "
+                f"(всего {int(item.get('missing_qty') or 0)})"
+            )
+        if int(item.get("defected_delta") or 0) > 0:
+            lines.append(
+                f"🧪 Брак: <b>+{int(item['defected_delta'])}</b> "
+                f"(всего {int(item.get('defected_qty') or 0)})"
+            )
+    if len(changes) > len(shown):
+        lines.extend(["", f"Ещё изменений: <b>{len(changes) - len(shown)}</b>"])
+    lines.extend(["", "Все накопительные потери: <code>/lost</code>"])
+    return "\n".join(lines)
+
+
+def _fbo_first_value(item: dict[str, Any], paths: tuple[str, ...]) -> tuple[Any, bool]:
+    for path in paths:
+        value = _value_by_path(item, path)
+        if value not in (None, ""):
+            return value, True
+    return None, False
+
+
+def _fbo_invoice_watch_key(invoice: dict[str, Any]) -> str:
+    invoice_id = _invoice_id(invoice)
+    if invoice_id not in (None, ""):
+        return f"id:{invoice_id}"
+    raw = "|".join(
+        str(value or "")
+        for value in (
+            _invoice_number(invoice),
+            _value_by_path(invoice, "dateCreated", "createdAt", "creationDate"),
+            _value_by_path(invoice, "totalToStock", "quantityToStock", "totalQuantity"),
+        )
+    )
+    return "hash:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:20]
+
+
+def _fbo_invoice_quantities(invoice: dict[str, Any]) -> tuple[float, float, bool]:
+    planned_value, _ = _fbo_first_value(
+        invoice,
+        ("totalToStock", "quantityToStock", "totalQuantity", "plannedQuantity"),
+    )
+    accepted_value, accepted_known = _fbo_first_value(
+        invoice,
+        ("totalAccepted", "quantityAccepted", "acceptedQuantity"),
+    )
+    return (
+        max(0.0, _num_any(planned_value)),
+        max(0.0, _num_any(accepted_value)),
+        accepted_known,
+    )
+
+
+def fbo_invoice_acceptance_is_terminal(invoice: dict[str, Any]) -> bool:
+    accepted_date = _value_by_path(invoice, "dateAccepted", "acceptedAt", "acceptanceDate")
+    if accepted_date not in (None, ""):
+        return True
+    status = _invoice_status(invoice).strip().upper()
+    if not status or status == "—":
+        return False
+    if any(token in status for token in ("CANCEL", "ОТМЕН", "BEKOR")):
+        return False
+    return any(
+        token in status
+        for token in (
+            "ACCEPTED",
+            "PARTIALLY_ACCEPTED",
+            "COMPLETED",
+            "FINISHED",
+            "CLOSED",
+            "RECEIVED",
+            "ПРИНЯТ",
+            "ЗАВЕРШ",
+            "ПОЛУЧЕН",
+            "QABUL",
+            "YAKUN",
+        )
+    )
+
+
+def _fbo_acceptance_items(products: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for product in products:
+        nested = _value_by_path(product, "skuForInvoiceDtoList", "skuList", "skus")
+        sources: list[tuple[dict[str, Any], dict[str, Any]]] = []
+        if isinstance(nested, list) and nested:
+            for sku in nested:
+                if isinstance(sku, dict):
+                    merged = dict(product)
+                    merged.update(sku)
+                    qty_source = merged if len(nested) == 1 else sku
+                    sources.append((merged, qty_source))
+        else:
+            sources.append((product, product))
+
+        for source, qty_source in sources:
+            planned_value, planned_known = _fbo_first_value(
+                qty_source,
+                ("quantityToStock", "toStock", "quantity", "plannedQuantity", "totalToStock"),
+            )
+            accepted_value, accepted_known = _fbo_first_value(
+                qty_source,
+                ("quantityAccepted", "accepted", "acceptedQuantity", "totalAccepted"),
+            )
+            defected_value, _ = _fbo_first_value(
+                qty_source,
+                (
+                    "quantityDefected",
+                    "defectedQuantity",
+                    "defectiveQuantity",
+                    "damagedQuantity",
+                ),
+            )
+            rejected_value, _ = _fbo_first_value(
+                qty_source,
+                (
+                    "quantityNotAccepted",
+                    "notAcceptedQuantity",
+                    "quantityRejected",
+                    "rejectedQuantity",
+                    "rejectQuantity",
+                ),
+            )
+            missing_value, _ = _fbo_first_value(
+                qty_source,
+                ("quantityMissing", "missingQuantity", "shortageQuantity"),
+            )
+            planned = max(0.0, _num_any(planned_value))
+            accepted = max(0.0, _num_any(accepted_value))
+            defected = max(0.0, _num_any(defected_value))
+            explicit_rejected = max(
+                max(0.0, _num_any(rejected_value)),
+                max(0.0, _num_any(missing_value)),
+                defected,
+            )
+            if not accepted_known and planned_known and explicit_rejected > 0:
+                accepted = max(0.0, planned - explicit_rejected)
+                accepted_known = True
+            difference = max(0.0, planned - accepted) if accepted_known else 0.0
+            not_accepted = max(difference, explicit_rejected)
+            title = str(
+                _value_by_path(source, "productTitle", "title", "product.name", "name")
+                or "Без названия"
+            )
+            sku = str(
+                _value_by_path(
+                    source,
+                    "skuId",
+                    "sku.id",
+                    "skuTitle",
+                    "skuName",
+                    "sellerItemCode",
+                    "barcode",
+                )
+                or "—"
+            )
+            barcode = str(_value_by_path(source, "barcode", "sku.barcode") or "")
+            reason_value = _value_by_path(
+                source,
+                "defectReason",
+                "rejectionReason",
+                "rejectReason",
+                "reason",
+                "comment",
+                "status",
+            )
+            reason = _status_text_any(reason_value) if isinstance(reason_value, dict) else str(reason_value or "")
+            if planned <= 0 and accepted <= 0 and not_accepted <= 0:
+                continue
+            rows.append({
+                "title": title,
+                "sku": sku,
+                "barcode": barcode,
+                "planned_qty": planned,
+                "accepted_qty": accepted,
+                "accepted_known": accepted_known,
+                "not_accepted_qty": not_accepted,
+                "defected_qty": defected,
+                "reason": reason,
+            })
+    rows.sort(
+        key=lambda item: (
+            -float(item.get("not_accepted_qty") or 0),
+            str(item.get("title") or ""),
+        )
+    )
+    return rows
+
+
+def summarize_fbo_acceptance(
+    invoice: dict[str, Any],
+    products: list[dict[str, Any]],
+    *,
+    shop_id: int,
+) -> dict[str, Any]:
+    items = _fbo_acceptance_items(products)
+    invoice_planned, invoice_accepted, invoice_accepted_known = _fbo_invoice_quantities(invoice)
+    product_planned = sum(float(item.get("planned_qty") or 0) for item in items)
+    known_items = [item for item in items if item.get("accepted_known")]
+    product_accepted = sum(float(item.get("accepted_qty") or 0) for item in known_items)
+    product_not_accepted = sum(float(item.get("not_accepted_qty") or 0) for item in items)
+    product_defected = sum(float(item.get("defected_qty") or 0) for item in items)
+
+    invoice_problem_value, _ = _fbo_first_value(
+        invoice,
+        (
+            "totalNotAccepted",
+            "quantityNotAccepted",
+            "totalRejected",
+            "rejectedQuantity",
+            "totalDefected",
+            "quantityDefected",
+        ),
+    )
+    invoice_problem = max(0.0, _num_any(invoice_problem_value))
+    planned = invoice_planned if invoice_planned > 0 else product_planned
+    accepted_known = invoice_accepted_known or bool(known_items)
+    accepted = invoice_accepted if invoice_accepted_known else product_accepted
+    difference = max(0.0, planned - accepted) if accepted_known else 0.0
+    not_accepted = max(difference, product_not_accepted, invoice_problem)
+    problem_items = [item for item in items if float(item.get("not_accepted_qty") or 0) > 0]
+    details_complete = not_accepted <= 0 or bool(problem_items)
+    if not_accepted > 0 and not problem_items:
+        problem_items = [{
+            "title": "Итого по накладной",
+            "sku": "—",
+            "barcode": "",
+            "planned_qty": planned,
+            "accepted_qty": accepted,
+            "accepted_known": accepted_known,
+            "not_accepted_qty": not_accepted,
+            "defected_qty": invoice_problem,
+            "reason": "Uzum API не передал разбивку расхождения по SKU",
+        }]
+
+    outcome = "discrepancy" if not_accepted > 0 else ("success" if planned > 0 and accepted_known else "unknown")
+    acceptance_rate = (accepted / planned * 100.0) if planned > 0 else 0.0
+    return {
+        "shop_id": int(shop_id),
+        "invoice_id": str(_invoice_id(invoice) or ""),
+        "invoice_number": _invoice_number(invoice),
+        "status": _invoice_status(invoice),
+        "accepted_date": _date_text_any(
+            _value_by_path(invoice, "dateAccepted", "acceptedAt", "acceptanceDate")
+        ),
+        "planned_qty": planned,
+        "accepted_qty": accepted,
+        "not_accepted_qty": not_accepted,
+        "defected_qty": product_defected if product_defected > 0 else invoice_problem,
+        "positions": len(items),
+        "items": items,
+        "problem_items": problem_items,
+        "details_complete": details_complete,
+        "acceptance_rate": acceptance_rate,
+        "outcome": outcome,
+    }
+
+
+def build_fbo_acceptance_notification(summary: dict[str, Any], *, lang: str = "ru") -> str:
+    uz = normalize_lang(lang) == "uz"
+    outcome = str(summary.get("outcome") or "unknown")
+    shop_id = int(summary.get("shop_id") or 0)
+    number = escape(str(summary.get("invoice_number") or summary.get("invoice_id") or "—"))
+    planned = _fmt_qty(summary.get("planned_qty"))
+    accepted = _fmt_qty(summary.get("accepted_qty"))
+    rejected = _fmt_qty(summary.get("not_accepted_qty"))
+    positions = int(summary.get("positions") or 0)
+    accepted_date = escape(str(summary.get("accepted_date") or "—"))
+    rate = float(summary.get("acceptance_rate") or 0)
+    positions_uz = (
+        f"📦 SKU pozitsiyalari: <b>{positions}</b>\n"
+        if positions > 0
+        else "📦 Tarkib: <b>Uzum API tafsilot bermadi</b>\n"
+    )
+    positions_ru = (
+        f"📦 SKU-позиций: <b>{positions}</b>\n"
+        if positions > 0
+        else "📦 Состав: <b>Uzum API не передал детализацию</b>\n"
+    )
+
+    if uz and outcome == "success":
+        return (
+            "✅ <b>FBO yetkazib berish to‘liq qabul qilindi</b>\n\n"
+            f"🏪 Do‘kon: <code>{shop_id}</code>\n"
+            f"📄 Yuk xati: <b>№{number}</b>\n"
+            f"{positions_uz}"
+            f"🚚 Yetkazildi: <b>{planned} dona</b>\n"
+            f"✅ Qabul qilindi: <b>{accepted} dona</b>\n"
+            f"📊 Qabul darajasi: <b>{rate:.1f}%</b>\n"
+            f"🕒 Yakunlandi: {accepted_date}\n\n"
+            "Barcha tovarlar farq va yaroqsiz holatsiz qabul qilindi."
+        )
+    if uz and outcome == "discrepancy":
+        details = "" if summary.get("details_complete") else "\n⚠️ Uzum SKU bo‘yicha to‘liq tafsilotni bermadi."
+        return (
+            "⚠️ <b>FBO qabuli farq bilan yakunlandi</b>\n\n"
+            f"🏪 Do‘kon: <code>{shop_id}</code>\n"
+            f"📄 Yuk xati: <b>№{number}</b>\n"
+            f"🚚 Yetkazildi: <b>{planned} dona</b>\n"
+            f"✅ Qabul qilindi: <b>{accepted} dona</b>\n"
+            f"🧪 Qabul qilinmadi / yaroqsiz: <b>{rejected} dona</b>\n"
+            f"📊 Qabul darajasi: <b>{rate:.1f}%</b>\n\n"
+            "📎 Muammoli tovarlar PDF faylda ko‘rsatilgan."
+            + details
+        )
+    if uz:
+        return (
+            "ℹ️ <b>FBO qabuli yakunlandi</b>\n\n"
+            f"🏪 Do‘kon: <code>{shop_id}</code>\n"
+            f"📄 Yuk xati: <b>№{number}</b>\n"
+            f"📌 Status: <b>{escape(str(summary.get('status') or '—'))}</b>\n\n"
+            "Uzum API yakuniy miqdorlarni bermadi; tafsilotlar keyingi tekshiruvda yangilanadi."
+        )
+
+    if outcome == "success":
+        return (
+            "✅ <b>Поставка FBO принята полностью</b>\n\n"
+            f"🏪 Магазин: <code>{shop_id}</code>\n"
+            f"📄 Накладная: <b>№{number}</b>\n"
+            f"{positions_ru}"
+            f"🚚 Передано: <b>{planned} шт.</b>\n"
+            f"✅ Принято: <b>{accepted} шт.</b>\n"
+            f"📊 Приёмка: <b>{rate:.1f}%</b>\n"
+            f"🕒 Завершено: {accepted_date}\n\n"
+            "Все товары приняты без расхождений и брака."
+        )
+    if outcome == "discrepancy":
+        details = "" if summary.get("details_complete") else "\n⚠️ Uzum не передал полную разбивку расхождения по SKU."
+        return (
+            "⚠️ <b>Приёмка FBO завершена с расхождениями</b>\n\n"
+            f"🏪 Магазин: <code>{shop_id}</code>\n"
+            f"📄 Накладная: <b>№{number}</b>\n"
+            f"🚚 Передано: <b>{planned} шт.</b>\n"
+            f"✅ Принято: <b>{accepted} шт.</b>\n"
+            f"🧪 Не принято / брак: <b>{rejected} шт.</b>\n"
+            f"📊 Приёмка: <b>{rate:.1f}%</b>\n\n"
+            "📎 Список проблемных товаров приложен в PDF."
+            + details
+        )
+    return (
+        "ℹ️ <b>Приёмка FBO завершена</b>\n\n"
+        f"🏪 Магазин: <code>{shop_id}</code>\n"
+        f"📄 Накладная: <b>№{number}</b>\n"
+        f"📌 Статус: <b>{escape(str(summary.get('status') or '—'))}</b>\n\n"
+        "Uzum API не передал итоговые количества; данные обновятся при следующей проверке."
+    )
+
+
+def _fbo_pdf_font_paths() -> tuple[Path, Path]:
+    configured = str(os.getenv("PDF_FONT_PATH", "") or "").strip()
+    regular_candidates = [
+        Path(configured) if configured else None,
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        Path("/usr/share/fonts/dejavu/DejaVuSans.ttf"),
+        Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
+    ]
+    regular = next((path for path in regular_candidates if path and path.exists()), None)
+    if regular is None:
+        raise RuntimeError("Не найден Unicode-шрифт для PDF. Укажите PDF_FONT_PATH.")
+    bold_candidates = [
+        regular.with_name(regular.name.replace(".ttf", "-Bold.ttf")),
+        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+        Path("/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"),
+        Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"),
+    ]
+    bold = next((path for path in bold_candidates if path.exists()), regular)
+    return regular, bold
+
+
+def build_fbo_acceptance_pdf(
+    summary: dict[str, Any],
+    output: str | Path | None = None,
+    *,
+    lang: str = "ru",
+) -> Path:
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+    from reportlab.lib.units import mm
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    regular_path, bold_path = _fbo_pdf_font_paths()
+    if "UzumReport" not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(TTFont("UzumReport", str(regular_path)))
+    if "UzumReportBold" not in pdfmetrics.getRegisteredFontNames():
+        pdfmetrics.registerFont(TTFont("UzumReportBold", str(bold_path)))
+
+    if output is None:
+        with tempfile.NamedTemporaryFile(prefix="fbo_acceptance_", suffix=".pdf", delete=False) as tmp:
+            output_path = Path(tmp.name)
+    else:
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    uz = normalize_lang(lang) == "uz"
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "FboTitle",
+        parent=styles["Title"],
+        fontName="UzumReportBold",
+        fontSize=18,
+        leading=22,
+        textColor=colors.HexColor("#17365D"),
+        alignment=TA_LEFT,
+        spaceAfter=8,
+    )
+    subtitle_style = ParagraphStyle(
+        "FboSubtitle",
+        parent=styles["BodyText"],
+        fontName="UzumReport",
+        fontSize=9,
+        leading=12,
+        textColor=colors.HexColor("#52657A"),
+    )
+    cell_style = ParagraphStyle(
+        "FboCell",
+        parent=styles["BodyText"],
+        fontName="UzumReport",
+        fontSize=8,
+        leading=10,
+        alignment=TA_LEFT,
+    )
+    cell_center = ParagraphStyle(
+        "FboCellCenter",
+        parent=cell_style,
+        alignment=TA_CENTER,
+    )
+    header_style = ParagraphStyle(
+        "FboHeader",
+        parent=cell_center,
+        fontName="UzumReportBold",
+        textColor=colors.white,
+    )
+
+    invoice_number = escape(str(summary.get("invoice_number") or summary.get("invoice_id") or "—"))
+    title = "FBO qabulidagi farqlar" if uz else "Расхождения при приёмке FBO"
+    subtitle = (
+        f"Do‘kon {int(summary.get('shop_id') or 0)} | Yuk xati №{invoice_number} | "
+        f"Yaratildi {datetime.now(UZT).strftime('%d.%m.%Y %H:%M')}"
+        if uz
+        else f"Магазин {int(summary.get('shop_id') or 0)} | Накладная №{invoice_number} | "
+        f"Сформировано {datetime.now(UZT).strftime('%d.%m.%Y %H:%M')}"
+    )
+    story: list[Any] = [Paragraph(title, title_style), Paragraph(subtitle, subtitle_style), Spacer(1, 5 * mm)]
+
+    summary_data = [
+        [
+            Paragraph("Yetkazildi" if uz else "Передано", header_style),
+            Paragraph("Qabul qilindi" if uz else "Принято", header_style),
+            Paragraph("Qabul qilinmadi" if uz else "Не принято", header_style),
+            Paragraph("Qabul foizi" if uz else "Процент приёмки", header_style),
+        ],
+        [
+            Paragraph(_fmt_qty(summary.get("planned_qty")), cell_center),
+            Paragraph(_fmt_qty(summary.get("accepted_qty")), cell_center),
+            Paragraph(_fmt_qty(summary.get("not_accepted_qty")), cell_center),
+            Paragraph(f"{float(summary.get('acceptance_rate') or 0):.1f}%", cell_center),
+        ],
+    ]
+    summary_table = Table(summary_data, colWidths=[46 * mm] * 4, repeatRows=1)
+    summary_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#17365D")),
+        ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#EEF4FA")),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#B7C9DD")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#B7C9DD")),
+        ("TOPPADDING", (0, 0), (-1, -1), 7),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+    ]))
+    story.extend([summary_table, Spacer(1, 6 * mm)])
+
+    headers = (
+        ("№", "Tovar", "SKU / shtrix", "Yetkazildi", "Qabul", "Qabul qilinmadi", "Yaroqsiz", "Sabab / status")
+        if uz
+        else ("№", "Товар", "SKU / штрихкод", "Передано", "Принято", "Не принято", "Брак", "Причина / статус")
+    )
+    table_data: list[list[Any]] = [[Paragraph(value, header_style) for value in headers]]
+    for index, item in enumerate(list(summary.get("problem_items") or []), start=1):
+        sku_text = str(item.get("sku") or "—")
+        if item.get("barcode") and str(item.get("barcode")) not in sku_text:
+            sku_text += f"\n{item['barcode']}"
+        reason = str(item.get("reason") or ("API sababni ko‘rsatmadi" if uz else "Причина не указана API"))
+        table_data.append([
+            Paragraph(str(index), cell_center),
+            Paragraph(escape(str(item.get("title") or "—")), cell_style),
+            Paragraph(escape(sku_text).replace("\n", "<br/>"), cell_style),
+            Paragraph(_fmt_qty(item.get("planned_qty")), cell_center),
+            Paragraph(_fmt_qty(item.get("accepted_qty")), cell_center),
+            Paragraph(_fmt_qty(item.get("not_accepted_qty")), cell_center),
+            Paragraph(_fmt_qty(item.get("defected_qty")), cell_center),
+            Paragraph(escape(reason), cell_style),
+        ])
+    detail_table = Table(
+        table_data,
+        colWidths=[10 * mm, 62 * mm, 34 * mm, 21 * mm, 21 * mm, 25 * mm, 19 * mm, 55 * mm],
+        repeatRows=1,
+        hAlign="LEFT",
+    )
+    detail_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#17365D")),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#F4F7FA")]),
+        ("BOX", (0, 0), (-1, -1), 0.5, colors.HexColor("#AABBCD")),
+        ("INNERGRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#CAD5E1")),
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(detail_table)
+    if not summary.get("details_complete"):
+        note = (
+            "Eslatma: Uzum API farqni SKU bo‘yicha to‘liq bermadi; umumiy ko‘rsatkich ko‘rsatildi."
+            if uz
+            else "Примечание: Uzum API не передал полную разбивку расхождения по SKU; показан общий итог."
+        )
+        story.extend([Spacer(1, 4 * mm), Paragraph(note, subtitle_style)])
+
+    doc = SimpleDocTemplate(
+        str(output_path),
+        pagesize=landscape(A4),
+        rightMargin=10 * mm,
+        leftMargin=10 * mm,
+        topMargin=10 * mm,
+        bottomMargin=13 * mm,
+        title=title,
+        author="Uzum Seller Assistant",
+    )
+
+    def footer(canvas: Any, document: Any) -> None:
+        canvas.saveState()
+        canvas.setFont("UzumReport", 8)
+        canvas.setFillColor(colors.HexColor("#6B7C8F"))
+        page_text = f"Sahifa {document.page}" if uz else f"Страница {document.page}"
+        canvas.drawRightString(landscape(A4)[0] - 10 * mm, 6 * mm, page_text)
+        canvas.drawString(10 * mm, 6 * mm, "Uzum Seller Assistant")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return output_path
+
+
+async def check_loss_defect_once() -> None:
+    for group in connected_watch_groups("notify_losses", "notify_defects"):
+        shop_id = int(group["shop_id"])
+        telegram_ids = [int(value) for value in group["telegram_ids"]]
+        try:
+            token = cipher.decrypt(group["uzum_token_encrypted"])
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            rows, unavailable_filters = await _load_all_time_loss_rows(client, shop_id)
+            current = _loss_watch_snapshot(rows)
+        except Exception as error:
+            _log_watcher_api_failure(
+                "Loss/defect watcher",
+                error,
+                shop_id=shop_id,
+                telegram_ids=telegram_ids,
+            )
+            continue
+
+        for telegram_id in telegram_ids:
+            initialized = operational_watcher_initialized(
+                telegram_id,
+                shop_id,
+                "loss_defect",
+            )
+            previous = load_product_loss_snapshot(telegram_id, shop_id)
+            if not initialized:
+                save_product_loss_snapshot(
+                    telegram_id,
+                    shop_id,
+                    current,
+                    reset_absent=not unavailable_filters,
+                )
+                mark_operational_watcher_initialized(
+                    telegram_id,
+                    shop_id,
+                    "loss_defect",
+                )
+                logging.info(
+                    "Loss/defect watcher initialized user=%s shop=%s skus=%s",
+                    telegram_id,
+                    shop_id,
+                    len(current),
+                )
+                continue
+
+            changes = calculate_loss_defect_changes(
+                previous,
+                current,
+                notify_losses=product_setting_enabled(telegram_id, "notify_losses"),
+                notify_defects=product_setting_enabled(telegram_id, "notify_defects"),
+            )
+            delivered = not changes
+            if changes:
+                try:
+                    await bot.send_message(
+                        telegram_id,
+                        build_loss_defect_notification(
+                            shop_id,
+                            changes,
+                            lang=get_user_language(telegram_id),
+                        ),
+                        reply_markup=main_menu_for_user(telegram_id),
+                    )
+                    delivered = True
+                    logging.info(
+                        "Loss/defect notification sent user=%s shop=%s changes=%s",
+                        telegram_id,
+                        shop_id,
+                        len(changes),
+                    )
+                    await asyncio.sleep(0.15)
+                except Exception:
+                    logging.exception(
+                        "Loss/defect watcher: delivery failed user=%s shop=%s",
+                        telegram_id,
+                        shop_id,
+                    )
+            if delivered:
+                save_product_loss_snapshot(
+                    telegram_id,
+                    shop_id,
+                    current,
+                    reset_absent=not unavailable_filters,
+                )
+        await asyncio.sleep(0.5)
+
+
+async def loss_defect_watch_loop() -> None:
+    await asyncio.sleep(85)
+    logging.info(
+        "Loss/defect watcher started. Interval: %s seconds",
+        LOSS_DEFECT_CHECK_INTERVAL_SECONDS,
+    )
+    while True:
+        try:
+            await check_loss_defect_once()
+        except Exception:
+            logging.exception("Loss/defect watcher loop error")
+        await asyncio.sleep(max(300, LOSS_DEFECT_CHECK_INTERVAL_SECONDS))
+
+
+_fbo_full_scan_at_by_group: dict[str, float] = {}
+
+
+async def check_fbo_acceptance_once() -> None:
+    for group in connected_watch_groups("notify_fbo_acceptance"):
+        shop_id = int(group["shop_id"])
+        telegram_ids = [int(value) for value in group["telegram_ids"]]
+        watch_key = _watch_group_key(group)
+        baseline_required = any(
+            not operational_watcher_initialized(user_id, shop_id, "fbo_acceptance")
+            for user_id in telegram_ids
+        )
+        last_full_scan = _fbo_full_scan_at_by_group.get(watch_key)
+        full_scan = (
+            baseline_required
+            or last_full_scan is None
+            or time.monotonic() - last_full_scan >= FBO_ACCEPTANCE_FULL_SCAN_INTERVAL_SECONDS
+        )
+        invoice_pages = (
+            FBO_ACCEPTANCE_INVOICE_PAGES
+            if full_scan
+            else FBO_ACCEPTANCE_FAST_PAGES
+        )
+        try:
+            token = cipher.decrypt(group["uzum_token_encrypted"])
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            invoices, _ = await _load_fbo_invoices(
+                client,
+                shop_id,
+                max_pages=invoice_pages,
+                page_size=20,
+            )
+            if full_scan:
+                _fbo_full_scan_at_by_group[watch_key] = time.monotonic()
+                logging.info(
+                    "FBO acceptance full reconciliation completed shop=%s invoices=%s "
+                    "next_full_in=%ss",
+                    shop_id,
+                    len(invoices),
+                    FBO_ACCEPTANCE_FULL_SCAN_INTERVAL_SECONDS,
+                )
+        except Exception as error:
+            _log_watcher_api_failure(
+                "FBO acceptance watcher invoice list",
+                error,
+                shop_id=shop_id,
+                telegram_ids=telegram_ids,
+            )
+            continue
+
+        products_cache: dict[str, list[dict[str, Any]]] = {}
+        products_error: set[str] = set()
+        products_retry_later: set[str] = set()
+        for telegram_id in telegram_ids:
+            initialized = operational_watcher_initialized(
+                telegram_id,
+                shop_id,
+                "fbo_acceptance",
+            )
+            if not initialized:
+                for invoice in invoices:
+                    invoice_key = _fbo_invoice_watch_key(invoice)
+                    planned, accepted, _ = _fbo_invoice_quantities(invoice)
+                    terminal = fbo_invoice_acceptance_is_terminal(invoice)
+                    save_fbo_acceptance_watch_state(
+                        telegram_id,
+                        shop_id,
+                        invoice_key,
+                        invoice_id=_invoice_id(invoice),
+                        invoice_number=_invoice_number(invoice),
+                        status=_invoice_status(invoice),
+                        planned_qty=planned,
+                        accepted_qty=accepted,
+                        terminal=terminal,
+                        baseline_notified=terminal,
+                    )
+                mark_operational_watcher_initialized(
+                    telegram_id,
+                    shop_id,
+                    "fbo_acceptance",
+                )
+                logging.info(
+                    "FBO acceptance watcher initialized user=%s shop=%s invoices=%s",
+                    telegram_id,
+                    shop_id,
+                    len(invoices),
+                )
+                continue
+
+            for invoice in invoices:
+                invoice_key = _fbo_invoice_watch_key(invoice)
+                previous = get_fbo_acceptance_watch_state(
+                    telegram_id,
+                    shop_id,
+                    invoice_key,
+                )
+                terminal = fbo_invoice_acceptance_is_terminal(invoice)
+                planned, accepted, _ = _fbo_invoice_quantities(invoice)
+                save_fbo_acceptance_watch_state(
+                    telegram_id,
+                    shop_id,
+                    invoice_key,
+                    invoice_id=_invoice_id(invoice),
+                    invoice_number=_invoice_number(invoice),
+                    status=_invoice_status(invoice),
+                    planned_qty=planned,
+                    accepted_qty=accepted,
+                    terminal=terminal,
+                )
+                state = get_fbo_acceptance_watch_state(
+                    telegram_id,
+                    shop_id,
+                    invoice_key,
+                ) or {}
+                if not terminal or state.get("notified_at"):
+                    continue
+                if previous and previous.get("notified_at"):
+                    continue
+
+                if invoice_key not in products_cache and invoice_key not in products_error:
+                    invoice_id = _invoice_id(invoice)
+                    try:
+                        numeric_invoice_id = int(str(invoice_id).strip())
+                        raw_products = await _request_fbo_invoice_products(
+                            client,
+                            shop_id,
+                            numeric_invoice_id,
+                        )
+                        products_cache[invoice_key] = [
+                            item
+                            for item in _extract_list_any(raw_products)
+                            if isinstance(item, dict)
+                        ]
+                    except Exception as error:
+                        products_error.add(invoice_key)
+                        products_cache[invoice_key] = []
+                        if _is_uzum_rate_limit_error(error):
+                            products_retry_later.add(invoice_key)
+                            _fbo_full_scan_at_by_group.pop(watch_key, None)
+                            _log_watcher_api_failure(
+                                f"FBO acceptance products invoice={invoice_id}",
+                                error,
+                                shop_id=shop_id,
+                                telegram_ids=telegram_ids,
+                            )
+                            # Не помечаем накладную обработанной: детали будут
+                            # повторно загружены на следующем цикле.
+                            continue
+                        logging.exception(
+                            "FBO acceptance watcher: products failed shop=%s invoice=%s",
+                            shop_id,
+                            invoice_id,
+                        )
+
+                if invoice_key in products_retry_later:
+                    continue
+
+                summary = summarize_fbo_acceptance(
+                    invoice,
+                    products_cache.get(invoice_key, []),
+                    shop_id=shop_id,
+                )
+                if summary.get("outcome") == "unknown":
+                    logging.warning(
+                        "FBO acceptance watcher: terminal invoice without totals shop=%s invoice=%s",
+                        shop_id,
+                        _invoice_id(invoice),
+                    )
+                    continue
+
+                lang = get_user_language(telegram_id)
+                text = build_fbo_acceptance_notification(summary, lang=lang)
+                pdf_path: Path | None = None
+                try:
+                    if summary.get("outcome") == "discrepancy":
+                        try:
+                            pdf_path = await asyncio.to_thread(build_fbo_acceptance_pdf, summary, lang=lang)
+                            safe_invoice = "".join(
+                                char if char.isalnum() else "_"
+                                for char in str(summary.get("invoice_number") or summary.get("invoice_id") or "invoice")
+                            )[:40]
+                            await bot.send_document(
+                                telegram_id,
+                                FSInputFile(
+                                    str(pdf_path),
+                                    filename=f"fbo_acceptance_{safe_invoice or 'invoice'}.pdf",
+                                ),
+                                caption=text,
+                                reply_markup=main_menu_for_user(telegram_id),
+                            )
+                        except Exception:
+                            logging.exception(
+                                "FBO acceptance PDF failed; sending text fallback user=%s shop=%s invoice=%s",
+                                telegram_id,
+                                shop_id,
+                                _invoice_id(invoice),
+                            )
+                            fallback_note = (
+                                "\n\n⚠️ PDF yaratilmadi, lekin tafovut saqlandi va tekshirish talab etiladi."
+                                if normalize_lang(lang) == "uz"
+                                else "\n\n⚠️ PDF не сформирован, но расхождение сохранено и требует проверки."
+                            )
+                            await bot.send_message(
+                                telegram_id,
+                                text + fallback_note,
+                                reply_markup=main_menu_for_user(telegram_id),
+                            )
+                    else:
+                        await bot.send_message(
+                            telegram_id,
+                            text,
+                            reply_markup=main_menu_for_user(telegram_id),
+                        )
+                    mark_fbo_acceptance_notified(
+                        telegram_id,
+                        shop_id,
+                        invoice_key,
+                    )
+                    logging.info(
+                        "FBO acceptance notification sent user=%s shop=%s invoice=%s outcome=%s",
+                        telegram_id,
+                        shop_id,
+                        _invoice_id(invoice),
+                        summary.get("outcome"),
+                    )
+                    await asyncio.sleep(0.2)
+                except Exception:
+                    logging.exception(
+                        "FBO acceptance watcher: delivery failed user=%s shop=%s invoice=%s",
+                        telegram_id,
+                        shop_id,
+                        _invoice_id(invoice),
+                    )
+                finally:
+                    if pdf_path is not None:
+                        try:
+                            pdf_path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+        await asyncio.sleep(0.5)
+
+
+async def fbo_acceptance_watch_loop() -> None:
+    await asyncio.sleep(110)
+    logging.info(
+        "FBO acceptance watcher started. Interval: %s seconds",
+        FBO_ACCEPTANCE_CHECK_INTERVAL_SECONDS,
+    )
+    while True:
+        try:
+            await check_fbo_acceptance_once()
+        except Exception:
+            logging.exception("FBO acceptance watcher loop error")
+        await asyncio.sleep(max(300, FBO_ACCEPTANCE_CHECK_INTERVAL_SECONDS))
 
 # =============================================================================
 # RELEASE HARDENING 2026-07
@@ -14607,41 +19154,238 @@ def _cleanup_release_state() -> None:
 _cleanup_release_state()
 
 
+# =============================================================================
+# PREMIUM MERGE 2026-07-18
+# Preserves per-user instant/hourly modes while using the durable outbox and
+# adaptive Finance pagination from RELEASE_HARDENING.
+# =============================================================================
+PREMIUM_RELEASE_VERSION = "2026.07.18-premium-r2"
+
+
+async def check_new_sales_once() -> None:
+    for group in connected_watch_groups("notify_sales", "notify_cancellations"):
+        shop_id = int(group["shop_id"])
+        encrypted_token = group["uzum_token_encrypted"]
+        telegram_ids = [int(value) for value in group["telegram_ids"]]
+
+        try:
+            token = cipher.decrypt(encrypted_token)
+            client = UzumClient(token, UZUM_API_BASE_URL)
+            state_by_user = {
+                telegram_id: _load_finance_watch_state(telegram_id, shop_id)
+                for telegram_id in telegram_ids
+            }
+            initialized_by_user = {
+                telegram_id: _watch_is_initialized(telegram_id, shop_id, "finance")
+                for telegram_id in telegram_ids
+            }
+            known_union: set[str] = set()
+            for state in state_by_user.values():
+                known_union.update(state.keys())
+            baseline_group = not any(initialized_by_user.values())
+            recent_rows = await _load_finance_watch_pages(
+                client,
+                shop_id,
+                known_identities=known_union,
+                baseline=baseline_group,
+            )
+            cancel_rows = await _load_cancel_status_rows(client, shop_id)
+
+            merged: dict[str, dict[str, Any]] = {}
+            for item in recent_rows + cancel_rows:
+                identity = finance_identity_key(item)
+                current = merged.get(identity)
+                if current is None:
+                    merged[identity] = item
+                    continue
+                current_score = (
+                    _finance_cancelled_qty(current),
+                    _finance_return_qty(current),
+                    str(_finance_status(current)),
+                )
+                item_score = (
+                    _finance_cancelled_qty(item),
+                    _finance_return_qty(item),
+                    str(_finance_status(item)),
+                )
+                if item_score > current_score:
+                    merged[identity] = item
+            rows = list(merged.values())
+        except Exception as error:
+            _log_watcher_api_failure(
+                "Premium finance watcher",
+                error,
+                shop_id=shop_id,
+                telegram_ids=telegram_ids,
+            )
+            await asyncio.sleep(2)
+            continue
+
+        now = _utc_now()
+        for telegram_id in telegram_ids:
+            previous = state_by_user.get(telegram_id, {})
+            initialized = initialized_by_user.get(telegram_id, False)
+            sales_mode = get_sales_notification_mode(telegram_id)
+            cancellations_enabled = product_setting_enabled(
+                telegram_id,
+                "notify_cancellations",
+            )
+
+            if not initialized:
+                _save_finance_watch_rows(telegram_id, shop_id, rows)
+                _set_watch_initialized(telegram_id, shop_id, "finance")
+                mark_operational_watcher_initialized(telegram_id, shop_id, "sales")
+                logging.info(
+                    "Sales watcher initialized user=%s shop=%s rows=%s mode=%s",
+                    telegram_id,
+                    shop_id,
+                    len(rows),
+                    sales_mode,
+                )
+                continue
+
+            new_sales: list[dict[str, Any]] = []
+            for item in rows:
+                identity = finance_identity_key(item)
+                before = previous.get(identity)
+                net_qty = _finance_qty(item)
+                cancelled_qty = _finance_cancelled_qty(item)
+                status = _finance_status(item)
+
+                if before is None:
+                    if net_qty > 0:
+                        new_sales.append(item)
+                    if cancellations_enabled and (
+                        cancelled_qty > 0 or _has_cancel_event_status(status)
+                    ):
+                        _enqueue_notification(
+                            "cancel",
+                            telegram_id,
+                            shop_id,
+                            f"{identity}:cancel:{cancelled_qty:g}:{_status_upper(status)}",
+                            {"item": item, "cancel_qty": cancelled_qty},
+                        )
+                    continue
+
+                if cancellations_enabled:
+                    previous_cancelled = float(before.get("cancelled_qty") or 0)
+                    if cancelled_qty > previous_cancelled:
+                        delta = cancelled_qty - previous_cancelled
+                        _enqueue_notification(
+                            "cancel",
+                            telegram_id,
+                            shop_id,
+                            f"{identity}:cancel:{cancelled_qty:g}:{_status_upper(status)}",
+                            {"item": item, "cancel_qty": delta},
+                        )
+                    elif (
+                        _has_cancel_event_status(status)
+                        and not _has_cancel_event_status(before.get("status"))
+                    ):
+                        fallback_qty = (
+                            _finance_original_qty(item)
+                            if _is_full_cancelled_status(status)
+                            else 0.0
+                        )
+                        _enqueue_notification(
+                            "cancel",
+                            telegram_id,
+                            shop_id,
+                            f"{identity}:cancel-status:{_status_upper(status)}",
+                            {"item": item, "cancel_qty": fallback_qty},
+                        )
+
+            if sales_mode == "hourly":
+                enqueue_sales_digest_events(
+                    telegram_id,
+                    shop_id,
+                    new_sales,
+                    detected_at=now,
+                )
+            elif sales_mode == "instant":
+                if len(new_sales) > INSTANT_SALE_BURST_LIMIT:
+                    direct = new_sales[:INSTANT_SALE_BURST_LIMIT]
+                    overflow = new_sales[INSTANT_SALE_BURST_LIMIT:]
+                else:
+                    direct = new_sales
+                    overflow = []
+                for item in direct:
+                    _enqueue_notification(
+                        "sale",
+                        telegram_id,
+                        shop_id,
+                        finance_identity_key(item),
+                        {"item": item},
+                    )
+                if overflow:
+                    digest_ids = sorted(finance_identity_key(item) for item in overflow)
+                    digest_hash = hashlib.sha256(
+                        "|".join(digest_ids).encode("utf-8")
+                    ).hexdigest()[:32]
+                    _enqueue_notification(
+                        "sale_digest",
+                        telegram_id,
+                        shop_id,
+                        f"burst:{digest_hash}",
+                        {"summary": _sale_digest_payload(overflow)},
+                    )
+
+            # State is written only after notification data is durably stored.
+            _save_finance_watch_rows(telegram_id, shop_id, rows)
+            if sales_mode == "hourly":
+                await maybe_send_hourly_sales_digest(
+                    telegram_id,
+                    shop_id,
+                    now=now,
+                )
+
+        await asyncio.sleep(0.2)
+
+    await _deliver_pending_notifications()
+
+
 async def main() -> None:
+    logging.info(
+        "PREMIUM_RELEASE_LOADED version=%s base=%s",
+        PREMIUM_RELEASE_VERSION,
+        APP_BUILD,
+    )
     logging.info(
         "RELEASE_HARDENING_LOADED version=%s: finance math + persistent watchers + retry outbox",
         RELEASE_VERSION,
     )
     logging.info(
-        "Release config: sale_interval=%ss watch_pages=%s report_pages=%s digest_threshold=%s drop_pending=%s",
+        "Premium config: sale_interval=%ss watch_pages=%s report_pages=%s drop_pending=%s API_min_interval=%.2fs",
         SALE_CHECK_INTERVAL_SECONDS,
         SALE_WATCH_MAX_PAGES,
         FINANCE_REPORT_MAX_PAGES,
-        SALE_DIGEST_THRESHOLD,
         DROP_PENDING_UPDATES,
+        UZUM_API_MIN_INTERVAL_SECONDS,
     )
+    logging.info("PREMIUM_UI_LOADED: compact main menu + guided sections + honest financial wording")
     logging.info("SKU_LABELS_INTERFACE_LOADED: official barcode types + PDF SKU labels")
-    logging.info("INTUITIVE_ATTENTION_INTERFACE_LOADED: simple sections + attention report + full stock list")
+    logging.info("STOCK_TRUTH_LOADED: SKU-level FBO/FBS totals + supply forecast")
+
     init_language_tables()
+    init_product_value_tables()
     await bot.delete_webhook(drop_pending_updates=DROP_PENDING_UPDATES)
-    if NEW_ORDER_NOTIFICATIONS:
-        asyncio.create_task(order_watch_loop())
-    if LOW_STOCK_NOTIFICATIONS:
-        asyncio.create_task(low_stock_watch_loop())
-    if OUT_OF_STOCK_NOTIFICATIONS:
-        asyncio.create_task(out_of_stock_watch_loop())
-    if SALE_NOTIFICATIONS:
-        asyncio.create_task(sales_watch_loop())
+
+    # Loops have staggered initial sleeps inside their implementations.
+    asyncio.create_task(order_watch_loop())
+    asyncio.create_task(low_stock_watch_loop())
+    asyncio.create_task(out_of_stock_watch_loop())
+    asyncio.create_task(sales_watch_loop())
     if STOCK_CHANGE_NOTIFICATIONS:
         asyncio.create_task(stock_change_watch_loop())
-    if DAILY_REPORTS:
-        asyncio.create_task(daily_report_loop())
+    asyncio.create_task(loss_defect_watch_loop())
+    asyncio.create_task(fbo_acceptance_watch_loop())
+    asyncio.create_task(daily_report_loop())
     if SUBSCRIPTION_REMINDERS:
         asyncio.create_task(subscription_reminder_loop())
-    if REVIEW_NOTIFICATIONS:
-        asyncio.create_task(reviews_watch_loop())
+    asyncio.create_task(reviews_watch_loop())
     await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
     asyncio.run(main())
+
