@@ -5928,19 +5928,17 @@ async def _load_finance_range_flexible(
     max_pages: int | None = None,
     page_size: int = 100,
 ) -> tuple[list[dict[str, Any]], Any | None, str]:
-    """Load every Finance page and fall back to legacy status filters.
+    """Load every Finance page using only documented query parameters.
 
     The old implementation requested only page 0, so Telegram and Excel silently
-    understated totals when a period contained more than 100 rows.
+    understated totals when a period contained more than 100 rows.  Earlier
+    fallback attempts also sent unsupported ``status``/``statuses`` parameters,
+    which produced HTTP 400 responses when the selected period had no rows.
     """
     max_pages = max(1, int(max_pages or FINANCE_REPORT_MAX_PAGES))
     page_size = max(1, min(100, int(page_size or 100)))
     attempts: list[tuple[str, list[tuple[str, Any]]]] = [
-        ("без статуса", []),
-        ("statuses=PROCESSING", [("statuses", "PROCESSING")]),
-        ("statuses=TO_WITHDRAW", [("statuses", "TO_WITHDRAW")]),
-        ("status=PROCESSING", [("status", "PROCESSING")]),
-        ("status=TO_WITHDRAW", [("status", "TO_WITHDRAW")]),
+        ("без дополнительных фильтров", []),
     ]
     all_rows: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -5980,7 +5978,7 @@ async def _load_finance_range_flexible(
                     truncated = True
                 await asyncio.sleep(0.04)
             used_attempts.append(f"{label}: {attempt_pages} стр./{attempt_rows} строк")
-            if all_rows and label == "без статуса":
+            if all_rows and label == "без дополнительных фильтров":
                 break
             await asyncio.sleep(0.15)
         except Exception as e:
@@ -7732,6 +7730,9 @@ async def check_new_reviews_once() -> None:
 
 async def reviews_watch_loop() -> None:
     logging.info("Reviews watcher started. Interval: %s seconds. Enabled: %s", REVIEW_CHECK_INTERVAL_SECONDS, REVIEW_NOTIFICATIONS)
+    if not REVIEW_NOTIFICATIONS:
+        logging.info("Reviews watcher disabled globally; no Uzum review API requests will be made")
+        return
     while True:
         try:
             await check_new_reviews_once()
@@ -9710,6 +9711,9 @@ async def order_watch_loop() -> None:
         ORDER_CHECK_INTERVAL_SECONDS,
         NEW_ORDER_NOTIFICATIONS,
     )
+    if not NEW_ORDER_NOTIFICATIONS:
+        logging.info("Order watcher disabled globally; no FBS order API requests will be made")
+        return
     while True:
         try:
             await check_new_orders_once()
@@ -17297,8 +17301,20 @@ SALE_WATCH_BASELINE_PAGES = max(
 SALE_WATCH_PAGE_SIZE = max(
     20, min(100, int(os.getenv("SALE_WATCH_PAGE_SIZE", "100") or "100"))
 )
-CANCEL_WATCH_MAX_PAGES_PER_STATUS = max(
-    1, min(20, int(os.getenv("CANCEL_WATCH_MAX_PAGES_PER_STATUS", "3") or "3"))
+# Finance /v1/finance/orders does not document a status filter.  Older builds
+# sent statuses=CANCELLED/CANCELED/... and received repeated HTTP 400 responses.
+# Cancellation changes are now detected from normal Finance rows, with a deeper
+# unfiltered scan at a low frequency for older orders.
+CANCEL_WATCH_DEEP_SCAN_INTERVAL_SECONDS = max(
+    900,
+    int(os.getenv("CANCEL_WATCH_DEEP_SCAN_INTERVAL_SECONDS", "3600") or "3600"),
+)
+CANCEL_WATCH_DEEP_SCAN_MAX_PAGES = max(
+    1,
+    min(
+        SALE_WATCH_MAX_PAGES,
+        int(os.getenv("CANCEL_WATCH_DEEP_SCAN_MAX_PAGES", "10") or "10"),
+    ),
 )
 SALE_NOTIFICATION_BATCH_LIMIT = max(
     1, min(100, int(os.getenv("SALE_NOTIFICATION_BATCH_LIMIT", "30") or "30"))
@@ -17326,14 +17342,9 @@ LOSS_REPORT_FILTERS = tuple(
     for value in os.getenv("LOSS_REPORT_FILTERS", "ALL,ARCHIVE").replace(";", ",").split(",")
     if value.strip()
 ) or ("ALL", "ARCHIVE")
-CANCEL_WATCH_STATUSES = tuple(
-    value.strip()
-    for value in os.getenv(
-        "CANCEL_WATCH_STATUSES",
-        "CANCELLED,CANCELED,PARTIALLY_CANCELLED,PARTIALLY_CANCELED",
-    ).replace(";", ",").split(",")
-    if value.strip()
-)
+# Kept only as an in-memory scheduler.  No unsupported status query parameters
+# are sent to Uzum Finance API.
+_CANCEL_DEEP_SCAN_LAST_ATTEMPT: dict[int, float] = {}
 
 
 def _finance_original_qty(item: dict[str, Any]) -> float:
@@ -18496,46 +18507,87 @@ async def _load_cancel_status_rows(
     client: UzumClient,
     shop_id: int,
 ) -> list[dict[str, Any]]:
+    """Periodically search older cancellations without unsupported filters.
+
+    Uzum's documented Finance endpoint accepts date/shop/pagination parameters,
+    but not ``statuses``.  We therefore load ordinary Finance pages and filter
+    cancellation rows locally.  The deep scan runs at most once per configured
+    interval for each shop, which avoids both HTTP 400 log spam and unnecessary
+    pressure that previously caused HTTP 429 responses.
+    """
+
+    now_mono = time.monotonic()
+    last_attempt = float(_CANCEL_DEEP_SCAN_LAST_ATTEMPT.get(int(shop_id), 0.0))
+    if now_mono - last_attempt < CANCEL_WATCH_DEEP_SCAN_INTERVAL_SECONDS:
+        return []
+
+    # Record the attempt before network calls.  A temporary API failure should
+    # not cause this expensive scan to repeat every minute.
+    _CANCEL_DEEP_SCAN_LAST_ATTEMPT[int(shop_id)] = now_mono
+
     now = _utc_now()
     date_from_ms = int((now - timedelta(days=SALE_WATCH_LOOKBACK_DAYS)).timestamp() * 1000)
     date_to_ms = int(now.timestamp() * 1000)
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
+    pages_loaded = 0
 
-    # Status-filtered scans keep old cancellations visible without walking every
-    # high-volume sale page for the entire lookback window.
-    per_status_pages = CANCEL_WATCH_MAX_PAGES_PER_STATUS
-    for status in CANCEL_WATCH_STATUSES:
-        try:
-            for page in range(per_status_pages):
-                data = await _finance_orders_request_extra(
-                    client,
-                    shop_id,
-                    date_from_ms=date_from_ms,
-                    date_to_ms=date_to_ms,
-                    extra_params=[("statuses", status)],
-                    page=page,
-                    size=SALE_WATCH_PAGE_SIZE,
+    try:
+        for page in range(CANCEL_WATCH_DEEP_SCAN_MAX_PAGES):
+            data = await _finance_orders_request(
+                client,
+                shop_id,
+                date_from_ms=date_from_ms,
+                date_to_ms=date_to_ms,
+                page=page,
+                size=SALE_WATCH_PAGE_SIZE,
+            )
+            pages_loaded += 1
+            items = _deep_items(data)
+            if not items:
+                break
+
+            for item in items:
+                status = _finance_status(item)
+                cancelled_qty = _finance_cancelled_qty(item)
+                if not _has_cancel_event_status(status) and cancelled_qty <= 0:
+                    continue
+                signature = (
+                    f"{finance_identity_key(item)}|{_status_upper(status)}|"
+                    f"{cancelled_qty:g}|{_finance_return_qty(item):g}"
                 )
-                items = _deep_items(data)
-                if not items:
-                    break
-                for item in items:
-                    if not _has_cancel_event_status(_finance_status(item)) and _finance_cancelled_qty(item) <= 0:
-                        continue
-                    sig = (
-                        f"{finance_identity_key(item)}|{_finance_status(item)}|"
-                        f"{_finance_cancelled_qty(item)}"
-                    )
-                    if sig not in seen:
-                        seen.add(sig)
-                        rows.append(item)
-                if len(items) < SALE_WATCH_PAGE_SIZE:
-                    break
-                await asyncio.sleep(0.04)
-        except Exception as exc:
-            logging.info("Cancel status scan skipped status=%s shop=%s: %s", status, shop_id, exc)
-        await asyncio.sleep(0.05)
+                if signature in seen:
+                    continue
+                seen.add(signature)
+                rows.append(item)
+
+            if len(items) < SALE_WATCH_PAGE_SIZE:
+                break
+            await asyncio.sleep(0.08)
+    except Exception as exc:
+        if _is_uzum_rate_limit_error(exc):
+            logging.warning(
+                "Cancel deep scan postponed by Uzum rate limit shop=%s pages=%s; "
+                "recent cancellation monitoring remains active",
+                shop_id,
+                pages_loaded,
+            )
+        else:
+            logging.warning(
+                "Cancel deep scan failed shop=%s pages=%s: %s",
+                shop_id,
+                pages_loaded,
+                exc,
+            )
+        return []
+
+    logging.info(
+        "Cancel deep scan completed shop=%s pages=%s cancellation_rows=%s next_in=%ss",
+        shop_id,
+        pages_loaded,
+        len(rows),
+        CANCEL_WATCH_DEEP_SCAN_INTERVAL_SECONDS,
+    )
     return rows
 
 
@@ -19159,7 +19211,7 @@ _cleanup_release_state()
 # Preserves per-user instant/hourly modes while using the durable outbox and
 # adaptive Finance pagination from RELEASE_HARDENING.
 # =============================================================================
-PREMIUM_RELEASE_VERSION = "2026.07.18-premium-r2"
+PREMIUM_RELEASE_VERSION = "2026.07.18-premium-r4-production"
 
 
 async def check_new_sales_once() -> None:
@@ -19355,14 +19407,18 @@ async def main() -> None:
         RELEASE_VERSION,
     )
     logging.info(
-        "Premium config: sale_interval=%ss watch_pages=%s report_pages=%s drop_pending=%s API_min_interval=%.2fs",
+        "Premium config: sale_interval=%ss watch_pages=%s report_pages=%s drop_pending=%s "
+        "API_min_interval=%.2fs cancel_deep_pages=%s cancel_deep_interval=%ss",
         SALE_CHECK_INTERVAL_SECONDS,
         SALE_WATCH_MAX_PAGES,
         FINANCE_REPORT_MAX_PAGES,
         DROP_PENDING_UPDATES,
         UZUM_API_MIN_INTERVAL_SECONDS,
+        CANCEL_WATCH_DEEP_SCAN_MAX_PAGES,
+        CANCEL_WATCH_DEEP_SCAN_INTERVAL_SECONDS,
     )
     logging.info("PREMIUM_UI_LOADED: compact main menu + guided sections + honest financial wording")
+    logging.info("LEGACY_CANCEL_STATUS_FILTER_SCAN_DISABLED: finance orders are scanned without unsupported status parameters")
     logging.info("SKU_LABELS_INTERFACE_LOADED: official barcode types + PDF SKU labels")
     logging.info("STOCK_TRUTH_LOADED: SKU-level FBO/FBS totals + supply forecast")
 
@@ -19388,4 +19444,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
