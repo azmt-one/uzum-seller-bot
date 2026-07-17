@@ -627,6 +627,7 @@ def build_premium_workbook(
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
+APP_BUILD = "2026.07.17-sales-modes-v1"
 
 TELEGRAM_BOT_TOKEN = (
     os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -663,6 +664,14 @@ SALE_NOTIFICATIONS = (
     not in {"0", "false", "no", "off"}
 )
 SALE_CHECK_INTERVAL_SECONDS = int(os.getenv("SALE_CHECK_INTERVAL_SECONDS", "300") or "300")
+SALES_DIGEST_INTERVAL_SECONDS = max(
+    900,
+    int(os.getenv("SALES_DIGEST_INTERVAL_SECONDS", "3600") or "3600"),
+)
+INSTANT_SALE_BURST_LIMIT = max(
+    1,
+    min(50, int(os.getenv("INSTANT_SALE_BURST_LIMIT", "10") or "10")),
+)
 STOCK_CHANGE_NOTIFICATIONS = (
     os.getenv("STOCK_CHANGE_NOTIFICATIONS", "0").strip().lower()
     not in {"0", "false", "no", "off"}
@@ -2071,6 +2080,7 @@ def list_staff_shop_connections(limit: int = 30) -> list[dict[str, Any]]:
 PRODUCT_SETTING_FIELDS = {
     "notify_orders",
     "notify_sales",
+    "sales_notification_mode",
     "notify_low_stock",
     "notify_out_of_stock",
     "notify_cancellations",
@@ -2109,6 +2119,7 @@ def init_product_value_tables() -> None:
                 telegram_id INTEGER PRIMARY KEY,
                 notify_orders INTEGER NOT NULL DEFAULT 0,
                 notify_sales INTEGER NOT NULL DEFAULT 1,
+                sales_notification_mode TEXT NOT NULL DEFAULT 'instant',
                 notify_low_stock INTEGER NOT NULL DEFAULT 1,
                 notify_out_of_stock INTEGER NOT NULL DEFAULT 1,
                 notify_cancellations INTEGER NOT NULL DEFAULT 1,
@@ -2141,6 +2152,11 @@ def init_product_value_tables() -> None:
                 conn.execute(
                     f"ALTER TABLE product_settings ADD COLUMN {column} INTEGER NOT NULL DEFAULT 1"
                 )
+        if "sales_notification_mode" not in existing_product_columns:
+            conn.execute(
+                "ALTER TABLE product_settings "
+                "ADD COLUMN sales_notification_mode TEXT NOT NULL DEFAULT 'instant'"
+            )
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS business_finance_settings (
@@ -2252,6 +2268,44 @@ def init_product_value_tables() -> None:
             ON fbo_acceptance_watch (telegram_id, shop_id, terminal, notified_at)
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sales_digest_queue (
+                telegram_id INTEGER NOT NULL,
+                shop_id INTEGER NOT NULL,
+                event_key TEXT NOT NULL,
+                identity_key TEXT NOT NULL,
+                order_id TEXT,
+                product_title TEXT,
+                sku_title TEXT,
+                quantity REAL NOT NULL DEFAULT 0,
+                revenue REAL NOT NULL DEFAULT 0,
+                commission REAL NOT NULL DEFAULT 0,
+                logistics REAL NOT NULL DEFAULT 0,
+                payout REAL NOT NULL DEFAULT 0,
+                sold_at TEXT,
+                detected_at TEXT NOT NULL,
+                PRIMARY KEY (telegram_id, shop_id, event_key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_sales_digest_queue_pending
+            ON sales_digest_queue (telegram_id, shop_id, detected_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sales_digest_state (
+                telegram_id INTEGER NOT NULL,
+                shop_id INTEGER NOT NULL,
+                last_sent_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (telegram_id, shop_id)
+            )
+            """
+        )
         conn.commit()
 
 
@@ -2305,6 +2359,45 @@ def update_product_setting(telegram_id: int, field: str, value: Any) -> dict[str
 
 def product_setting_enabled(telegram_id: int, field: str) -> bool:
     return bool(int(ensure_product_settings(telegram_id).get(field) or 0))
+
+
+SALES_NOTIFICATION_MODES = {"instant", "hourly", "off"}
+
+
+def _sales_notification_mode_from_settings(settings: dict[str, Any]) -> str:
+    if not bool(int(settings.get("notify_sales") or 0)):
+        return "off"
+    mode = str(settings.get("sales_notification_mode") or "instant").strip().lower()
+    return mode if mode in {"instant", "hourly"} else "instant"
+
+
+def get_sales_notification_mode(telegram_id: int) -> str:
+    return _sales_notification_mode_from_settings(ensure_product_settings(telegram_id))
+
+
+def set_sales_notification_mode(telegram_id: int, mode: str) -> dict[str, Any]:
+    normalized = str(mode or "").strip().lower()
+    if normalized not in SALES_NOTIFICATION_MODES:
+        raise ValueError(f"Unsupported sales notification mode: {mode}")
+    ensure_product_settings(telegram_id)
+    enabled = 0 if normalized == "off" else 1
+    stored_mode = "instant" if normalized == "off" else normalized
+    with db.connect() as conn:
+        conn.execute(
+            """
+            UPDATE product_settings
+            SET notify_sales = ?, sales_notification_mode = ?, updated_at = ?
+            WHERE telegram_id = ?
+            """,
+            (
+                enabled,
+                stored_mode,
+                _dt_to_db(_utc_now()) or "",
+                int(telegram_id),
+            ),
+        )
+        conn.commit()
+    return ensure_product_settings(telegram_id)
 
 
 def ensure_finance_settings(telegram_id: int, shop_id: int) -> dict[str, Any]:
@@ -13137,6 +13230,21 @@ def _weekday_name(value: Any, lang: str) -> str:
     return (uz if normalize_lang(lang) == "uz" else ru)[index]
 
 
+def _sales_mode_label(settings: dict[str, Any], lang: str, *, compact: bool = False) -> str:
+    mode = _sales_notification_mode_from_settings(settings)
+    uz = normalize_lang(lang) == "uz"
+    labels = {
+        "instant": ("⚡ Сразу", "⚡ Darhol"),
+        "hourly": ("🕐 Сводка раз в час", "🕐 Har soatda hisobot"),
+        "off": ("🔕 Выключены", "🔕 O‘chirilgan"),
+    }
+    ru_text, uz_text = labels[mode]
+    text = uz_text if uz else ru_text
+    if compact and mode == "hourly":
+        return "🕐 За час" if not uz else "🕐 Har soat"
+    return text
+
+
 def automation_settings_text(telegram_id: int) -> str:
     lang = get_user_language(telegram_id)
     row = ensure_product_settings(telegram_id)
@@ -13144,7 +13252,7 @@ def automation_settings_text(telegram_id: int) -> str:
         return (
             "⚙️ <b>Shaxsiy avtomatlashtirish</b>\n\n"
             "Har bir tugma faqat sizning Telegram hisobingiz uchun ishlaydi.\n\n"
-            f"💸 Yangi savdo: {_toggle_icon(row.get('notify_sales'))}\n"
+            f"💸 Savdo xabarlari: <b>{_sales_mode_label(row, lang)}</b>\n"
             f"🚫 Bekor qilish: {_toggle_icon(row.get('notify_cancellations'))}\n"
             f"🧭 Yangi yo‘qotish: {_toggle_icon(row.get('notify_losses'))}\n"
             f"🧪 Yangi yaroqsiz: {_toggle_icon(row.get('notify_defects'))}\n"
@@ -13162,7 +13270,7 @@ def automation_settings_text(telegram_id: int) -> str:
     return (
         "⚙️ <b>Персональная автоматизация</b>\n\n"
         "Каждая настройка действует только для вашего Telegram-аккаунта.\n\n"
-        f"💸 Новые продажи: {_toggle_icon(row.get('notify_sales'))}\n"
+        f"💸 Уведомления о продажах: <b>{_sales_mode_label(row, lang)}</b>\n"
         f"🚫 Отмены: {_toggle_icon(row.get('notify_cancellations'))}\n"
         f"🧭 Новые потери: {_toggle_icon(row.get('notify_losses'))}\n"
         f"🧪 Новый брак: {_toggle_icon(row.get('notify_defects'))}\n"
@@ -13191,7 +13299,10 @@ def automation_settings_markup(telegram_id: int) -> InlineKeyboardMarkup:
         )
 
     return InlineKeyboardMarkup(inline_keyboard=[
-        [toggle("notify_sales", "Продажи", "Savdo"), toggle("notify_cancellations", "Отмены", "Bekor")],
+        [InlineKeyboardButton(
+            text=f"💸 {_sales_mode_label(row, lang, compact=True)}",
+            callback_data="salesmode:menu",
+        ), toggle("notify_cancellations", "Отмены", "Bekor")],
         [toggle("notify_losses", "Потери", "Yo‘qotish"), toggle("notify_defects", "Брак", "Yaroqsiz")],
         [toggle("notify_fbo_acceptance", "Приёмка FBO", "FBO qabuli")],
         [toggle("notify_low_stock", "Низкий остаток", "Kam qoldiq"), toggle("notify_out_of_stock", "Закончился", "Tugadi")],
@@ -13205,6 +13316,53 @@ def automation_settings_markup(telegram_id: int) -> InlineKeyboardMarkup:
          InlineKeyboardButton(text=("🗓 Oy kuni" if uz else "🗓 День месяца"), callback_data="autoedit:monthly_day")],
         [InlineKeyboardButton(text=("🕘 Oy vaqti" if uz else "🕘 Время месячного"), callback_data="autoedit:monthly_hour"),
          InlineKeyboardButton(text=("📉 Qoldiq chegarasi" if uz else "📉 Порог остатка"), callback_data="autoedit:low_stock_threshold")],
+    ])
+
+
+def sales_mode_selection_text(telegram_id: int) -> str:
+    lang = get_user_language(telegram_id)
+    settings = ensure_product_settings(telegram_id)
+    shop_id = db.get_default_shop_id(telegram_id)
+    shop_text = str(shop_id) if shop_id is not None else "—"
+    if normalize_lang(lang) == "uz":
+        return (
+            "💸 <b>Savdo xabarlari rejimi</b>\n\n"
+            f"🏪 Faol do‘kon: <code>{shop_text}</code>\n"
+            f"Hozir: <b>{_sales_mode_label(settings, lang)}</b>\n\n"
+            "⚡ <b>Darhol</b> — har bir yangi savdo alohida xabar bo‘lib keladi. "
+            "Savdosi kam do‘konlar uchun qulay.\n\n"
+            "🕐 <b>Har soatda hisobot</b> — bot savdolarni yig‘adi va soatiga bitta xabar yuboradi: "
+            "buyurtmalar, dona, tushum, komissiya, logistika, to‘lov va top tovarlar.\n\n"
+            "🚫 Bekor qilingan buyurtmalar tanlangan rejimdan qat’i nazar alohida tezkor xabar bo‘lib keladi."
+        )
+    return (
+        "💸 <b>Режим уведомлений о продажах</b>\n\n"
+        f"🏪 Активный магазин: <code>{shop_text}</code>\n"
+        f"Сейчас: <b>{_sales_mode_label(settings, lang)}</b>\n\n"
+        "⚡ <b>Сразу</b> — каждая новая продажа приходит отдельным сообщением. "
+        "Удобно для небольших магазинов.\n\n"
+        "🕐 <b>Сводка раз в час</b> — бот собирает продажи и присылает одно сообщение: "
+        "заказы, количество товаров, выручка, комиссия, логистика, выплата и топ товаров.\n\n"
+        "🚫 Отмены остаются отдельными срочными уведомлениями независимо от выбранного режима."
+    )
+
+
+def sales_mode_selection_markup(telegram_id: int) -> InlineKeyboardMarkup:
+    lang = get_user_language(telegram_id)
+    uz = normalize_lang(lang) == "uz"
+    mode = get_sales_notification_mode(telegram_id)
+
+    def option(value: str, ru: str, uz_text: str) -> InlineKeyboardButton:
+        marker = "✅" if mode == value else "▫️"
+        return InlineKeyboardButton(
+            text=f"{marker} {uz_text if uz else ru}",
+            callback_data=f"salesmode:{value}",
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [option("instant", "⚡ Сразу", "⚡ Darhol"), option("hourly", "🕐 За час", "🕐 Har soat")],
+        [option("off", "🔕 Выключить", "🔕 O‘chirish")],
+        [InlineKeyboardButton(text="⬅️ Ortga" if uz else "⬅️ Назад", callback_data="salesmode:back")],
     ])
 
 
@@ -13286,6 +13444,73 @@ async def automation_settings_screen(message: Message) -> None:
         automation_settings_text(telegram_id),
         reply_markup=automation_settings_markup(telegram_id),
     )
+
+
+@dp.message(Command("sales_notify_mode", "sales_notifications"))
+async def sales_mode_screen(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    if not await require_active_subscription(message, telegram_id):
+        return
+    await message.answer(
+        sales_mode_selection_text(telegram_id),
+        reply_markup=sales_mode_selection_markup(telegram_id),
+    )
+
+
+@dp.callback_query(F.data.startswith("salesmode:"))
+async def sales_mode_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user:
+        return
+    telegram_id = int(callback.from_user.id)
+    action = str(callback.data or "").split(":", 1)[-1]
+    lang = get_user_language(telegram_id)
+
+    if action == "menu":
+        if callback.message:
+            await callback.message.edit_text(
+                sales_mode_selection_text(telegram_id),
+                reply_markup=sales_mode_selection_markup(telegram_id),
+            )
+        await callback.answer()
+        return
+
+    if action == "back":
+        if callback.message:
+            await callback.message.edit_text(
+                automation_settings_text(telegram_id),
+                reply_markup=automation_settings_markup(telegram_id),
+            )
+        await callback.answer()
+        return
+
+    if action not in SALES_NOTIFICATION_MODES:
+        await callback.answer(
+            "Noma’lum rejim" if normalize_lang(lang) == "uz" else "Неизвестный режим",
+            show_alert=True,
+        )
+        return
+
+    set_sales_notification_mode(telegram_id, action)
+    shop_id = db.get_default_shop_id(telegram_id)
+    if shop_id is not None:
+        reset_sales_digest_schedule(
+            telegram_id,
+            int(shop_id),
+            now=_utc_now(),
+            clear_queue=True,
+        )
+    if callback.message:
+        await callback.message.edit_text(
+            automation_settings_text(telegram_id),
+            reply_markup=automation_settings_markup(telegram_id),
+        )
+    labels = {
+        "instant": ("Режим: продажи сразу", "Rejim: savdolar darhol"),
+        "hourly": ("Режим: сводка раз в час", "Rejim: har soatda hisobot"),
+        "off": ("Уведомления о продажах выключены", "Savdo xabarlari o‘chirildi"),
+    }
+    ru_text, uz_text = labels[action]
+    await callback.answer(uz_text if normalize_lang(lang) == "uz" else ru_text)
 
 
 @dp.message(Command("loss_defect_notify_status", "warehouse_loss_notifications"))
@@ -14379,10 +14604,483 @@ def save_sale_statuses(telegram_id: int, shop_id: int, statuses: dict[str, str])
                 for identity, status in statuses.items()
             ],
         )
+        conn.execute(
+            """
+            DELETE FROM sale_status_watch
+            WHERE telegram_id = ? AND shop_id = ? AND updated_at < ?
+            """,
+            (
+                int(telegram_id),
+                int(shop_id),
+                _dt_to_db(_utc_now() - timedelta(days=30)) or "",
+            ),
+        )
         conn.commit()
 
 
 init_sale_status_watch_table()
+
+
+def _sales_digest_product_title(item: dict[str, Any]) -> str:
+    for field in ("productTitle", "productName", "offerName", "title", "name", "skuTitle"):
+        value = _deep_pick_value(item, (field,))
+        if isinstance(value, dict):
+            value = pick(value, "title", "name", "value")
+        if value not in (None, ""):
+            return str(value)
+    return _finance_title(item)
+
+
+def _sales_digest_event(
+    item: dict[str, Any],
+    *,
+    detected_at: datetime | None = None,
+) -> dict[str, Any]:
+    normalized = _normalize_finance_row(item)
+    sold_at = normalized.get("date")
+    if isinstance(sold_at, datetime) and sold_at.tzinfo is None:
+        sold_at = sold_at.replace(tzinfo=UZT)
+    detected = detected_at or _utc_now()
+    payout = max(0.0, float(normalized.get("payout") or 0))
+    return {
+        "event_key": sale_key(item),
+        "identity_key": finance_identity_key(item),
+        "order_id": str(normalized.get("order_id") or "-"),
+        "product_title": _sales_digest_product_title(item),
+        "sku_title": str(normalized.get("sku") or _finance_sku_title(item) or "-"),
+        "quantity": max(0.0, float(normalized.get("qty") or 0)),
+        "revenue": max(0.0, float(normalized.get("revenue") or 0)),
+        "commission": max(0.0, float(normalized.get("commission") or 0)),
+        "logistics": max(0.0, float(normalized.get("logistics") or 0)),
+        "payout": payout,
+        "sold_at": _dt_to_db(sold_at) if isinstance(sold_at, datetime) else None,
+        "detected_at": _dt_to_db(detected) or "",
+    }
+
+
+def enqueue_sales_digest_events(
+    telegram_id: int,
+    shop_id: int,
+    items: list[dict[str, Any]],
+    *,
+    detected_at: datetime | None = None,
+) -> int:
+    if not items:
+        return 0
+    init_product_value_tables()
+    detected = detected_at or _utc_now()
+    events = [_sales_digest_event(item, detected_at=detected) for item in items]
+    cutoff = _dt_to_db(detected - timedelta(days=7)) or ""
+    with db.connect() as conn:
+        before = conn.total_changes
+        conn.executemany(
+            """
+            INSERT OR IGNORE INTO sales_digest_queue (
+                telegram_id, shop_id, event_key, identity_key, order_id,
+                product_title, sku_title, quantity, revenue, commission,
+                logistics, payout, sold_at, detected_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    int(telegram_id),
+                    int(shop_id),
+                    event["event_key"],
+                    event["identity_key"],
+                    event["order_id"],
+                    event["product_title"],
+                    event["sku_title"],
+                    event["quantity"],
+                    event["revenue"],
+                    event["commission"],
+                    event["logistics"],
+                    event["payout"],
+                    event["sold_at"],
+                    event["detected_at"],
+                )
+                for event in events
+            ],
+        )
+        inserted = conn.total_changes - before
+        conn.execute(
+            """
+            DELETE FROM sales_digest_queue
+            WHERE telegram_id = ? AND shop_id = ? AND detected_at < ?
+            """,
+            (int(telegram_id), int(shop_id), cutoff),
+        )
+        conn.commit()
+    return max(0, int(inserted))
+
+
+def discard_sales_digest_events(
+    telegram_id: int,
+    shop_id: int,
+    identity_keys: Iterable[str],
+) -> int:
+    values = sorted({str(value) for value in identity_keys if str(value)})
+    if not values:
+        return 0
+    init_product_value_tables()
+    deleted = 0
+    with db.connect() as conn:
+        for offset in range(0, len(values), 500):
+            chunk = values[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            cursor = conn.execute(
+                f"""
+                DELETE FROM sales_digest_queue
+                WHERE telegram_id = ? AND shop_id = ?
+                  AND identity_key IN ({placeholders})
+                """,
+                (int(telegram_id), int(shop_id), *chunk),
+            )
+            deleted += max(0, int(cursor.rowcount or 0))
+        conn.commit()
+    return deleted
+
+
+def reset_sales_digest_schedule(
+    telegram_id: int,
+    shop_id: int,
+    *,
+    now: datetime | None = None,
+    clear_queue: bool = False,
+) -> None:
+    init_product_value_tables()
+    now_text = _dt_to_db(now or _utc_now()) or ""
+    with db.connect() as conn:
+        if clear_queue:
+            conn.execute(
+                "DELETE FROM sales_digest_queue WHERE telegram_id = ? AND shop_id = ?",
+                (int(telegram_id), int(shop_id)),
+            )
+        conn.execute(
+            """
+            INSERT INTO sales_digest_state
+                (telegram_id, shop_id, last_sent_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id, shop_id) DO UPDATE SET
+                last_sent_at = excluded.last_sent_at,
+                updated_at = excluded.updated_at
+            """,
+            (int(telegram_id), int(shop_id), now_text, now_text),
+        )
+        conn.commit()
+
+
+def get_sales_digest_last_sent(
+    telegram_id: int,
+    shop_id: int,
+    *,
+    now: datetime | None = None,
+) -> datetime:
+    init_product_value_tables()
+    current = now or _utc_now()
+    with db.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT last_sent_at
+            FROM sales_digest_state
+            WHERE telegram_id = ? AND shop_id = ?
+            """,
+            (int(telegram_id), int(shop_id)),
+        ).fetchone()
+    parsed = _dt_from_db(row["last_sent_at"]) if row else None
+    if parsed is not None:
+        return parsed
+    reset_sales_digest_schedule(telegram_id, shop_id, now=current)
+    return current
+
+
+def _sales_digest_summary_from_events(
+    events: list[dict[str, Any]],
+    *,
+    shop_id: int,
+    period_start: datetime,
+    period_end: datetime,
+) -> dict[str, Any]:
+    order_ids = {
+        str(event.get("order_id"))
+        for event in events
+        if str(event.get("order_id") or "") not in {"", "-", "—"}
+    }
+    products: dict[tuple[str, str], dict[str, Any]] = {}
+    for event in events:
+        title = str(event.get("product_title") or "Без названия")
+        sku = str(event.get("sku_title") or "-")
+        product = products.setdefault(
+            (title, sku),
+            {"title": title, "sku": sku, "quantity": 0.0, "revenue": 0.0},
+        )
+        product["quantity"] = float(product["quantity"]) + float(event.get("quantity") or 0)
+        product["revenue"] = float(product["revenue"]) + float(event.get("revenue") or 0)
+    positions = len(events)
+    revenue = sum(float(event.get("revenue") or 0) for event in events)
+    orders = len(order_ids) or positions
+    return {
+        "shop_id": int(shop_id),
+        "positions": positions,
+        "orders": orders,
+        "units": sum(float(event.get("quantity") or 0) for event in events),
+        "revenue": revenue,
+        "commission": sum(float(event.get("commission") or 0) for event in events),
+        "logistics": sum(float(event.get("logistics") or 0) for event in events),
+        "payout": sum(float(event.get("payout") or 0) for event in events),
+        "average_check": revenue / max(1, orders),
+        "product_count": len(products),
+        "top_products": sorted(
+            products.values(),
+            key=lambda value: (float(value.get("revenue") or 0), float(value.get("quantity") or 0)),
+            reverse=True,
+        )[:5],
+        "period_start": period_start,
+        "period_end": period_end,
+    }
+
+
+def summarize_sales_digest_items(
+    items: list[dict[str, Any]],
+    *,
+    shop_id: int,
+    period_start: datetime,
+    period_end: datetime,
+) -> dict[str, Any]:
+    events = [_sales_digest_event(item, detected_at=period_end) for item in items]
+    return _sales_digest_summary_from_events(
+        events,
+        shop_id=shop_id,
+        period_start=period_start,
+        period_end=period_end,
+    )
+
+
+def load_sales_digest_summary(
+    telegram_id: int,
+    shop_id: int,
+    *,
+    period_start: datetime,
+    period_end: datetime,
+) -> dict[str, Any]:
+    init_product_value_tables()
+    params = (int(telegram_id), int(shop_id))
+    with db.connect() as conn:
+        totals = conn.execute(
+            """
+            SELECT
+                COUNT(*) AS positions,
+                COUNT(DISTINCT CASE
+                    WHEN order_id IS NOT NULL AND order_id NOT IN ('', '-', '—')
+                    THEN order_id END
+                ) AS orders,
+                COALESCE(SUM(quantity), 0) AS units,
+                COALESCE(SUM(revenue), 0) AS revenue,
+                COALESCE(SUM(commission), 0) AS commission,
+                COALESCE(SUM(logistics), 0) AS logistics,
+                COALESCE(SUM(payout), 0) AS payout,
+                COUNT(DISTINCT COALESCE(product_title, '') || char(31) || COALESCE(sku_title, ''))
+                    AS product_count
+            FROM sales_digest_queue
+            WHERE telegram_id = ? AND shop_id = ?
+            """,
+            params,
+        ).fetchone()
+        top_rows = conn.execute(
+            """
+            SELECT
+                COALESCE(product_title, 'Без названия') AS title,
+                COALESCE(sku_title, '-') AS sku,
+                COALESCE(SUM(quantity), 0) AS quantity,
+                COALESCE(SUM(revenue), 0) AS revenue
+            FROM sales_digest_queue
+            WHERE telegram_id = ? AND shop_id = ?
+            GROUP BY product_title, sku_title
+            ORDER BY revenue DESC, quantity DESC
+            LIMIT 5
+            """,
+            params,
+        ).fetchall()
+    positions = int(totals["positions"] or 0) if totals else 0
+    orders = int(totals["orders"] or 0) if totals else 0
+    revenue = float(totals["revenue"] or 0) if totals else 0.0
+    return {
+        "shop_id": int(shop_id),
+        "positions": positions,
+        "orders": orders or positions,
+        "units": float(totals["units"] or 0) if totals else 0.0,
+        "revenue": revenue,
+        "commission": float(totals["commission"] or 0) if totals else 0.0,
+        "logistics": float(totals["logistics"] or 0) if totals else 0.0,
+        "payout": float(totals["payout"] or 0) if totals else 0.0,
+        "average_check": revenue / max(1, orders or positions),
+        "product_count": int(totals["product_count"] or 0) if totals else 0,
+        "top_products": [dict(row) for row in top_rows],
+        "period_start": period_start,
+        "period_end": period_end,
+    }
+
+
+def _sales_digest_period_text(start: datetime, end: datetime, lang: str) -> str:
+    start_local = start.astimezone(UZT) if start.tzinfo else start.replace(tzinfo=UZT)
+    end_local = end.astimezone(UZT) if end.tzinfo else end.replace(tzinfo=UZT)
+    if start_local.date() == end_local.date():
+        return f"{start_local:%d.%m.%Y}, {start_local:%H:%M}–{end_local:%H:%M}"
+    return f"{start_local:%d.%m %H:%M}–{end_local:%d.%m %H:%M}"
+
+
+def build_sales_digest_message(
+    summary: dict[str, Any],
+    *,
+    lang: str = "ru",
+    burst: bool = False,
+) -> str:
+    uz = normalize_lang(lang) == "uz"
+    period = _sales_digest_period_text(
+        summary.get("period_start") or _utc_now(),
+        summary.get("period_end") or _utc_now(),
+        lang,
+    )
+    positions = int(summary.get("positions") or 0)
+    orders = int(summary.get("orders") or positions)
+    units = float(summary.get("units") or 0)
+    product_count = int(summary.get("product_count") or 0)
+    top_products = list(summary.get("top_products") or [])
+    if uz:
+        lines = [
+            "🔥 <b>Savdolar oqimi bo‘yicha hisobot</b>" if burst else "🕐 <b>Soatlik savdo hisoboti</b>",
+            f"🏪 Do‘kon: <code>{int(summary.get('shop_id') or 0)}</code>",
+            f"🕒 Davr: <b>{period}</b>",
+            "",
+            f"🧾 Buyurtmalar: <b>{orders}</b> | Pozitsiyalar: <b>{positions}</b>",
+            f"📦 Sotildi: <b>{units:g} dona</b>",
+            f"💵 Tushum: <b>{_format_money(float(summary.get('revenue') or 0))}</b>",
+            f"🧮 O‘rtacha chek: <b>{_format_money(float(summary.get('average_check') or 0))}</b>",
+            f"🏷 Komissiya: <b>{_format_money(float(summary.get('commission') or 0))}</b>",
+            f"🚚 Logistika: <b>{_format_money(float(summary.get('logistics') or 0))}</b>",
+            f"✅ To‘lovga: <b>{_format_money(float(summary.get('payout') or 0))}</b>",
+        ]
+        if top_products:
+            lines.extend(["", "🏆 <b>Top tovarlar:</b>"])
+            for index, product in enumerate(top_products, start=1):
+                title = escape(_short_text(str(product.get("title") or product.get("sku") or "-"), 55))
+                lines.append(
+                    f"{index}. {title} — <b>{float(product.get('quantity') or 0):g} dona</b> · "
+                    f"{_format_money(float(product.get('revenue') or 0))}"
+                )
+        if product_count > len(top_products):
+            lines.append(f"Yana tovarlar: <b>{product_count - len(top_products)}</b>")
+        return "\n".join(lines)
+
+    lines = [
+        "🔥 <b>Сводка по потоку продаж</b>" if burst else "🕐 <b>Продажи за час</b>",
+        f"🏪 Магазин: <code>{int(summary.get('shop_id') or 0)}</code>",
+        f"🕒 Период: <b>{period}</b>",
+        "",
+        f"🧾 Заказов: <b>{orders}</b> | Позиций: <b>{positions}</b>",
+        f"📦 Продано: <b>{units:g} шт.</b>",
+        f"💵 Выручка: <b>{_format_money(float(summary.get('revenue') or 0))}</b>",
+        f"🧮 Средний чек: <b>{_format_money(float(summary.get('average_check') or 0))}</b>",
+        f"🏷 Комиссия: <b>{_format_money(float(summary.get('commission') or 0))}</b>",
+        f"🚚 Логистика: <b>{_format_money(float(summary.get('logistics') or 0))}</b>",
+        f"✅ К выплате: <b>{_format_money(float(summary.get('payout') or 0))}</b>",
+    ]
+    if top_products:
+        lines.extend(["", "🏆 <b>Топ товаров:</b>"])
+        for index, product in enumerate(top_products, start=1):
+            title = escape(_short_text(str(product.get("title") or product.get("sku") or "-"), 55))
+            lines.append(
+                f"{index}. {title} — <b>{float(product.get('quantity') or 0):g} шт.</b> · "
+                f"{_format_money(float(product.get('revenue') or 0))}"
+            )
+    if product_count > len(top_products):
+        lines.append(f"Ещё товаров: <b>{product_count - len(top_products)}</b>")
+    return "\n".join(lines)
+
+
+def mark_sales_digest_sent(
+    telegram_id: int,
+    shop_id: int,
+    *,
+    sent_at: datetime | None = None,
+    clear_queue: bool = True,
+) -> None:
+    init_product_value_tables()
+    now_text = _dt_to_db(sent_at or _utc_now()) or ""
+    with db.connect() as conn:
+        if clear_queue:
+            conn.execute(
+                "DELETE FROM sales_digest_queue WHERE telegram_id = ? AND shop_id = ?",
+                (int(telegram_id), int(shop_id)),
+            )
+        conn.execute(
+            """
+            INSERT INTO sales_digest_state
+                (telegram_id, shop_id, last_sent_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id, shop_id) DO UPDATE SET
+                last_sent_at = excluded.last_sent_at,
+                updated_at = excluded.updated_at
+            """,
+            (int(telegram_id), int(shop_id), now_text, now_text),
+        )
+        conn.commit()
+
+
+async def maybe_send_hourly_sales_digest(
+    telegram_id: int,
+    shop_id: int,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    current = now or _utc_now()
+    last_sent = get_sales_digest_last_sent(telegram_id, shop_id, now=current)
+    if current - last_sent < timedelta(seconds=SALES_DIGEST_INTERVAL_SECONDS):
+        return False
+    summary = load_sales_digest_summary(
+        telegram_id,
+        shop_id,
+        period_start=last_sent,
+        period_end=current,
+    )
+    if int(summary.get("positions") or 0) <= 0:
+        mark_sales_digest_sent(
+            telegram_id,
+            shop_id,
+            sent_at=current,
+            clear_queue=False,
+        )
+        return False
+    try:
+        await bot.send_message(
+            telegram_id,
+            build_sales_digest_message(
+                summary,
+                lang=get_user_language(telegram_id),
+            ),
+            reply_markup=main_menu_for_user(telegram_id),
+        )
+    except Exception:
+        logging.exception(
+            "Hourly sales digest: delivery failed user=%s shop=%s events=%s",
+            telegram_id,
+            shop_id,
+            summary.get("positions"),
+        )
+        return False
+    mark_sales_digest_sent(telegram_id, shop_id, sent_at=current)
+    logging.info(
+        "Hourly sales digest sent user=%s shop=%s orders=%s positions=%s units=%s revenue=%s",
+        telegram_id,
+        shop_id,
+        summary.get("orders"),
+        summary.get("positions"),
+        summary.get("units"),
+        summary.get("revenue"),
+    )
+    return True
+
+
+_sales_watch_initialized_scopes: set[tuple[int, int]] = set()
 
 
 # Финальное переопределение. sales_watch_loop использует именно эту версию.
@@ -14417,16 +15115,14 @@ async def check_new_sales_once() -> None:
             await asyncio.sleep(3)
             continue
 
-        keys_now = [sale_key(item) for item in rows]
         identity_status_now = {
             finance_identity_key(item): _finance_status(item)
             for item in rows
         }
 
         for telegram_id in telegram_ids:
-            sales_enabled = product_setting_enabled(telegram_id, "notify_sales")
+            sales_mode = get_sales_notification_mode(telegram_id)
             cancellations_enabled = product_setting_enabled(telegram_id, "notify_cancellations")
-            known = _seen_sale_keys_by_user.setdefault(telegram_id, set())
             status_memory = _sale_status_by_user.setdefault(telegram_id, {})
 
             # Загружаем статусы из SQLite. Они не пропадают после SIGTERM.
@@ -14434,7 +15130,14 @@ async def check_new_sales_once() -> None:
             if saved_statuses:
                 status_memory.update(saved_statuses)
 
-            first_ever_snapshot = not saved_statuses and telegram_id not in _sales_watch_initialized
+            # Первый снимок фиксируется отдельно, поэтому даже магазин без единой продажи
+            # не потеряет свою первую будущую продажу после перезапуска бота.
+            sales_baseline_ready = operational_watcher_initialized(
+                telegram_id,
+                shop_id,
+                "sales",
+            )
+            first_ever_snapshot = not saved_statuses and not sales_baseline_ready
 
             cancel_rows: list[dict[str, Any]] = []
             if cancellations_enabled and not first_ever_snapshot:
@@ -14442,57 +15145,119 @@ async def check_new_sales_once() -> None:
                     ident = finance_identity_key(item)
                     current_status = _finance_status(item)
                     previous_status = status_memory.get(ident)
-
-                    # Уведомляем только о реальном переходе известной строки в отмену.
                     if (
-                        previous_status is not None
-                        and _is_cancelled_status(current_status)
-                        and not _is_cancelled_status(str(previous_status))
+                        _is_cancelled_status(current_status)
+                        and (
+                            previous_status is None
+                            or not _is_cancelled_status(str(previous_status))
+                        )
                     ):
                         cancel_rows.append(item)
 
-            # Новые продажи по-прежнему отслеживаем, но отменённые как продажу не отправляем.
-            if telegram_id not in _sales_watch_initialized:
-                known.update(keys_now)
-                _sales_watch_initialized.add(telegram_id)
-                logging.info(
-                    "Sales watcher initialized for user=%s shop=%s sales_rows=%s saved_statuses=%s",
-                    telegram_id,
-                    shop_id,
-                    len(keys_now),
-                    len(saved_statuses),
-                )
+            if first_ever_snapshot:
                 new_rows: list[dict[str, Any]] = []
             else:
                 new_rows = [
-                    item for item, key in zip(rows, keys_now)
-                    if key not in known and not _is_cancelled_status(_finance_status(item))
+                    item
+                    for item in rows
+                    if finance_identity_key(item) not in saved_statuses
+                    and not _is_cancelled_status(_finance_status(item))
+                    and not _is_returned_status(_finance_status(item))
                 ]
-                known.update(keys_now)
+
+            scope = (telegram_id, shop_id)
+            if scope not in _sales_watch_initialized_scopes:
+                _sales_watch_initialized_scopes.add(scope)
+                _sales_watch_initialized.add(telegram_id)
+                logging.info(
+                    "Sales watcher initialized for user=%s shop=%s sales_rows=%s "
+                    "saved_statuses=%s mode=%s",
+                    telegram_id,
+                    shop_id,
+                    len(rows),
+                    len(saved_statuses),
+                    sales_mode,
+                )
+
+            no_longer_sales = [
+                finance_identity_key(item)
+                for item in rows
+                if _is_cancelled_status(_finance_status(item))
+                or _is_returned_status(_finance_status(item))
+            ]
+            if no_longer_sales:
+                discard_sales_digest_events(
+                    telegram_id,
+                    shop_id,
+                    no_longer_sales,
+                )
+
+            if sales_mode == "hourly" and new_rows:
+                inserted = enqueue_sales_digest_events(
+                    telegram_id,
+                    shop_id,
+                    new_rows,
+                    detected_at=now,
+                )
+                logging.info(
+                    "Hourly sales digest queued user=%s shop=%s detected=%s inserted=%s",
+                    telegram_id,
+                    shop_id,
+                    len(new_rows),
+                    inserted,
+                )
 
             status_memory.update(identity_status_now)
             save_sale_statuses(telegram_id, shop_id, identity_status_now)
+            if not sales_baseline_ready:
+                mark_operational_watcher_initialized(
+                    telegram_id,
+                    shop_id,
+                    "sales",
+                )
 
-            if len(known) > 5000:
-                _seen_sale_keys_by_user[telegram_id] = set(keys_now)
+            if sales_mode == "instant":
+                for item in new_rows[:INSTANT_SALE_BURST_LIMIT]:
+                    try:
+                        await bot.send_message(
+                            telegram_id,
+                            build_new_sale_message(
+                                item,
+                                shop_id=shop_id,
+                                lang=get_user_language(telegram_id),
+                            ),
+                            reply_markup=main_menu_for_user(telegram_id),
+                        )
+                        await asyncio.sleep(0.15)
+                    except Exception:
+                        logging.exception(
+                            "Sales watcher: failed to send sale notification to %s",
+                            telegram_id,
+                        )
 
-            for item in (new_rows[:10] if sales_enabled else []):
-                try:
-                    await bot.send_message(
-                        telegram_id,
-                        build_new_sale_message(
-                            item,
-                            shop_id=shop_id,
-                            lang=get_user_language(telegram_id),
-                        ),
-                        reply_markup=main_menu_for_user(telegram_id),
+                overflow = new_rows[INSTANT_SALE_BURST_LIMIT:]
+                if overflow:
+                    summary = summarize_sales_digest_items(
+                        overflow,
+                        shop_id=shop_id,
+                        period_start=now - timedelta(seconds=max(60, SALE_CHECK_INTERVAL_SECONDS)),
+                        period_end=now,
                     )
-                    await asyncio.sleep(0.15)
-                except Exception:
-                    logging.exception(
-                        "Sales watcher: failed to send sale notification to %s",
-                        telegram_id,
-                    )
+                    try:
+                        await bot.send_message(
+                            telegram_id,
+                            build_sales_digest_message(
+                                summary,
+                                lang=get_user_language(telegram_id),
+                                burst=True,
+                            ),
+                            reply_markup=main_menu_for_user(telegram_id),
+                        )
+                    except Exception:
+                        logging.exception(
+                            "Sales watcher: failed to send burst summary to %s",
+                            telegram_id,
+                        )
 
             for item in cancel_rows[:10]:
                 try:
@@ -14518,6 +15283,35 @@ async def check_new_sales_once() -> None:
                         "Sales watcher: failed to send cancel notification to %s",
                         telegram_id,
                     )
+
+            if len(cancel_rows) > 10:
+                lang = get_user_language(telegram_id)
+                extra = len(cancel_rows) - 10
+                text = (
+                    f"➕ Yana bekor qilingan buyurtmalar: <b>{extra}</b>\n"
+                    "Batafsil: <code>/balance</code>"
+                    if normalize_lang(lang) == "uz"
+                    else f"➕ Ещё отмен за эту проверку: <b>{extra}</b>\n"
+                    "Подробно: <code>/balance</code>"
+                )
+                try:
+                    await bot.send_message(
+                        telegram_id,
+                        text,
+                        reply_markup=main_menu_for_user(telegram_id),
+                    )
+                except Exception:
+                    logging.exception(
+                        "Sales watcher: failed to send cancel overflow to %s",
+                        telegram_id,
+                    )
+
+            if sales_mode == "hourly":
+                await maybe_send_hourly_sales_digest(
+                    telegram_id,
+                    shop_id,
+                    now=now,
+                )
 
         await asyncio.sleep(0.5)
 
@@ -15481,6 +16275,7 @@ async def fbo_acceptance_watch_loop() -> None:
 
 
 async def main() -> None:
+    logging.info("APP_BUILD: %s", APP_BUILD)
     logging.info("SKU_LABELS_INTERFACE_LOADED: official barcode types + PDF SKU labels")
     logging.info("INTUITIVE_ATTENTION_INTERFACE_LOADED: simple sections + attention report + full stock list")
     init_language_tables()
