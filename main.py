@@ -627,7 +627,7 @@ def build_premium_workbook(
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logging.getLogger("httpx").setLevel(logging.WARNING)
-APP_BUILD = "2026.07.17-sales-modes-v1"
+APP_BUILD = "2026.07.17-intuitive-ui-v1"
 
 TELEGRAM_BOT_TOKEN = (
     os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -3299,10 +3299,10 @@ def language_markup() -> InlineKeyboardMarkup:
 
 MAIN_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔌 Подключить"), KeyboardButton(text="🎥 Видеоинструкция")],
-        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
-        [KeyboardButton(text="ℹ️ Помощь")],
-        [KeyboardButton(text="🌐 Веб-кабинет")],
+        [KeyboardButton(text="🔌 Подключить магазин")],
+        [KeyboardButton(text="🎥 Как подключить")],
+        [KeyboardButton(text="🌐 Язык"), KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="💎 Подписка")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Сначала подключите магазин",
@@ -3310,10 +3310,10 @@ MAIN_MENU_RU = ReplyKeyboardMarkup(
 
 MAIN_MENU_RU_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔌 Подключить"), KeyboardButton(text="🎥 Видеоинструкция")],
-        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
-        [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="👑 Админ")],
-        [KeyboardButton(text="🌐 Веб-кабинет")],
+        [KeyboardButton(text="🔌 Подключить магазин")],
+        [KeyboardButton(text="🎥 Как подключить")],
+        [KeyboardButton(text="🌐 Язык"), KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="👑 Админ")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Сначала подключите магазин",
@@ -3321,10 +3321,10 @@ MAIN_MENU_RU_ADMIN = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔌 Ulash"), KeyboardButton(text="🎥 API ulash videosi")],
-        [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
-        [KeyboardButton(text="ℹ️ Yordam")],
-        [KeyboardButton(text="🌐 Veb-kabinet")],
+        [KeyboardButton(text="🔌 Do‘konni ulash")],
+        [KeyboardButton(text="🎥 Qanday ulash kerak")],
+        [KeyboardButton(text="🌐 Til"), KeyboardButton(text="ℹ️ Yordam")],
+        [KeyboardButton(text="💎 Obuna")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Avval do‘konni ulang",
@@ -3332,10 +3332,10 @@ MAIN_MENU_UZ = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔌 Ulash"), KeyboardButton(text="🎥 API ulash videosi")],
-        [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
-        [KeyboardButton(text="ℹ️ Yordam"), KeyboardButton(text="👑 Admin")],
-        [KeyboardButton(text="🌐 Veb-kabinet")],
+        [KeyboardButton(text="🔌 Do‘konni ulash")],
+        [KeyboardButton(text="🎥 Qanday ulash kerak")],
+        [KeyboardButton(text="🌐 Til"), KeyboardButton(text="ℹ️ Yordam")],
+        [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="👑 Admin")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Avval do‘konni ulang",
@@ -3344,12 +3344,10 @@ MAIN_MENU_UZ_ADMIN = ReplyKeyboardMarkup(
 # Главное меню после подключения API: простая структура по разделам.
 MAIN_MENU_RU_CONNECTED = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🏠 Обзор магазина")],
         [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
-        [KeyboardButton(text="💼 Центр действий"), KeyboardButton(text="🔔 Уведомления")],
-        [KeyboardButton(text="📊 Отчёты"), KeyboardButton(text="🏪 Магазины")],
-        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
-        [KeyboardButton(text="ℹ️ Помощь")],
-        [KeyboardButton(text="🌐 Веб-кабинет")],
+        [KeyboardButton(text="🚨 Важно сейчас"), KeyboardButton(text="📊 Отчёты")],
+        [KeyboardButton(text="⚙️ Настройки")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите раздел",
@@ -3357,12 +3355,10 @@ MAIN_MENU_RU_CONNECTED = ReplyKeyboardMarkup(
 
 MAIN_MENU_RU_CONNECTED_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🏠 Обзор магазина")],
         [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="📦 Склад")],
-        [KeyboardButton(text="💼 Центр действий"), KeyboardButton(text="🔔 Уведомления")],
-        [KeyboardButton(text="📊 Отчёты"), KeyboardButton(text="🏪 Магазины")],
-        [KeyboardButton(text="💎 Подписка"), KeyboardButton(text="🌐 Язык")],
-        [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="👑 Админ")],
-        [KeyboardButton(text="🌐 Веб-кабинет")],
+        [KeyboardButton(text="🚨 Важно сейчас"), KeyboardButton(text="📊 Отчёты")],
+        [KeyboardButton(text="⚙️ Настройки"), KeyboardButton(text="👑 Админ")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Выберите раздел",
@@ -3370,12 +3366,10 @@ MAIN_MENU_RU_CONNECTED_ADMIN = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ_CONNECTED = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🏠 Do‘kon holati")],
         [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
-        [KeyboardButton(text="💼 Amallar markazi"), KeyboardButton(text="🔔 Xabarnomalar")],
-        [KeyboardButton(text="📊 Hisobotlar"), KeyboardButton(text="🏪 Do‘konlar")],
-        [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
-        [KeyboardButton(text="ℹ️ Yordam")],
-        [KeyboardButton(text="🌐 Veb-kabinet")],
+        [KeyboardButton(text="🚨 Hozir muhim"), KeyboardButton(text="📊 Hisobotlar")],
+        [KeyboardButton(text="⚙️ Sozlamalar")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Bo‘limni tanlang",
@@ -3383,12 +3377,10 @@ MAIN_MENU_UZ_CONNECTED = ReplyKeyboardMarkup(
 
 MAIN_MENU_UZ_CONNECTED_ADMIN = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="🏠 Do‘kon holati")],
         [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="📦 Ombor")],
-        [KeyboardButton(text="💼 Amallar markazi"), KeyboardButton(text="🔔 Xabarnomalar")],
-        [KeyboardButton(text="📊 Hisobotlar"), KeyboardButton(text="🏪 Do‘konlar")],
-        [KeyboardButton(text="💎 Obuna"), KeyboardButton(text="🌐 Til")],
-        [KeyboardButton(text="ℹ️ Yordam"), KeyboardButton(text="👑 Admin")],
-        [KeyboardButton(text="🌐 Veb-kabinet")],
+        [KeyboardButton(text="🚨 Hozir muhim"), KeyboardButton(text="📊 Hisobotlar")],
+        [KeyboardButton(text="⚙️ Sozlamalar"), KeyboardButton(text="👑 Admin")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Bo‘limni tanlang",
@@ -3398,11 +3390,9 @@ SALES_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Сегодня"), KeyboardButton(text="📆 Вчера")],
         [KeyboardButton(text="🗓 7 дней"), KeyboardButton(text="📅 30 дней")],
-        [KeyboardButton(text="📊 Бизнес-сводка"), KeyboardButton(text="🌐 Все магазины")],
-        [KeyboardButton(text="🏆 Топ товаров"), KeyboardButton(text="🐢 Не продаётся")],
-        [KeyboardButton(text="🧾 Юнит-экономика"), KeyboardButton(text="💰 Прибыль")],
-        [KeyboardButton(text="📥 Себестоимость Excel"), KeyboardButton(text="🧮 Расходы и налоги")],
-        [KeyboardButton(text="⬅️ Главное меню")],
+        [KeyboardButton(text="💰 Прибыль"), KeyboardButton(text="🏆 Топ товаров")],
+        [KeyboardButton(text="✨ Ещё по продажам")],
+        [KeyboardButton(text="🏠 Главное")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Продажи",
@@ -3412,22 +3402,42 @@ SALES_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Bugun"), KeyboardButton(text="📆 Kecha")],
         [KeyboardButton(text="🗓 7 kun"), KeyboardButton(text="📅 30 kun")],
-        [KeyboardButton(text="📊 Biznes xulosa"), KeyboardButton(text="🌐 Barcha do‘konlar")],
-        [KeyboardButton(text="🏆 Top tovarlar"), KeyboardButton(text="🐢 Sotilmayapti")],
-        [KeyboardButton(text="🧾 Unit iqtisodiyot"), KeyboardButton(text="💰 Foyda")],
-        [KeyboardButton(text="📥 Tannarx Excel"), KeyboardButton(text="🧮 Xarajat va soliq")],
-        [KeyboardButton(text="⬅️ Asosiy menyu")],
+        [KeyboardButton(text="💰 Foyda"), KeyboardButton(text="🏆 Top tovarlar")],
+        [KeyboardButton(text="✨ Yana savdo tahlili")],
+        [KeyboardButton(text="🏠 Asosiy")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Savdo",
 )
 
+SALES_MORE_MENU_RU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📊 Бизнес-сводка"), KeyboardButton(text="🌐 Все магазины")],
+        [KeyboardButton(text="🐢 Не продаётся"), KeyboardButton(text="🧾 Юнит-экономика")],
+        [KeyboardButton(text="📥 Себестоимость Excel"), KeyboardButton(text="🧮 Расходы и налоги")],
+        [KeyboardButton(text="⬅️ Продажи"), KeyboardButton(text="🏠 Главное")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Дополнительная аналитика",
+)
+
+SALES_MORE_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📊 Biznes xulosa"), KeyboardButton(text="🌐 Barcha do‘konlar")],
+        [KeyboardButton(text="🐢 Sotilmayapti"), KeyboardButton(text="🧾 Unit iqtisodiyot")],
+        [KeyboardButton(text="📥 Tannarx Excel"), KeyboardButton(text="🧮 Xarajat va soliq")],
+        [KeyboardButton(text="⬅️ Savdo"), KeyboardButton(text="🏠 Asosiy")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Qo‘shimcha tahlil",
+)
+
 STOCK_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📦 Остатки"), KeyboardButton(text="⚠️ Прогноз остатков")],
-        [KeyboardButton(text="🧭 Потерянные"), KeyboardButton(text="🏷 Этикетки SKU")],
-        [KeyboardButton(text="🚚 План поставки"), KeyboardButton(text="⚙️ Параметры поставки")],
-        [KeyboardButton(text="⬅️ Главное меню")],
+        [KeyboardButton(text="🚚 План поставки"), KeyboardButton(text="🧭 Потерянные товары")],
+        [KeyboardButton(text="🏷 Этикетки SKU"), KeyboardButton(text="⚙️ Параметры поставки")],
+        [KeyboardButton(text="🏠 Главное")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Склад",
@@ -3436,9 +3446,9 @@ STOCK_MENU_RU = ReplyKeyboardMarkup(
 STOCK_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📦 Qoldiq"), KeyboardButton(text="⚠️ Qoldiq prognozi")],
-        [KeyboardButton(text="🧭 Yo‘qolganlar"), KeyboardButton(text="🏷 SKU etiketkalari")],
-        [KeyboardButton(text="🚚 Yetkazib berish rejasi"), KeyboardButton(text="⚙️ Yetkazish sozlamasi")],
-        [KeyboardButton(text="⬅️ Asosiy menyu")],
+        [KeyboardButton(text="🚚 Yetkazib berish rejasi"), KeyboardButton(text="🧭 Yo‘qolgan tovarlar")],
+        [KeyboardButton(text="🏷 SKU etiketkalari"), KeyboardButton(text="⚙️ Yetkazish sozlamasi")],
+        [KeyboardButton(text="🏠 Asosiy")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Ombor",
@@ -3446,12 +3456,8 @@ STOCK_MENU_UZ = ReplyKeyboardMarkup(
 
 NOTIFY_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💸 Новые продажи"), KeyboardButton(text="📉 Низкие остатки")],
-        [KeyboardButton(text="❌ Нет в наличии"), KeyboardButton(text="🚫 Отмены заказов")],
-        [KeyboardButton(text="🧭 Потери и брак"), KeyboardButton(text="🚚 Приёмка FBO")],
-        [KeyboardButton(text="📅 Автоотчёты"), KeyboardButton(text="⭐ Отзывы")],
         [KeyboardButton(text="⚙️ Настроить уведомления")],
-        [KeyboardButton(text="⬅️ Главное меню")],
+        [KeyboardButton(text="⬅️ Настройки"), KeyboardButton(text="🏠 Главное")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Уведомления",
@@ -3459,12 +3465,8 @@ NOTIFY_MENU_RU = ReplyKeyboardMarkup(
 
 NOTIFY_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="💸 Yangi savdolar"), KeyboardButton(text="📉 Kam qoldiq")],
-        [KeyboardButton(text="❌ Qoldiq tugagan"), KeyboardButton(text="🚫 Bekor qilishlar")],
-        [KeyboardButton(text="🧭 Yo‘qotish va yaroqsiz"), KeyboardButton(text="🚚 FBO qabuli")],
-        [KeyboardButton(text="📅 Avtohisobotlar"), KeyboardButton(text="⭐ Sharhlar")],
         [KeyboardButton(text="⚙️ Xabarnomalarni sozlash")],
-        [KeyboardButton(text="⬅️ Asosiy menyu")],
+        [KeyboardButton(text="⬅️ Sozlamalar"), KeyboardButton(text="🏠 Asosiy")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Xabarnomalar",
@@ -3472,12 +3474,10 @@ NOTIFY_MENU_UZ = ReplyKeyboardMarkup(
 
 REPORT_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Excel отчёт"), KeyboardButton(text="🌙 Утренний отчёт")],
-        [KeyboardButton(text="💰 Прибыль"), KeyboardButton(text="📥 Себестоимость Excel")],
-        [KeyboardButton(text="⭐ Отзывы"), KeyboardButton(text="✅ Проверить подключение")],
-        [KeyboardButton(text="📈 Польза бота"), KeyboardButton(text="🧮 Расходы и налоги")],
-        [KeyboardButton(text="🔐 Безопасность")],
-        [KeyboardButton(text="⬅️ Главное меню")],
+        [KeyboardButton(text="📊 Excel-отчёт")],
+        [KeyboardButton(text="🌙 Краткий отчёт"), KeyboardButton(text="💰 Прибыль")],
+        [KeyboardButton(text="📈 Польза бота"), KeyboardButton(text="📅 Автоотчёты")],
+        [KeyboardButton(text="🏠 Главное")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Отчёты",
@@ -3485,24 +3485,102 @@ REPORT_MENU_RU = ReplyKeyboardMarkup(
 
 REPORT_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Excel hisobot"), KeyboardButton(text="🌙 Ertalabki hisobot")],
-        [KeyboardButton(text="💰 Foyda"), KeyboardButton(text="📥 Tannarx Excel")],
-        [KeyboardButton(text="⭐ Sharhlar"), KeyboardButton(text="✅ Ulanishni tekshirish")],
-        [KeyboardButton(text="📈 Bot foydasi"), KeyboardButton(text="🧮 Xarajat va soliq")],
-        [KeyboardButton(text="🔐 Xavfsizlik")],
-        [KeyboardButton(text="⬅️ Asosiy menyu")],
+        [KeyboardButton(text="📊 Excel hisobot")],
+        [KeyboardButton(text="🌙 Qisqa hisobot"), KeyboardButton(text="💰 Foyda")],
+        [KeyboardButton(text="📈 Bot foydasi"), KeyboardButton(text="📅 Avtohisobotlar")],
+        [KeyboardButton(text="🏠 Asosiy")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Hisobotlar",
 )
 
+SETTINGS_MENU_RU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🔔 Уведомления")],
+        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="🌐 Язык")],
+        [KeyboardButton(text="🧮 Финансы"), KeyboardButton(text="🚚 Настройки поставки")],
+        [KeyboardButton(text="🔐 Подключение Uzum"), KeyboardButton(text="🌐 Веб-кабинет")],
+        [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="💎 Подписка")],
+        [KeyboardButton(text="🏠 Главное")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Настройки",
+)
+
+SETTINGS_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🔔 Xabarnomalar")],
+        [KeyboardButton(text="🏪 Do‘konlar"), KeyboardButton(text="🌐 Til")],
+        [KeyboardButton(text="🧮 Moliya"), KeyboardButton(text="🚚 Yetkazish sozlamalari")],
+        [KeyboardButton(text="🔐 Uzum ulanishi"), KeyboardButton(text="🌐 Veb-kabinet")],
+        [KeyboardButton(text="ℹ️ Yordam"), KeyboardButton(text="💎 Obuna")],
+        [KeyboardButton(text="🏠 Asosiy")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Sozlamalar",
+)
+
+FINANCE_MENU_RU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📥 Себестоимость Excel")],
+        [KeyboardButton(text="🧮 Расходы и налоги"), KeyboardButton(text="💰 Прибыль")],
+        [KeyboardButton(text="🧾 Юнит-экономика")],
+        [KeyboardButton(text="⬅️ Настройки"), KeyboardButton(text="🏠 Главное")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Финансы",
+)
+
+FINANCE_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📥 Tannarx Excel")],
+        [KeyboardButton(text="🧮 Xarajat va soliq"), KeyboardButton(text="💰 Foyda")],
+        [KeyboardButton(text="🧾 Unit iqtisodiyot")],
+        [KeyboardButton(text="⬅️ Sozlamalar"), KeyboardButton(text="🏠 Asosiy")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Moliya",
+)
+
+CONNECTION_MENU_RU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="✅ Проверить подключение")],
+        [KeyboardButton(text="🔌 Обновить API-ключ"), KeyboardButton(text="🔐 Безопасность")],
+        [KeyboardButton(text="⬅️ Настройки"), KeyboardButton(text="🏠 Главное")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Подключение Uzum",
+)
+
+CONNECTION_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="✅ Ulanishni tekshirish")],
+        [KeyboardButton(text="🔌 API-kalitni yangilash"), KeyboardButton(text="🔐 Xavfsizlik")],
+        [KeyboardButton(text="⬅️ Sozlamalar"), KeyboardButton(text="🏠 Asosiy")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Uzum ulanishi",
+)
+
+CONNECT_INPUT_MENU_RU = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="❌ Отмена")]],
+    resize_keyboard=True,
+    input_field_placeholder="Вставьте API-ключ сюда",
+)
+
+CONNECT_INPUT_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[[KeyboardButton(text="❌ Bekor qilish")]],
+    resize_keyboard=True,
+    input_field_placeholder="API-kalitni shu yerga kiriting",
+)
+
 ATTENTION_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔍 Проверить сейчас")],
+        [KeyboardButton(text="🔍 Проверить магазин")],
         [KeyboardButton(text="⚠️ Остатки"), KeyboardButton(text="🐢 Без продаж")],
         [KeyboardButton(text="🧾 Нет себестоимости"), KeyboardButton(text="📉 Низкая прибыль")],
-        [KeyboardButton(text="❌ Отмены"), KeyboardButton(text="📈 Польза бота")],
-        [KeyboardButton(text="⬅️ Главное меню")],
+        [KeyboardButton(text="❌ Отмены")],
+        [KeyboardButton(text="🏠 Главное")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Что проверить",
@@ -3510,11 +3588,11 @@ ATTENTION_MENU_RU = ReplyKeyboardMarkup(
 
 ATTENTION_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔍 Hozir tekshirish")],
+        [KeyboardButton(text="🔍 Do‘konni tekshirish")],
         [KeyboardButton(text="⚠️ Qoldiqlar"), KeyboardButton(text="🐢 Sotuv yo‘q")],
         [KeyboardButton(text="🧾 Tannarx yo‘q"), KeyboardButton(text="📉 Past foyda")],
-        [KeyboardButton(text="❌ Bekor qilishlar"), KeyboardButton(text="📈 Bot foydasi")],
-        [KeyboardButton(text="⬅️ Asosiy menyu")],
+        [KeyboardButton(text="❌ Bekor qilishlar")],
+        [KeyboardButton(text="🏠 Asosiy")],
     ],
     resize_keyboard=True,
     input_field_placeholder="Nimani tekshiramiz",
@@ -3553,7 +3631,6 @@ ANALYTICS_MENU = MAIN_MENU_RU
 PRODUCTS_MENU = MAIN_MENU_RU
 ORDERS_MENU = MAIN_MENU_RU
 NOTIFICATIONS_MENU = MAIN_MENU_RU
-SETTINGS_MENU = MAIN_MENU_RU
 
 
 def _user_has_uzum_connection(telegram_id: int | None) -> bool:
@@ -3587,6 +3664,10 @@ def sales_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
     return SALES_MENU_UZ if get_user_language(telegram_id) == "uz" else SALES_MENU_RU
 
 
+def sales_more_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
+    return SALES_MORE_MENU_UZ if get_user_language(telegram_id) == "uz" else SALES_MORE_MENU_RU
+
+
 def stock_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
     return STOCK_MENU_UZ if get_user_language(telegram_id) == "uz" else STOCK_MENU_RU
 
@@ -3597,6 +3678,18 @@ def notify_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
 
 def report_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
     return REPORT_MENU_UZ if get_user_language(telegram_id) == "uz" else REPORT_MENU_RU
+
+
+def settings_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
+    return SETTINGS_MENU_UZ if get_user_language(telegram_id) == "uz" else SETTINGS_MENU_RU
+
+
+def finance_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
+    return FINANCE_MENU_UZ if get_user_language(telegram_id) == "uz" else FINANCE_MENU_RU
+
+
+def connection_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
+    return CONNECTION_MENU_UZ if get_user_language(telegram_id) == "uz" else CONNECTION_MENU_RU
 
 
 def attention_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
@@ -3614,6 +3707,10 @@ def sales_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
     return sales_menu_for_user(_message_user_id(message))
 
 
+def sales_more_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
+    return sales_more_menu_for_user(_message_user_id(message))
+
+
 def stock_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
     return stock_menu_for_user(_message_user_id(message))
 
@@ -3624,6 +3721,18 @@ def notify_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
 
 def report_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
     return report_menu_for_user(_message_user_id(message))
+
+
+def settings_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
+    return settings_menu_for_user(_message_user_id(message))
+
+
+def finance_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
+    return finance_menu_for_user(_message_user_id(message))
+
+
+def connection_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
+    return connection_menu_for_user(_message_user_id(message))
 
 
 def attention_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
@@ -3909,14 +4018,14 @@ async def connect_shop_by_staff(message: Message, shop_id_text: str, state: FSMC
                 "✅ <b>Do‘kon ulandi</b>\n\n"
                 f"Shop ID: <code>{shop_id}</code>\n"
                 "Xodim orqali kirish tasdiqlandi.\n\n"
-                "Endi savdolar, qoldiqlar va hisobotlardan foydalanishingiz mumkin."
+                "Boshlash uchun <b>🏠 Do‘kon holati</b> tugmasini bosing."
             )
         else:
             text_ok = (
                 "✅ <b>Магазин подключён</b>\n\n"
                 f"Shop ID: <code>{shop_id}</code>\n"
                 "Доступ через сотрудника подтверждён.\n\n"
-                "Теперь можно смотреть продажи, остатки и отчёты."
+                "Для начала нажмите <b>🏠 Обзор магазина</b>."
             )
         await message.answer(text_ok, reply_markup=menu_for_message(message))
         await notify_admins_staff_shop_connected(message, telegram_id, shop_id)
@@ -3958,23 +4067,29 @@ async def require_connection(message: Message) -> tuple[int, UzumClient, int] | 
         lang = get_user_language(telegram_id)
         if lang == "uz":
             text = (
-                "Avval do‘konni ulang.\n\n"
-                "<code>/connect</code> buyrug‘ini bosing va Uzum Seller API-kalitingizni yuboring.\n"
-                "Videoqo‘llanma: <code>/video</code>"
+                "🔌 <b>Avval do‘konni ulang</b>\n\n"
+                "Pastdagi <b>🎥 Qanday ulash kerak</b> videosini ko‘ring, so‘ng "
+                "<b>🔌 Do‘konni ulash</b> tugmasini bosing."
             )
         else:
             text = (
-                "Сначала подключите магазин.\n\n"
-                "Нажмите <code>/connect</code> и отправьте API-ключ из кабинета Uzum Seller.\n"
-                "Видеоинструкция: <code>/video</code>"
+                "🔌 <b>Сначала подключите магазин</b>\n\n"
+                "Посмотрите <b>🎥 Как подключить</b>, затем нажмите "
+                "<b>🔌 Подключить магазин</b>."
             )
         await message.answer(text, reply_markup=menu_for_message(message))
         return None
 
     if shop_id is None:
+        lang = get_user_language(telegram_id)
         await message.answer(
-            "Токен подключён, но основной магазин не выбран.\n"
-            "Напишите <code>/shops</code>, потом <code>/setshop SHOP_ID</code>.",
+            (
+                "API-kalit ulangan, lekin faol do‘kon tanlanmagan.\n"
+                "<b>⚙️ Sozlamalar → 🏪 Do‘konlar</b> bo‘limidan do‘konni tanlang."
+                if lang == "uz"
+                else "API-ключ подключён, но активный магазин не выбран.\n"
+                "Откройте <b>⚙️ Настройки → 🏪 Магазины</b> и выберите магазин."
+            ),
             reply_markup=menu_for_message(message),
         )
         return None
@@ -3989,7 +4104,8 @@ async def send_api_error(message: Message, error: Exception) -> None:
         user_text = (
             "🔐 <b>Uzum API-ключ не принят</b>\n\n"
             "Возможно, ключ неверный, удалён или истёк.\n"
-            "Создайте новый ключ в кабинете Uzum Seller и подключите его через <code>/reconnect</code>."
+            "Создайте новый ключ и откройте <b>⚙️ Настройки → 🔐 Подключение Uzum → "
+            "🔌 Обновить API-ключ</b>."
         )
     elif "403" in raw or "rbac" in low or "forbidden" in low:
         user_text = (
@@ -4072,10 +4188,14 @@ async def connect_token(
     telegram_id = upsert_from_message(message)
     token = token.strip()
     if not token or len(token) < 20:
+        lang = get_user_language(telegram_id)
         await message.answer(
-            "Похоже, это не Uzum API-токен.\n"
-            "Отправьте полный токен или нажмите /cancel.",
-            reply_markup=menu_for_message(message),
+            (
+                "Bu API-kalitga o‘xshamaydi. To‘liq kalitni bitta xabar qilib yuboring."
+                if lang == "uz"
+                else "Похоже, это не API-ключ. Отправьте полный ключ одним сообщением."
+            ),
+            reply_markup=CONNECT_INPUT_MENU_UZ if lang == "uz" else CONNECT_INPUT_MENU_RU,
         )
         return
 
@@ -4084,12 +4204,16 @@ async def connect_token(
         data = await client.get_shops()
         shops = extract_items(data)
         if not shops:
+            lang = get_user_language(telegram_id)
             await message.answer(
-                "Токен сработал, но список магазинов не найден.\n"
-                "Ответ API:\n<code>"
-                + escape(compact_json_preview(data))
-                + "</code>",
-                reply_markup=menu_for_message(message),
+                (
+                    "Kalit qabul qilindi, lekin unga bog‘langan do‘kon topilmadi. "
+                    "Kalit huquqlarini tekshiring yoki boshqa kalit yuboring."
+                    if lang == "uz"
+                    else "Ключ принят, но доступных магазинов не найдено. "
+                    "Проверьте права ключа или отправьте другой ключ."
+                ),
+                reply_markup=CONNECT_INPUT_MENU_UZ if lang == "uz" else CONNECT_INPUT_MENU_RU,
             )
             return
 
@@ -4102,36 +4226,41 @@ async def connect_token(
             pass
 
         lang = get_user_language(telegram_id)
-        lines = [format_shop_line(shop) for shop in shops[:20]]
         if lang == "uz":
             text_ok = (
                 "✅ <b>Do‘kon ulandi</b>\n\n"
                 f"Topilgan do‘konlar: <b>{len(shops)}</b>\n"
-                + "\n".join(lines)
-                + "\n\nFaol do‘kon: "
+                "Faol do‘kon: "
                 + (f"<code>{default_shop_id}</code>" if default_shop_id else "tanlanmagan")
-                + "\n\nEndi asosiy bo‘limlardan foydalanishingiz mumkin:\n"
-                "💰 <b>Savdo</b> — bugun, kecha, 7/30 kun\n"
-                "📦 <b>Ombor</b> — qoldiq va prognoz\n"
-                "📊 <b>Hisobotlar</b> — Excel va tekshiruv"
+                + "\n\nTayyor. Boshlash uchun:\n"
+                "🏠 <b>Do‘kon holati</b> — asosiy raqamlar\n"
+                "🚨 <b>Hozir muhim</b> — birinchi navbatdagi muammolar\n"
+                "💰 <b>Savdo</b> va 📦 <b>Ombor</b> — batafsil ma’lumot"
             )
         else:
             text_ok = (
                 "✅ <b>Магазин подключён</b>\n\n"
                 f"Найдено магазинов: <b>{len(shops)}</b>\n"
-                + "\n".join(lines)
-                + "\n\nАктивный магазин: "
+                "Активный магазин: "
                 + (f"<code>{default_shop_id}</code>" if default_shop_id else "не выбран")
-                + "\n\nТеперь пользуйтесь основными разделами:\n"
-                "💰 <b>Продажи</b> — сегодня, вчера, 7/30 дней\n"
-                "📦 <b>Склад</b> — остатки и прогноз\n"
-                "📊 <b>Отчёты</b> — Excel и проверка подключения"
+                + "\n\nГотово. Начните с разделов:\n"
+                "🏠 <b>Обзор магазина</b> — главные цифры\n"
+                "🚨 <b>Важно сейчас</b> — проблемы в первую очередь\n"
+                "💰 <b>Продажи</b> и 📦 <b>Склад</b> — подробности"
             )
         await message.answer(text_ok, reply_markup=menu_for_message(message))
         if state:
             await state.clear()
     except Exception as e:
         await send_api_error(message, e)
+        if state:
+            lang = get_user_language(telegram_id)
+            await message.answer(
+                "Boshqa kalit yuboring yoki bekor qiling."
+                if lang == "uz"
+                else "Отправьте другой ключ или отмените подключение.",
+                reply_markup=CONNECT_INPUT_MENU_UZ if lang == "uz" else CONNECT_INPUT_MENU_RU,
+            )
 
 
 @dp.message(Command("language", "lang", "til"))
@@ -4408,43 +4537,58 @@ async def start(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     ensure_subscription(telegram_id)
     lang = get_user_language(telegram_id)
-    connected = "✅ подключён" if db.has_uzum_connection(telegram_id) else "❌ не подключён"
+    is_connected = db.has_uzum_connection(telegram_id)
+    connected = "✅ подключён" if is_connected else "❌ не подключён"
     if lang == "uz":
-        connected = "✅ ulangan" if db.has_uzum_connection(telegram_id) else "❌ ulanmagan"
+        connected = "✅ ulangan" if is_connected else "❌ ulanmagan"
     sub_line = subscription_status_text(telegram_id)
 
-    admin_part = ""
-
     if lang == "uz":
-        text = (
-            "👋 <b>Uzum Seller Assistant</b>\n\n"
-            "Sotuv, qoldiq va hisobotlarni Telegramda ko‘rish uchun yordamchi bot.\n\n"
-            f"Uzum API: {connected}\n"
-            f"Kirish: {sub_line}\n"
-            f"Til: <b>{language_title(lang)}</b>\n\n"
-            "🚀 <b>Boshlash uchun 3 qadam:</b>\n"
-            "1. <code>/video</code> — API ulash videosini ko‘ring\n"
-            "2. <code>/connect</code> — API-kalitni botga yuboring\n"
-            "3. <b>💰 Savdo</b> yoki <b>📦 Ombor</b> bo‘limini tanlang\n\n"
-            "Asosiy menyuda faqat eng kerakli bo‘limlar qoldirildi.\n"
-            "Yordam: <code>/support</code>"
-            + admin_part
-        )
+        if is_connected:
+            text = (
+                "👋 <b>Seller.pro.uz</b>\n\n"
+                f"Do‘kon: {connected}\n"
+                f"Kirish: {sub_line}\n\n"
+                "<b>Nimadan boshlash kerak?</b>\n"
+                "🏠 <b>Do‘kon holati</b> — asosiy raqamlarni bir joyda ko‘rish\n"
+                "🚨 <b>Hozir muhim</b> — yo‘qotish va pul xavflarini topish\n"
+                "💰 <b>Savdo</b> va 📦 <b>Ombor</b> — kundalik ishlar\n\n"
+                "Kerakli tugmani pastdan bosing 👇"
+            )
+        else:
+            text = (
+                "👋 <b>Seller.pro.uz</b>\n\n"
+                "Uzum do‘koningizni Telegram orqali nazorat qilish uchun yordamchi.\n\n"
+                f"Do‘kon: {connected}\n"
+                f"Kirish: {sub_line}\n\n"
+                "<b>Boshlash juda oson:</b>\n"
+                "1. <b>🎥 Qanday ulash kerak</b> — qisqa videoni ko‘ring\n"
+                "2. <b>🔌 Do‘konni ulash</b> — API-kalitni yuboring\n\n"
+                "Qolgan bo‘limlar ulanishdan keyin avtomatik ochiladi."
+            )
     else:
-        text = (
-            "👋 <b>Uzum Seller Assistant</b>\n\n"
-            "Помощник для селлеров Uzum: продажи, остатки, уведомления и отчёты прямо в Telegram.\n\n"
-            f"Uzum API: {connected}\n"
-            f"Доступ: {sub_line}\n"
-            f"Язык: <b>{language_title(lang)}</b>\n\n"
-            "🚀 <b>Начать в 3 шага:</b>\n"
-            "1. <code>/video</code> — посмотрите видеоинструкцию\n"
-            "2. <code>/connect</code> — отправьте API-ключ боту\n"
-            "3. Выберите раздел <b>💰 Продажи</b> или <b>📦 Склад</b>\n\n"
-            "В главном меню оставлены только самые нужные разделы, чтобы не путаться.\n"
-            "Поддержка: <code>/support</code>"
-            + admin_part
-        )
+        if is_connected:
+            text = (
+                "👋 <b>Seller.pro.uz</b>\n\n"
+                f"Магазин: {connected}\n"
+                f"Доступ: {sub_line}\n\n"
+                "<b>С чего начать?</b>\n"
+                "🏠 <b>Обзор магазина</b> — главные цифры на одном экране\n"
+                "🚨 <b>Важно сейчас</b> — потери и риски для денег\n"
+                "💰 <b>Продажи</b> и 📦 <b>Склад</b> — ежедневная работа\n\n"
+                "Нажмите нужную кнопку внизу 👇"
+            )
+        else:
+            text = (
+                "👋 <b>Seller.pro.uz</b>\n\n"
+                "Помощник для контроля магазина Uzum прямо в Telegram.\n\n"
+                f"Магазин: {connected}\n"
+                f"Доступ: {sub_line}\n\n"
+                "<b>Начать очень просто:</b>\n"
+                "1. <b>🎥 Как подключить</b> — посмотрите короткое видео\n"
+                "2. <b>🔌 Подключить магазин</b> — отправьте API-ключ\n\n"
+                "Остальные разделы откроются автоматически после подключения."
+            )
     await message.answer(text, reply_markup=menu_for_message(message))
 
 
@@ -4489,15 +4633,13 @@ def api_already_connected_text(lang: str) -> str:
     if lang == "uz":
         return (
             "✅ <b>Do‘kon allaqachon ulangan</b>\n\n"
-            "Tasodifan <b>🔌 Ulash</b> tugmasini bossangiz ham, eski API-kalit o‘chmaydi.\n\n"
-            "API-kalitni almashtirish kerak bo‘lsa, faqat shunda <code>/reconnect</code> buyrug‘ini yuboring.\n"
-            "Ulanishni butunlay o‘chirish uchun: <code>/disconnect</code>"
+            "Amaldagi API-kalit xavfsiz saqlangan. Uni almashtirish kerak bo‘lsa:\n"
+            "<b>⚙️ Sozlamalar → 🔐 Uzum ulanishi → 🔌 API-kalitni yangilash</b>."
         )
     return (
         "✅ <b>Магазин уже подключён</b>\n\n"
-        "Если вы случайно нажали <b>🔌 Подключить</b>, ничего страшного — старый API-ключ не удалён и не слетит.\n\n"
-        "Чтобы заменить API-ключ, используйте только команду <code>/reconnect</code>.\n"
-        "Чтобы полностью удалить подключение: <code>/disconnect</code>"
+        "Текущий API-ключ сохранён и продолжает работать. Если его нужно заменить:\n"
+        "<b>⚙️ Настройки → 🔐 Подключение Uzum → 🔌 Обновить API-ключ</b>."
     )
 
 
@@ -4517,28 +4659,57 @@ async def connect_shop_command(message: Message, state: FSMContext) -> None:
     if lang == "uz":
         text = (
             "🔌 <b>Do‘konni ulash</b>\n\n"
-            "Do‘konni ulash uchun Uzum Seller kabinetidan API-kalit yarating va shu yerga yuboring.\n\n"
-            "🎥 Videoqo‘llanma: <code>/video</code>\n"
-            "📌 Yozma yo‘riqnoma: <code>/api_token</code>\n\n"
-            "API-kalitni keyingi xabarda yuboring.\n"
-            "Bekor qilish: <code>/cancel</code>"
+            "Uzum Seller kabinetida yaratilgan API-kalitni nusxalang va keyingi xabarda yuboring.\n\n"
+            "🔐 Kalit Telegram chatida ko‘rsatilmaydi va bot uni ishlashdan oldin tekshiradi."
         )
     else:
         text = (
             "🔌 <b>Подключение магазина</b>\n\n"
-            "Чтобы подключить магазин, создайте API-ключ в кабинете Uzum Seller и отправьте его сюда.\n\n"
-            "🎥 Видеоинструкция: <code>/video</code>\n"
-            "📌 Текстовая инструкция: <code>/api_token</code>\n\n"
-            "Отправьте API-ключ следующим сообщением.\n"
-            "Отмена: <code>/cancel</code>"
+            "Скопируйте API-ключ из кабинета Uzum Seller и отправьте его следующим сообщением.\n\n"
+            "🔐 Ключ не показывается в интерфейсе и будет проверен до сохранения."
         )
-    await message.answer(text, reply_markup=menu_for_message(message))
+    await message.answer(
+        text,
+        reply_markup=CONNECT_INPUT_MENU_UZ if lang == "uz" else CONNECT_INPUT_MENU_RU,
+    )
 
 
-@dp.message(F.text == "🔌 Подключить")
-@dp.message(F.text == "🔌 Ulash")
+@dp.message(F.text.in_({"🔌 Подключить", "🔌 Подключить магазин", "🔌 Ulash", "🔌 Do‘konni ulash"}))
 async def connect_shop_button(message: Message, state: FSMContext) -> None:
     await connect_shop_command(message, state)
+
+
+@dp.message(F.text.in_({"🔌 Обновить API-ключ", "🔌 API-kalitni yangilash"}))
+async def reconnect_shop_button(message: Message, state: FSMContext) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    await state.set_state(ConnectStates.waiting_for_token)
+    if lang == "uz":
+        text = (
+            "🔁 <b>API-kalitni yangilash</b>\n\n"
+            "Yangi API-kalitni keyingi xabarda yuboring. Eski ulanish faqat yangi kalit "
+            "muvaffaqiyatli tekshirilgandan keyin almashtiriladi."
+        )
+    else:
+        text = (
+            "🔁 <b>Обновление API-ключа</b>\n\n"
+            "Отправьте новый API-ключ следующим сообщением. Старое подключение заменится "
+            "только после успешной проверки нового ключа."
+        )
+    await message.answer(
+        text,
+        reply_markup=CONNECT_INPUT_MENU_UZ if lang == "uz" else CONNECT_INPUT_MENU_RU,
+    )
+
+
+@dp.message(ConnectStates.waiting_for_token, F.text.in_({"❌ Отмена", "❌ Bekor qilish"}))
+async def cancel_connect_button(message: Message, state: FSMContext) -> None:
+    telegram_id = upsert_from_message(message)
+    await state.clear()
+    await message.answer(
+        "Bekor qilindi." if get_user_language(telegram_id) == "uz" else "Подключение отменено.",
+        reply_markup=menu_for_message(message),
+    )
 
 
 @dp.message(ConnectStates.waiting_for_shop_id, F.text)
@@ -7098,7 +7269,7 @@ async def dashboard(message: Message) -> None:
             f"• Заканчиваются ≤ {LOW_STOCK_THRESHOLD}: <b>{int(st['low_count'])}</b>\n"
             f"• Нет в наличии: <b>{int(st['zero_count'])}</b>\n"
             f"• Примерная стоимость остатка: <b>{_format_money(float(st['stock_value']))}</b>\n\n"
-            f"Подробно: <code>/sales</code>, <code>/orders_summary</code>, <code>/lowstock</code>",
+            "Подробнее: <b>💰 Продажи</b>, <b>📦 Склад</b> или <b>🚨 Важно сейчас</b>.",
             reply_markup=menu_for_message(message),
         )
     except Exception as e:
@@ -7982,7 +8153,7 @@ async def video_instruction(message: Message) -> None:
             "Videoda qisqa ko‘rsatilgan:\n"
             "1. Uzum Seller kabinetida API kalit qayerda joylashgan.\n"
             "2. Yangi kalit qanday yaratiladi.\n"
-            "3. Kalit botga <code>/connect</code> orqali qanday ulanadi.\n\n"
+            "3. Kalit <b>🔌 Do‘konni ulash</b> tugmasi orqali qanday ulanadi.\n\n"
             "Videoni ko‘rish uchun pastdagi tugmani bosing 👇"
         )
     else:
@@ -7991,7 +8162,7 @@ async def video_instruction(message: Message) -> None:
             "В видео коротко показано:\n"
             "1. Где в кабинете Uzum Seller находятся ключи API.\n"
             "2. Как создать новый ключ.\n"
-            "3. Как подключить ключ к боту через <code>/connect</code>.\n\n"
+            "3. Как подключить ключ кнопкой <b>🔌 Подключить магазин</b>.\n\n"
             "Нажмите кнопку ниже, чтобы открыть видео 👇"
         )
     await message.answer(text, reply_markup=video_instruction_markup(lang) or menu_for_message(message))
@@ -8004,7 +8175,7 @@ async def api_token_help(message: Message) -> None:
     if lang == "uz":
         text = (
             "🔑 <b>Uzum API-kalitini botga ulash</b>\n\n"
-            "🎥 Videoqo‘llanma: <code>/video</code>\n\n"
+            "🎥 Videoqo‘llanma pastdagi tugma orqali ochiladi.\n\n"
             "API-kalitni faqat Uzum Seller kabinetidan olasiz.\n"
             "Bu kabinet paroli emas, uni istalgan vaqtda o‘chirishingiz mumkin.\n\n"
             "API-kalit qayerda:\n"
@@ -8013,14 +8184,14 @@ async def api_token_help(message: Message) -> None:
             "3. <b>API kalitlari</b> ni bosing.\n"
             "4. <b>Kalit yaratish</b> ni bosing.\n"
             "5. API-kalitni nusxa oling.\n"
-            "6. Botga qayting va <code>/connect</code> ni bosing.\n"
+            "6. Botga qayting va <b>🔌 Do‘konni ulash</b> tugmasini bosing.\n"
             "7. Kalitni bitta xabar qilib yuboring.\n\n"
             "⚠️ API-kalitni begonalarga yubormang. Bot uni himoyalangan ko‘rinishda saqlaydi va xabarni o‘chirishga harakat qiladi."
         )
     else:
         text = (
             "🔑 <b>Как подключить Uzum API к боту</b>\n\n"
-            "🎥 Видеоинструкция: <code>/video</code>\n\n"
+            "🎥 Видеоинструкция открывается кнопкой ниже.\n\n"
             "API-ключ создаётся только в вашем кабинете Uzum Seller.\n"
             "Это не пароль от кабинета, ключ можно удалить в любой момент.\n\n"
             "Где взять API-ключ:\n"
@@ -8029,7 +8200,7 @@ async def api_token_help(message: Message) -> None:
             "3. Нажмите <b>Ключи API</b>.\n"
             "4. Нажмите <b>Создать ключ</b>.\n"
             "5. Скопируйте API-ключ.\n"
-            "6. Вернитесь в бот и нажмите <code>/connect</code>.\n"
+            "6. Вернитесь в бот и нажмите <b>🔌 Подключить магазин</b>.\n"
             "7. Отправьте ключ одним сообщением.\n\n"
             "⚠️ Не отправляйте ключ посторонним. Бот хранит его защищённо и старается удалить сообщение с ключом после проверки."
         )
@@ -8046,8 +8217,8 @@ async def security(message: Message) -> None:
             "Uzum API-kalitingiz botda ko‘rsatilmaydi va sizga qayta xabar qilib yuborilmaydi.\n"
             "Ulangandan keyin bot kalit yuborilgan xabarni o‘chirishga harakat qiladi.\n"
             "Bazaga faqat himoyalangan versiya saqlanadi.\n\n"
-            "Istalgan vaqtda ulanishni <code>/disconnect</code> orqali o‘chirishingiz mumkin.\n"
-            "Kalitni almashtirish uchun <code>/reconnect</code> dan foydalaning."
+            "Kalitni almashtirish uchun <b>⚙️ Sozlamalar → 🔐 Uzum ulanishi → "
+            "🔌 API-kalitni yangilash</b> bo‘limidan foydalaning."
         )
     else:
         text = (
@@ -8055,10 +8226,10 @@ async def security(message: Message) -> None:
             "Ваш Uzum API-ключ не показывается в боте и не отправляется обратно сообщением.\n"
             "После подключения бот старается удалить сообщение, где был отправлен ключ.\n"
             "В базе хранится только защищённая версия ключа.\n\n"
-            "Вы можете в любой момент удалить подключение командой <code>/disconnect</code>.\n"
-            "Чтобы заменить ключ, используйте <code>/reconnect</code>."
+            "Чтобы заменить ключ, откройте <b>⚙️ Настройки → 🔐 Подключение Uzum → "
+            "🔌 Обновить API-ключ</b>."
         )
-    await message.answer(text, reply_markup=menu_for_message(message))
+    await message.answer(text, reply_markup=connection_menu_for_message(message))
 
 
 @dp.message(Command("support"))
@@ -10353,6 +10524,22 @@ async def button_sales_section_simple(message: Message) -> None:
     await message.answer(text, reply_markup=sales_menu_for_message(message))
 
 
+@dp.message(F.text.in_({"✨ Ещё по продажам", "✨ Yana savdo tahlili"}))
+async def button_sales_more(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    text = (
+        "✨ <b>Qo‘shimcha savdo tahlili</b>\nKamroq ishlatiladigan batafsil vositalar."
+        if get_user_language(telegram_id) == "uz"
+        else "✨ <b>Дополнительная аналитика</b>\nЗдесь собраны подробные инструменты, которые нужны не каждый день."
+    )
+    await message.answer(text, reply_markup=sales_more_menu_for_message(message))
+
+
+@dp.message(F.text.in_({"⬅️ Продажи", "⬅️ Savdo"}))
+async def button_back_to_sales(message: Message) -> None:
+    await button_sales_section_simple(message)
+
+
 @dp.message(F.text == "📦 Ombor")
 @dp.message(F.text == "📦 Склад")
 async def button_stock_section_simple(message: Message) -> None:
@@ -10365,10 +10552,7 @@ async def button_stock_section_simple(message: Message) -> None:
 @dp.message(F.text == "🔔 Xabarnomalar")
 @dp.message(F.text == "🔔 Уведомления")
 async def button_notifications_section_simple(message: Message) -> None:
-    telegram_id = upsert_from_message(message)
-    lang = get_user_language(telegram_id)
-    text = "🔔 <b>Xabarnomalar</b>\nKerakli holatni tanlang 👇" if lang == "uz" else "🔔 <b>Уведомления</b>\nПроверьте, что включено 👇"
-    await message.answer(text, reply_markup=notify_menu_for_message(message))
+    await notification_hub_screen(message)
 
 
 @dp.message(F.text == "📊 Hisobotlar")
@@ -10378,6 +10562,46 @@ async def button_reports_section_simple(message: Message) -> None:
     lang = get_user_language(telegram_id)
     text = "📊 <b>Hisobotlar</b>\nExcel, foyda va tayyor hisobotlar 👇" if lang == "uz" else "📊 <b>Отчёты</b>\nExcel, прибыль и готовые отчёты 👇"
     await message.answer(text, reply_markup=report_menu_for_message(message))
+
+
+@dp.message(F.text.in_({"🏠 Обзор магазина", "🏠 Do‘kon holati"}))
+async def button_store_overview(message: Message) -> None:
+    await dashboard(message)
+
+
+@dp.message(F.text.in_({"🚨 Важно сейчас", "🚨 Hozir muhim"}))
+async def button_important_now(message: Message) -> None:
+    await business_control_center(message)
+
+
+@dp.message(F.text.in_({"🧮 Финансы", "🧮 Moliya"}))
+async def button_finance_section(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    text = (
+        "🧮 <b>Moliya</b>\nTannarx, xarajatlar va haqiqiy foydani boshqaring."
+        if get_user_language(telegram_id) == "uz"
+        else "🧮 <b>Финансы</b>\nСебестоимость, расходы и реальная прибыль — в одном месте."
+    )
+    await message.answer(text, reply_markup=finance_menu_for_message(message))
+
+
+@dp.message(F.text.in_({"🔐 Подключение Uzum", "🔐 Uzum ulanishi"}))
+async def button_connection_section(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    connected = db.has_uzum_connection(telegram_id)
+    if get_user_language(telegram_id) == "uz":
+        text = (
+            "🔐 <b>Uzum ulanishi</b>\n\n"
+            f"Holat: {'✅ ulangan' if connected else '❌ ulanmagan'}\n"
+            "Bu yerda ulanishni tekshirish yoki API-kalitni xavfsiz yangilash mumkin."
+        )
+    else:
+        text = (
+            "🔐 <b>Подключение Uzum</b>\n\n"
+            f"Статус: {'✅ подключено' if connected else '❌ не подключено'}\n"
+            "Здесь можно проверить соединение или безопасно обновить API-ключ."
+        )
+    await message.answer(text, reply_markup=connection_menu_for_message(message))
 
 
 @dp.message(F.text == "🧠 Tekshirish")
@@ -10406,6 +10630,8 @@ async def button_attention_section(message: Message) -> None:
 
 @dp.message(F.text == "🔍 Hozir tekshirish")
 @dp.message(F.text == "🔍 Проверить сейчас")
+@dp.message(F.text == "🔍 Do‘konni tekshirish")
+@dp.message(F.text == "🔍 Проверить магазин")
 async def button_attention_now(message: Message) -> None:
     await attention_report(message)
 
@@ -10502,6 +10728,8 @@ async def button_check_connection(message: Message) -> None:
 
 @dp.message(F.text == "⬅️ Asosiy menyu")
 @dp.message(F.text == "⬅️ Главное меню")
+@dp.message(F.text == "🏠 Asosiy")
+@dp.message(F.text == "🏠 Главное")
 @dp.message(F.text == "Menyu")
 @dp.message(F.text == "Меню")
 async def button_main_menu(message: Message) -> None:
@@ -10897,6 +11125,8 @@ async def button_lowstock_short(message: Message) -> None:
 
 @dp.message(F.text == "🧭 Yo‘qolganlar")
 @dp.message(F.text == "🧭 Потерянные")
+@dp.message(F.text == "🧭 Yo‘qolgan tovarlar")
+@dp.message(F.text == "🧭 Потерянные товары")
 async def button_lost(message: Message) -> None:
     await lost_goods(message)
 
@@ -10913,37 +11143,51 @@ async def button_subscription(message: Message) -> None:
 async def button_help(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     lang = get_user_language(telegram_id)
+    connected = db.has_uzum_connection(telegram_id)
     if lang == "uz":
-        text = (
-            "ℹ️ <b>Yordam</b>\n\n"
-            "Botni ulash uchun:\n"
-            "1. <code>/video</code> — videoqo‘llanmani ko‘ring.\n"
-            "2. <code>/connect</code> — API-kalitni yuboring.\n"
-            "3. <b>💰 Savdo</b> yoki <b>📦 Ombor</b> bo‘limidan foydalaning.\n\n"
-            "Foydali buyruqlar:\n"
-            "• <code>/api_token</code> — API-kalit bo‘yicha yozma yo‘riqnoma\n"
-            "• <code>/check</code> — ulanishni tekshirish\n"
-            "• <code>/labels</code> — SKU etiketkalarini PDF qilib olish\n"
-            "• <code>/support</code> — yordam va administrator bilan aloqa"
-        )
+        if connected:
+            text = (
+                "ℹ️ <b>Qayerga bosish kerak?</b>\n\n"
+                "🏠 <b>Do‘kon holati</b> — asosiy ko‘rsatkichlar\n"
+                "💰 <b>Savdo</b> — davr, foyda va top tovarlar\n"
+                "📦 <b>Ombor</b> — qoldiq, yo‘qotish va yetkazish rejasi\n"
+                "🚨 <b>Hozir muhim</b> — birinchi navbatdagi muammolar\n"
+                "📊 <b>Hisobotlar</b> — Excel va tayyor xulosalar\n"
+                "⚙️ <b>Sozlamalar</b> — xabarnomalar, moliya va ulanish\n\n"
+                "Muammo bo‘lsa, pastdagi tugma orqali administratorga yozing."
+            )
+        else:
+            text = (
+                "ℹ️ <b>Do‘konni ulash</b>\n\n"
+                "1. Pastdagi videoni ko‘ring.\n"
+                "2. <b>🔌 Do‘konni ulash</b> tugmasini bosing.\n"
+                "3. Uzum Seller kabinetidagi API-kalitni yuboring.\n\n"
+                "Bot kalitni tekshiradi va asosiy menyuni avtomatik ochadi."
+            )
     else:
-        text = (
-            "ℹ️ <b>Помощь</b>\n\n"
-            "Чтобы подключить бота:\n"
-            "1. <code>/video</code> — посмотрите видеоинструкцию.\n"
-            "2. <code>/connect</code> — отправьте API-ключ.\n"
-            "3. Пользуйтесь разделами <b>💰 Продажи</b> и <b>📦 Склад</b>.\n\n"
-            "Полезные команды:\n"
-            "• <code>/api_token</code> — текстовая инструкция по API-ключу\n"
-            "• <code>/check</code> — проверить подключение\n"
-            "• <code>/labels</code> — получить PDF с этикетками SKU\n"
-            "• <code>/support</code> — поддержка и связь с администратором"
-        )
-    await message.answer(text, reply_markup=help_links_markup(lang) or menu_for_message(message))
+        if connected:
+            text = (
+                "ℹ️ <b>Куда нажимать?</b>\n\n"
+                "🏠 <b>Обзор магазина</b> — главные показатели\n"
+                "💰 <b>Продажи</b> — периоды, прибыль и топ товаров\n"
+                "📦 <b>Склад</b> — остатки, потери и план поставки\n"
+                "🚨 <b>Важно сейчас</b> — проблемы, требующие действий\n"
+                "📊 <b>Отчёты</b> — Excel и готовые сводки\n"
+                "⚙️ <b>Настройки</b> — уведомления, финансы и подключение\n\n"
+                "Если что-то не получается, напишите администратору кнопкой ниже."
+            )
+        else:
+            text = (
+                "ℹ️ <b>Как подключить магазин</b>\n\n"
+                "1. Посмотрите видео по кнопке ниже.\n"
+                "2. Нажмите <b>🔌 Подключить магазин</b>.\n"
+                "3. Отправьте API-ключ из кабинета Uzum Seller.\n\n"
+                "Бот проверит ключ и автоматически откроет рабочее меню."
+            )
+    await message.answer(text, reply_markup=help_links_markup(lang) or settings_menu_for_message(message))
 
 
-@dp.message(F.text == "🎥 Видеоинструкция")
-@dp.message(F.text == "🎥 API ulash videosi")
+@dp.message(F.text.in_({"🎥 Видеоинструкция", "🎥 Как подключить", "🎥 API ulash videosi", "🎥 Qanday ulash kerak"}))
 async def button_video_instruction(message: Message) -> None:
     await video_instruction(message)
 
@@ -10969,9 +11213,20 @@ async def section_notifications(message: Message) -> None:
     await notify_status(message)
 
 
-@dp.message(F.text == "⚙️ Настройки")
+@dp.message(F.text.in_({"⚙️ Настройки", "⚙️ Sozlamalar", "⬅️ Настройки", "⬅️ Sozlamalar"}))
 async def section_settings(message: Message) -> None:
-    await status(message)
+    telegram_id = upsert_from_message(message)
+    if get_user_language(telegram_id) == "uz":
+        text = (
+            "⚙️ <b>Sozlamalar</b>\n\n"
+            "Xabarnomalar, do‘konlar, moliya va Uzum ulanishini shu yerda boshqaring."
+        )
+    else:
+        text = (
+            "⚙️ <b>Настройки</b>\n\n"
+            "Уведомления, магазины, финансы и подключение Uzum собраны здесь."
+        )
+    await message.answer(text, reply_markup=settings_menu_for_message(message))
 
 
 @dp.message(F.text == "⭐ Отзывы")
@@ -11025,6 +11280,7 @@ async def button_orders(message: Message) -> None:
 
 @dp.message(F.text == "📊 Excel hisobot")
 @dp.message(F.text == "📊 Excel отчёт")
+@dp.message(F.text == "📊 Excel-отчёт")
 @dp.message(F.text == "📄 Excel-отчёт")
 async def button_excel_report(message: Message) -> None:
     await report_excel(message)
@@ -12441,6 +12697,8 @@ async def button_dead_stock(message: Message) -> None:
 
 @dp.message(F.text == "🌙 Ertalabki hisobot")
 @dp.message(F.text == "🌙 Утренний отчёт")
+@dp.message(F.text == "🌙 Qisqa hisobot")
+@dp.message(F.text == "🌙 Краткий отчёт")
 async def button_morning_report(message: Message) -> None:
     await morning_report(message)
 
@@ -13245,6 +13503,196 @@ def _sales_mode_label(settings: dict[str, Any], lang: str, *, compact: bool = Fa
     return text
 
 
+NOTIFICATION_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
+    "sales": ("notify_cancellations", "notify_orders"),
+    "stock": (
+        "notify_low_stock",
+        "notify_out_of_stock",
+        "notify_stock_change",
+        "notify_losses",
+        "notify_defects",
+        "notify_fbo_acceptance",
+    ),
+    "reports": ("daily_enabled", "weekly_enabled", "monthly_enabled"),
+}
+
+
+def _enabled_count(settings: dict[str, Any], fields: Iterable[str]) -> tuple[int, int]:
+    field_list = list(fields)
+    enabled = sum(1 for field in field_list if bool(int(settings.get(field) or 0)))
+    return enabled, len(field_list)
+
+
+def notification_hub_text(telegram_id: int) -> str:
+    lang = get_user_language(telegram_id)
+    row = ensure_product_settings(telegram_id)
+    stock_on, stock_total = _enabled_count(row, NOTIFICATION_SECTION_FIELDS["stock"])
+    reports_on, reports_total = _enabled_count(row, NOTIFICATION_SECTION_FIELDS["reports"])
+    if lang == "uz":
+        return (
+            "🔔 <b>Xabarnomalar</b>\n\n"
+            f"💸 Savdo: <b>{_sales_mode_label(row, lang)}</b>\n"
+            f"📦 Ombor va yetkazish: <b>{stock_on}/{stock_total} yoqilgan</b>\n"
+            f"📅 Avtohisobotlar: <b>{reports_on}/{reports_total} yoqilgan</b>\n"
+            f"⭐ Sharhlar: {_toggle_icon(row.get('notify_reviews'))}\n\n"
+            "Sozlash uchun kerakli guruhni tanlang."
+        )
+    return (
+        "🔔 <b>Уведомления</b>\n\n"
+        f"💸 Продажи: <b>{_sales_mode_label(row, lang)}</b>\n"
+        f"📦 Склад и поставки: <b>{stock_on}/{stock_total} включено</b>\n"
+        f"📅 Автоотчёты: <b>{reports_on}/{reports_total} включено</b>\n"
+        f"⭐ Отзывы: {_toggle_icon(row.get('notify_reviews'))}\n\n"
+        "Выберите группу — увидите только относящиеся к ней настройки."
+    )
+
+
+def notification_hub_markup(telegram_id: int) -> InlineKeyboardMarkup:
+    lang = get_user_language(telegram_id)
+    row = ensure_product_settings(telegram_id)
+    uz = lang == "uz"
+    stock_on, stock_total = _enabled_count(row, NOTIFICATION_SECTION_FIELDS["stock"])
+    reports_on, reports_total = _enabled_count(row, NOTIFICATION_SECTION_FIELDS["reports"])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=(f"💸 Savdo · {_sales_mode_label(row, lang, compact=True)}" if uz else f"💸 Продажи · {_sales_mode_label(row, lang, compact=True)}"),
+            callback_data="notifyhub:sales",
+        )],
+        [
+            InlineKeyboardButton(
+                text=(f"📦 Ombor · {stock_on}/{stock_total}" if uz else f"📦 Склад · {stock_on}/{stock_total}"),
+                callback_data="notifyhub:stock",
+            ),
+            InlineKeyboardButton(
+                text=(f"📅 Hisobot · {reports_on}/{reports_total}" if uz else f"📅 Отчёты · {reports_on}/{reports_total}"),
+                callback_data="notifyhub:reports",
+            ),
+        ],
+        [InlineKeyboardButton(
+            text=f"{_toggle_icon(row.get('notify_reviews'))} {'Sharhlar' if uz else 'Отзывы'}",
+            callback_data="notifytoggle:main:notify_reviews",
+        )],
+    ])
+
+
+def notification_section_text(telegram_id: int, section: str) -> str:
+    lang = get_user_language(telegram_id)
+    row = ensure_product_settings(telegram_id)
+    uz = lang == "uz"
+    if section == "sales":
+        if uz:
+            return (
+                "💸 <b>Savdo va buyurtmalar</b>\n\n"
+                f"Savdo xabarlari: <b>{_sales_mode_label(row, lang)}</b>\n"
+                f"Bekor qilishlar: {_toggle_icon(row.get('notify_cancellations'))}\n"
+                f"Yangi FBS buyurtmalar: {_toggle_icon(row.get('notify_orders'))}\n\n"
+                "Kichik do‘kon uchun «Darhol», ko‘p savdo bo‘lsa «Har soat» rejimini tanlang."
+            )
+        return (
+            "💸 <b>Продажи и заказы</b>\n\n"
+            f"Продажи: <b>{_sales_mode_label(row, lang)}</b>\n"
+            f"Отмены: {_toggle_icon(row.get('notify_cancellations'))}\n"
+            f"Новые FBS-заказы: {_toggle_icon(row.get('notify_orders'))}\n\n"
+            "Для небольшого магазина выберите «Сразу», для большого — «Сводка раз в час»."
+        )
+    if section == "stock":
+        if uz:
+            return (
+                "📦 <b>Ombor va yetkazish</b>\n\n"
+                f"Kam qoldiq: {_toggle_icon(row.get('notify_low_stock'))} (≤ {int(row.get('low_stock_threshold') or 0)})\n"
+                f"Tovar tugashi: {_toggle_icon(row.get('notify_out_of_stock'))}\n"
+                f"Qoldiq o‘zgarishi: {_toggle_icon(row.get('notify_stock_change'))}\n"
+                f"Yo‘qotish: {_toggle_icon(row.get('notify_losses'))}\n"
+                f"Yaroqsiz tovar: {_toggle_icon(row.get('notify_defects'))}\n"
+                f"FBO qabuli va farqlar PDF: {_toggle_icon(row.get('notify_fbo_acceptance'))}"
+            )
+        return (
+            "📦 <b>Склад и поставки</b>\n\n"
+            f"Низкий остаток: {_toggle_icon(row.get('notify_low_stock'))} (≤ {int(row.get('low_stock_threshold') or 0)})\n"
+            f"Товар закончился: {_toggle_icon(row.get('notify_out_of_stock'))}\n"
+            f"Изменение остатка: {_toggle_icon(row.get('notify_stock_change'))}\n"
+            f"Потери: {_toggle_icon(row.get('notify_losses'))}\n"
+            f"Брак: {_toggle_icon(row.get('notify_defects'))}\n"
+            f"Приёмка FBO и PDF с расхождениями: {_toggle_icon(row.get('notify_fbo_acceptance'))}"
+        )
+    if uz:
+        return (
+            "📅 <b>Avtohisobotlar</b>\n\n"
+            f"Kunlik: {_toggle_icon(row.get('daily_enabled'))} {int(row.get('daily_hour') or 0):02d}:00\n"
+            f"Haftalik: {_toggle_icon(row.get('weekly_enabled'))} {_weekday_name(row.get('weekly_weekday'), lang)} {int(row.get('weekly_hour') or 0):02d}:00\n"
+            f"Oylik: {_toggle_icon(row.get('monthly_enabled'))} {int(row.get('monthly_day') or 1)}-kun {int(row.get('monthly_hour') or 0):02d}:00\n\n"
+            "Vaqt zonasi: Asia/Tashkent."
+        )
+    return (
+        "📅 <b>Автоматические отчёты</b>\n\n"
+        f"Ежедневный: {_toggle_icon(row.get('daily_enabled'))} {int(row.get('daily_hour') or 0):02d}:00\n"
+        f"Еженедельный: {_toggle_icon(row.get('weekly_enabled'))} {_weekday_name(row.get('weekly_weekday'), lang)} {int(row.get('weekly_hour') or 0):02d}:00\n"
+        f"Ежемесячный: {_toggle_icon(row.get('monthly_enabled'))} {int(row.get('monthly_day') or 1)} числа в {int(row.get('monthly_hour') or 0):02d}:00\n\n"
+        "Часовой пояс: Asia/Tashkent."
+    )
+
+
+def notification_section_markup(telegram_id: int, section: str) -> InlineKeyboardMarkup:
+    lang = get_user_language(telegram_id)
+    row = ensure_product_settings(telegram_id)
+    uz = lang == "uz"
+
+    def toggle(field: str, ru: str, uz_text: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(
+            text=f"{_toggle_icon(row.get(field))} {uz_text if uz else ru}",
+            callback_data=f"notifytoggle:{section}:{field}",
+        )
+
+    back = InlineKeyboardButton(
+        text="⬅️ Xabarnomalar" if uz else "⬅️ Все уведомления",
+        callback_data="notifyhub:main",
+    )
+    if section == "sales":
+        rows = [
+            [InlineKeyboardButton(
+                text=f"💸 {_sales_mode_label(row, lang, compact=True)}",
+                callback_data="salesmode:menu:sales",
+            )],
+            [
+                toggle("notify_cancellations", "Отмены", "Bekor qilish"),
+                toggle("notify_orders", "FBS-заказы", "FBS buyurtma"),
+            ],
+            [back],
+        ]
+    elif section == "stock":
+        rows = [
+            [
+                toggle("notify_low_stock", "Низкий остаток", "Kam qoldiq"),
+                toggle("notify_out_of_stock", "Закончился", "Tugadi"),
+            ],
+            [toggle("notify_stock_change", "Изменение остатка", "Qoldiq o‘zgarishi")],
+            [toggle("notify_losses", "Потери", "Yo‘qotish"), toggle("notify_defects", "Брак", "Yaroqsiz")],
+            [toggle("notify_fbo_acceptance", "Приёмка FBO", "FBO qabuli")],
+            [InlineKeyboardButton(
+                text=("📉 Qoldiq chegarasi" if uz else "📉 Порог низкого остатка"),
+                callback_data="notifyedit:stock:low_stock_threshold",
+            )],
+            [back],
+        ]
+    else:
+        rows = [
+            [toggle("daily_enabled", "Ежедневный", "Kunlik")],
+            [toggle("weekly_enabled", "Еженедельный", "Haftalik")],
+            [toggle("monthly_enabled", "Ежемесячный", "Oylik")],
+            [InlineKeyboardButton(text=("🕘 Kunlik vaqt" if uz else "🕘 Время ежедневного"), callback_data="notifyedit:reports:daily_hour")],
+            [
+                InlineKeyboardButton(text=("📅 Hafta kuni" if uz else "📅 День недели"), callback_data="notifyedit:reports:weekly_weekday"),
+                InlineKeyboardButton(text=("🕘 Hafta vaqti" if uz else "🕘 Время недельного"), callback_data="notifyedit:reports:weekly_hour"),
+            ],
+            [
+                InlineKeyboardButton(text=("🗓 Oy kuni" if uz else "🗓 День месяца"), callback_data="notifyedit:reports:monthly_day"),
+                InlineKeyboardButton(text=("🕘 Oy vaqti" if uz else "🕘 Время месячного"), callback_data="notifyedit:reports:monthly_hour"),
+            ],
+            [back],
+        ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def automation_settings_text(telegram_id: int) -> str:
     lang = get_user_language(telegram_id)
     row = ensure_product_settings(telegram_id)
@@ -13347,7 +13795,7 @@ def sales_mode_selection_text(telegram_id: int) -> str:
     )
 
 
-def sales_mode_selection_markup(telegram_id: int) -> InlineKeyboardMarkup:
+def sales_mode_selection_markup(telegram_id: int, *, back_to: str = "automation") -> InlineKeyboardMarkup:
     lang = get_user_language(telegram_id)
     uz = normalize_lang(lang) == "uz"
     mode = get_sales_notification_mode(telegram_id)
@@ -13356,13 +13804,13 @@ def sales_mode_selection_markup(telegram_id: int) -> InlineKeyboardMarkup:
         marker = "✅" if mode == value else "▫️"
         return InlineKeyboardButton(
             text=f"{marker} {uz_text if uz else ru}",
-            callback_data=f"salesmode:{value}",
+            callback_data=f"salesmode:{value}:{back_to}",
         )
 
     return InlineKeyboardMarkup(inline_keyboard=[
         [option("instant", "⚡ Сразу", "⚡ Darhol"), option("hourly", "🕐 За час", "🕐 Har soat")],
         [option("off", "🔕 Выключить", "🔕 O‘chirish")],
-        [InlineKeyboardButton(text="⬅️ Ortga" if uz else "⬅️ Назад", callback_data="salesmode:back")],
+        [InlineKeyboardButton(text="⬅️ Ortga" if uz else "⬅️ Назад", callback_data=f"salesmode:back:{back_to}")],
     ])
 
 
@@ -13437,13 +13885,76 @@ def finance_settings_markup(telegram_id: int) -> InlineKeyboardMarkup:
 @dp.message(Command("automation", "notification_settings", "auto_reports"))
 @dp.message(F.text.in_({"⚙️ Настроить уведомления", "⚙️ Xabarnomalarni sozlash", "📅 Автоотчёты", "📅 Avtohisobotlar"}))
 async def automation_settings_screen(message: Message) -> None:
+    section = "reports" if str(message.text or "") in {"📅 Автоотчёты", "📅 Avtohisobotlar"} else "main"
+    await notification_hub_screen(message, section=section)
+
+
+async def notification_hub_screen(message: Message, *, section: str = "main") -> None:
     telegram_id = upsert_from_message(message)
     if not await require_active_subscription(message, telegram_id):
         return
-    await message.answer(
-        automation_settings_text(telegram_id),
-        reply_markup=automation_settings_markup(telegram_id),
-    )
+    if section in NOTIFICATION_SECTION_FIELDS:
+        text = notification_section_text(telegram_id, section)
+        markup = notification_section_markup(telegram_id, section)
+    else:
+        text = notification_hub_text(telegram_id)
+        markup = notification_hub_markup(telegram_id)
+    await message.answer(text, reply_markup=markup)
+
+
+@dp.callback_query(F.data.startswith("notifyhub:"))
+async def notification_hub_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user:
+        return
+    telegram_id = int(callback.from_user.id)
+    section = str(callback.data or "").split(":", 1)[-1]
+    if section != "main" and section not in NOTIFICATION_SECTION_FIELDS:
+        await callback.answer("Неизвестный раздел", show_alert=True)
+        return
+    if callback.message:
+        if section == "main":
+            await callback.message.edit_text(
+                notification_hub_text(telegram_id),
+                reply_markup=notification_hub_markup(telegram_id),
+            )
+        else:
+            await callback.message.edit_text(
+                notification_section_text(telegram_id, section),
+                reply_markup=notification_section_markup(telegram_id, section),
+            )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("notifytoggle:"))
+async def notification_hub_toggle_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user:
+        return
+    telegram_id = int(callback.from_user.id)
+    parts = str(callback.data or "").split(":")
+    if len(parts) != 3:
+        await callback.answer("Неизвестная настройка", show_alert=True)
+        return
+    section, field = parts[1], parts[2]
+    allowed = field == "notify_reviews" and section == "main"
+    if section in NOTIFICATION_SECTION_FIELDS and field in NOTIFICATION_SECTION_FIELDS[section]:
+        allowed = True
+    if not allowed or field not in AUTOMATION_BOOL_FIELDS:
+        await callback.answer("Неизвестная настройка", show_alert=True)
+        return
+    row = ensure_product_settings(telegram_id)
+    update_product_setting(telegram_id, field, 0 if int(row.get(field) or 0) else 1)
+    if callback.message:
+        if section == "main":
+            await callback.message.edit_text(
+                notification_hub_text(telegram_id),
+                reply_markup=notification_hub_markup(telegram_id),
+            )
+        else:
+            await callback.message.edit_text(
+                notification_section_text(telegram_id, section),
+                reply_markup=notification_section_markup(telegram_id, section),
+            )
+    await callback.answer("Saqlandi" if get_user_language(telegram_id) == "uz" else "Сохранено")
 
 
 @dp.message(Command("sales_notify_mode", "sales_notifications"))
@@ -13462,24 +13973,32 @@ async def sales_mode_callback(callback: CallbackQuery) -> None:
     if not callback.from_user:
         return
     telegram_id = int(callback.from_user.id)
-    action = str(callback.data or "").split(":", 1)[-1]
+    parts = str(callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else ""
+    back_to = parts[2] if len(parts) > 2 else "automation"
     lang = get_user_language(telegram_id)
 
     if action == "menu":
         if callback.message:
             await callback.message.edit_text(
                 sales_mode_selection_text(telegram_id),
-                reply_markup=sales_mode_selection_markup(telegram_id),
+                reply_markup=sales_mode_selection_markup(telegram_id, back_to=back_to),
             )
         await callback.answer()
         return
 
     if action == "back":
         if callback.message:
-            await callback.message.edit_text(
-                automation_settings_text(telegram_id),
-                reply_markup=automation_settings_markup(telegram_id),
-            )
+            if back_to == "sales":
+                await callback.message.edit_text(
+                    notification_section_text(telegram_id, "sales"),
+                    reply_markup=notification_section_markup(telegram_id, "sales"),
+                )
+            else:
+                await callback.message.edit_text(
+                    automation_settings_text(telegram_id),
+                    reply_markup=automation_settings_markup(telegram_id),
+                )
         await callback.answer()
         return
 
@@ -13500,10 +14019,16 @@ async def sales_mode_callback(callback: CallbackQuery) -> None:
             clear_queue=True,
         )
     if callback.message:
-        await callback.message.edit_text(
-            automation_settings_text(telegram_id),
-            reply_markup=automation_settings_markup(telegram_id),
-        )
+        if back_to == "sales":
+            await callback.message.edit_text(
+                notification_section_text(telegram_id, "sales"),
+                reply_markup=notification_section_markup(telegram_id, "sales"),
+            )
+        else:
+            await callback.message.edit_text(
+                automation_settings_text(telegram_id),
+                reply_markup=automation_settings_markup(telegram_id),
+            )
     labels = {
         "instant": ("Режим: продажи сразу", "Rejim: savdolar darhol"),
         "hourly": ("Режим: сводка раз в час", "Rejim: har soatda hisobot"),
@@ -13578,7 +14103,12 @@ async def fbo_acceptance_notification_status(message: Message) -> None:
 
 
 @dp.message(Command("supply_settings", "replenishment_settings"))
-@dp.message(F.text.in_({"⚙️ Параметры поставки", "⚙️ Yetkazish sozlamasi"}))
+@dp.message(F.text.in_({
+    "⚙️ Параметры поставки",
+    "⚙️ Yetkazish sozlamasi",
+    "🚚 Настройки поставки",
+    "🚚 Yetkazish sozlamalari",
+}))
 async def supply_settings_screen(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     if not await require_active_subscription(message, telegram_id):
@@ -13619,11 +14149,23 @@ async def automation_toggle_callback(callback: CallbackQuery) -> None:
 
 
 @dp.callback_query(F.data.startswith("autoedit:"))
+@dp.callback_query(F.data.startswith("notifyedit:"))
 async def automation_edit_callback(callback: CallbackQuery, state: FSMContext) -> None:
     if not callback.from_user:
         return
     telegram_id = int(callback.from_user.id)
-    field = str(callback.data or "").split(":", 1)[-1]
+    parts = str(callback.data or "").split(":")
+    if parts and parts[0] == "notifyedit" and len(parts) == 3:
+        return_section = parts[1]
+        field = parts[2]
+    else:
+        field = parts[1] if len(parts) > 1 else ""
+        if field in {"lead_time_days", "safety_days", "target_cover_days"}:
+            return_section = "supply"
+        elif field in FINANCE_NUMERIC_LIMITS:
+            return_section = "finance"
+        else:
+            return_section = "automation"
     if field not in PRODUCT_NUMERIC_LIMITS and field not in FINANCE_NUMERIC_LIMITS:
         await callback.answer("Неизвестная настройка", show_alert=True)
         return
@@ -13659,9 +14201,30 @@ async def automation_edit_callback(callback: CallbackQuery, state: FSMContext) -
         "other_monthly": "Boshqa oylik xarajatlarni so‘mda kiriting.",
     }
     await state.set_state(ProductSettingsStates.waiting_for_value)
-    await state.update_data(product_setting_field=field)
+    await state.update_data(product_setting_field=field, product_setting_return_section=return_section)
     if callback.message:
-        await callback.message.answer((prompts_uz if lang == "uz" else prompts_ru)[field] + "\n\n/cancel")
+        await callback.message.answer(
+            (prompts_uz if lang == "uz" else prompts_ru)[field],
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(
+                    text="❌ Bekor qilish" if lang == "uz" else "❌ Отмена",
+                    callback_data="settingeditcancel",
+                )
+            ]]),
+        )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settingeditcancel")
+async def automation_edit_cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user:
+        return
+    telegram_id = int(callback.from_user.id)
+    await state.clear()
+    if callback.message:
+        await callback.message.edit_text(
+            "Bekor qilindi." if get_user_language(telegram_id) == "uz" else "Изменение отменено."
+        )
     await callback.answer()
 
 
@@ -13671,6 +14234,7 @@ async def product_setting_value_received(message: Message, state: FSMContext) ->
     lang = get_user_language(telegram_id)
     data = await state.get_data()
     field = str(data.get("product_setting_field") or "")
+    return_section = str(data.get("product_setting_return_section") or "automation")
     raw = str(message.text or "").strip().replace(" ", "").replace(",", ".")
     try:
         value = float(raw)
@@ -13693,6 +14257,11 @@ async def product_setting_value_received(message: Message, state: FSMContext) ->
         await state.clear()
         if field in {"lead_time_days", "safety_days", "target_cover_days"}:
             await message.answer(supply_settings_text(telegram_id), reply_markup=supply_settings_markup(telegram_id))
+        elif return_section in NOTIFICATION_SECTION_FIELDS:
+            await message.answer(
+                notification_section_text(telegram_id, return_section),
+                reply_markup=notification_section_markup(telegram_id, return_section),
+            )
         else:
             await message.answer(automation_settings_text(telegram_id), reply_markup=automation_settings_markup(telegram_id))
         return
@@ -13816,17 +14385,17 @@ def _business_center_text(
     generated_text = generated.strftime("%d.%m.%Y %H:%M") if isinstance(generated, datetime) else "—"
     if lang == "uz":
         lines = [
-            "💼 <b>Pul bo‘yicha amallar markazi</b>",
+            "🚨 <b>Hozir muhim</b>",
             f"🏪 Do‘kon: <code>{shop_id}</code>",
             f"🕒 Yangilandi: {generated_text}",
             "",
-            f"💰 Nazoratdagi potensial summa: <b>{_format_money(total_effect)}</b>",
+            f"💰 Potensial xavf summasi: <b>{_format_money(total_effect)}</b>",
             f"🔴 Jiddiy: <b>{critical}</b> | 🟡 Diqqat: <b>{warnings}</b>",
         ]
         if not actions:
             lines.extend(["", "✅ Hozir faol muammo topilmadi yoki ular vaqtincha yashirilgan."])
         else:
-            lines.extend(["", "<b>Eng muhim amallar — summa bo‘yicha:</b>"])
+            lines.extend(["", "<b>Avval nima qilish kerak:</b>"])
             for index, action in enumerate(actions[:8], start=1):
                 amount = float(action.get("amount") or 0)
                 amount_text = _format_money(amount) if amount > 0 else "baholanmagan"
@@ -13841,17 +14410,17 @@ def _business_center_text(
         return "\n".join(lines)
 
     lines = [
-        "💼 <b>Денежный центр действий</b>",
+        "🚨 <b>Важно сейчас</b>",
         f"🏪 Магазин: <code>{shop_id}</code>",
         f"🕒 Обновлено: {generated_text}",
         "",
-        f"💰 Потенциальная сумма под контролем: <b>{_format_money(total_effect)}</b>",
+        f"💰 Потенциально под риском: <b>{_format_money(total_effect)}</b>",
         f"🔴 Критично: <b>{critical}</b> | 🟡 Внимание: <b>{warnings}</b>",
     ]
     if not actions:
         lines.extend(["", "✅ Активных проблем сейчас не найдено либо они временно отложены."])
     else:
-        lines.extend(["", "<b>Главные действия — по сумме влияния:</b>"])
+        lines.extend(["", "<b>Что сделать в первую очередь:</b>"])
         for index, action in enumerate(actions[:8], start=1):
             amount = float(action.get("amount") or 0)
             amount_text = _format_money(amount) if amount > 0 else "эффект не оценён"
@@ -13923,7 +14492,7 @@ async def business_control_center(message: Message) -> None:
     telegram_id, client, shop_id = req
     lang = get_user_language(telegram_id)
     await message.answer(
-        "⌛ Do‘kon xavflari pul bo‘yicha hisoblanmoqda..." if lang == "uz" else "⌛ Считаю риски магазина в деньгах...",
+        "⌛ Do‘kon tekshirilmoqda..." if lang == "uz" else "⌛ Проверяю магазин и расставляю приоритеты...",
         reply_markup=attention_menu_for_message(message),
     )
     try:
@@ -14069,32 +14638,31 @@ async def friendly_auto_start(message: Message, state: FSMContext) -> None:
     if current_state:
         if lang == "uz":
             await message.answer(
-                "Men sizni tushundim. Agar jarayonni bekor qilmoqchi bo‘lsangiz, <code>/cancel</code> yuboring.\n"
-                "Asosiy menyu quyida 👇",
+                "Hozir bot avvalgi amal uchun ma’lumot kutmoqda. Oldingi ko‘rsatmaga muvofiq javob bering "
+                "yoki ekrandagi <b>Bekor qilish</b> tugmasini bosing.",
                 reply_markup=menu_for_message(message),
             )
         else:
             await message.answer(
-                "Я вас понял. Если хотите отменить текущий шаг, отправьте <code>/cancel</code>.\n"
-                "Главное меню ниже 👇",
+                "Сейчас бот ждёт данные для предыдущего действия. Ответьте по подсказке выше "
+                "или нажмите кнопку <b>Отмена</b>, если она показана.",
                 reply_markup=menu_for_message(message),
             )
         return
 
     ensure_subscription(telegram_id)
+    connected = db.has_uzum_connection(telegram_id)
     if lang == "uz":
         text = (
-            "👋 <b>Uzum Seller Assistant</b>\n\n"
-            "Botdan foydalanishni boshlash uchun pastdagi menyudan kerakli bo‘limni tanlang.\n\n"
-            "🔌 Agar do‘kon hali ulanmagan bo‘lsa — <b>Ulash</b> tugmasini bosing.\n"
-            "🎥 API ulash videosi ham menyuda bor."
+            "Bu xabarni amal sifatida tanimadim. Kerakli bo‘limni pastdagi tugmalar orqali tanlang 👇"
+            if connected
+            else "Avval <b>🎥 Qanday ulash kerak</b>, so‘ng <b>🔌 Do‘konni ulash</b> tugmasini bosing 👇"
         )
     else:
         text = (
-            "👋 <b>Uzum Seller Assistant</b>\n\n"
-            "Чтобы начать пользоваться ботом, выберите нужный раздел в меню ниже.\n\n"
-            "🔌 Если магазин ещё не подключён — нажмите <b>Подключить</b>.\n"
-            "🎥 Видеоинструкция по API тоже есть в меню."
+            "Не распознал это как действие. Выберите нужный раздел кнопкой внизу 👇"
+            if connected
+            else "Сначала нажмите <b>🎥 Как подключить</b>, затем <b>🔌 Подключить магазин</b> 👇"
         )
     await message.answer(text, reply_markup=menu_for_message(message))
 
@@ -16276,6 +16844,7 @@ async def fbo_acceptance_watch_loop() -> None:
 
 async def main() -> None:
     logging.info("APP_BUILD: %s", APP_BUILD)
+    logging.info("INTUITIVE_UI_LOADED: compact navigation + grouped notifications + guided onboarding")
     logging.info("SKU_LABELS_INTERFACE_LOADED: official barcode types + PDF SKU labels")
     logging.info("INTUITIVE_ATTENTION_INTERFACE_LOADED: simple sections + attention report + full stock list")
     init_language_tables()
