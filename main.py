@@ -18,7 +18,7 @@ from urllib.parse import urlencode
 from pathlib import Path
 from typing import Any, Iterable
 
-from aiogram import Bot, Dispatcher, F
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command
@@ -1010,7 +1010,9 @@ def _fmt_dt(value: Any) -> str:
     return dt.astimezone(timezone(timedelta(hours=5))).strftime("%d.%m.%Y %H:%M")
 
 
-def is_admin(telegram_id: int) -> bool:
+def is_admin(telegram_id: int | None) -> bool:
+    if telegram_id is None:
+        return False
     return int(telegram_id) in ADMIN_IDS
 
 
@@ -1066,13 +1068,51 @@ def subscription_active_until(row: dict[str, Any] | None) -> datetime | None:
 
 
 def has_active_subscription(telegram_id: int) -> bool:
+    return subscription_access_level(telegram_id) in {"admin", "paid", "trial"}
+
+
+# Trial is intentionally useful but limited: it demonstrates the two core
+# outcomes of Seller Pro without providing the full paid product.
+TRIAL_ALLOWED_FEATURES = frozenset(
+    {
+        "sales_notifications",
+        "sales_today",
+        "morning_report",
+    }
+)
+
+
+def subscription_access_level(telegram_id: int) -> str:
+    """Return one stable access level for UI, handlers and background jobs."""
+    telegram_id = int(telegram_id)
     if is_admin(telegram_id):
-        return True
+        return "admin"
+
     row = ensure_subscription(telegram_id)
     if int(row.get("blocked") or 0) == 1:
-        return False
-    until = subscription_active_until(row)
-    return bool(until and until > _utc_now())
+        return "blocked"
+
+    now = _utc_now()
+    paid_until = _dt_from_db(row.get("subscription_until"))
+    if paid_until and paid_until > now:
+        return "paid"
+
+    trial_until = _dt_from_db(row.get("trial_until"))
+    if trial_until and trial_until > now:
+        return "trial"
+
+    return "expired"
+
+
+def has_paid_subscription(telegram_id: int) -> bool:
+    return subscription_access_level(telegram_id) in {"admin", "paid"}
+
+
+def feature_access_allowed(telegram_id: int, feature: str) -> bool:
+    level = subscription_access_level(telegram_id)
+    if level in {"admin", "paid"}:
+        return True
+    return level == "trial" and str(feature) in TRIAL_ALLOWED_FEATURES
 
 
 def subscription_status_text(telegram_id: int) -> str:
@@ -1137,6 +1177,32 @@ async def require_active_subscription(message: Message, telegram_id: int | None 
         return True
     await message.answer(
         tr_user(int(telegram_id), "access_limited"),
+        reply_markup=menu_for_message(message),
+    )
+    return False
+
+
+async def require_premium_subscription(
+    message: Message,
+    telegram_id: int | None = None,
+) -> bool:
+    """Allow only a paid subscription or admin access.
+
+    Trial users receive the plan selector, while expired/blocked users retain
+    the existing access-ended screen.  The helper is also used for entry points
+    such as the web cabinet that must never be opened by a saved old button.
+    """
+    if telegram_id is None:
+        telegram_id = upsert_from_message(message)
+    telegram_id = int(telegram_id)
+    level = subscription_access_level(telegram_id)
+    if level in {"admin", "paid"}:
+        return True
+    if level == "trial":
+        await send_trial_premium_locked(message, telegram_id)
+        return False
+    await message.answer(
+        tr_user(telegram_id, "access_limited"),
         reply_markup=menu_for_message(message),
     )
     return False
@@ -3570,6 +3636,72 @@ MAIN_MENU_UZ_CONNECTED_ADMIN = ReplyKeyboardMarkup(
     input_field_placeholder="Bo‘limni tanlang",
 )
 
+# Trial menu deliberately exposes only the value promised for the free period.
+# Paid sections remain discoverable through one clear "full version" button.
+TRIAL_MAIN_MENU_RU_CONNECTED = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="💰 Продажи"), KeyboardButton(text="🌙 Утренний отчёт")],
+        [KeyboardButton(text="💎 Полная версия")],
+        [KeyboardButton(text="⚙️ Настройки")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Пробный период: продажи и утренний отчёт",
+)
+
+TRIAL_MAIN_MENU_UZ_CONNECTED = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="💰 Savdo"), KeyboardButton(text="🌙 Ertalabki hisobot")],
+        [KeyboardButton(text="💎 To‘liq versiya")],
+        [KeyboardButton(text="⚙️ Sozlamalar")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Sinov: savdo va ertalabki hisobot",
+)
+
+TRIAL_SALES_MENU_RU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📊 Сегодня")],
+        [KeyboardButton(text="💸 Уведомления о продажах")],
+        [KeyboardButton(text="🌙 Утренний отчёт")],
+        [KeyboardButton(text="💎 Полная версия"), KeyboardButton(text="🏠 Главное")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Продажи в пробном периоде",
+)
+
+TRIAL_SALES_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="📊 Bugun")],
+        [KeyboardButton(text="💸 Savdo xabarlari")],
+        [KeyboardButton(text="🌙 Ertalabki hisobot")],
+        [KeyboardButton(text="💎 To‘liq versiya"), KeyboardButton(text="🏠 Asosiy")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Sinov davridagi savdo",
+)
+
+TRIAL_SETTINGS_MENU_RU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="💸 Уведомления о продажах")],
+        [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="🔐 Подключение Uzum")],
+        [KeyboardButton(text="🌐 Язык"), KeyboardButton(text="ℹ️ Помощь")],
+        [KeyboardButton(text="💎 Полная версия"), KeyboardButton(text="🏠 Главное")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Настройки пробного периода",
+)
+
+TRIAL_SETTINGS_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="💸 Savdo xabarlari")],
+        [KeyboardButton(text="🏪 Do‘konlar"), KeyboardButton(text="🔐 Uzum ulanishi")],
+        [KeyboardButton(text="🌐 Til"), KeyboardButton(text="ℹ️ Yordam")],
+        [KeyboardButton(text="💎 To‘liq versiya"), KeyboardButton(text="🏠 Asosiy")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Sinov davri sozlamalari",
+)
+
 SALES_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Сегодня"), KeyboardButton(text="📆 Вчера")],
@@ -3833,18 +3965,28 @@ def main_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
     lang = get_user_language(telegram_id)
     admin = is_admin(telegram_id)
     connected = _user_has_uzum_connection(telegram_id)
+    trial = bool(
+        telegram_id is not None
+        and subscription_access_level(int(telegram_id)) == "trial"
+    )
 
     if lang == "uz":
         if connected:
+            if trial:
+                return TRIAL_MAIN_MENU_UZ_CONNECTED
             return MAIN_MENU_UZ_CONNECTED_ADMIN if admin else MAIN_MENU_UZ_CONNECTED
         return MAIN_MENU_UZ_ADMIN if admin else MAIN_MENU_UZ
 
     if connected:
+        if trial:
+            return TRIAL_MAIN_MENU_RU_CONNECTED
         return MAIN_MENU_RU_CONNECTED_ADMIN if admin else MAIN_MENU_RU_CONNECTED
     return MAIN_MENU_RU_ADMIN if admin else MAIN_MENU_RU
 
 
 def sales_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
+    if telegram_id is not None and subscription_access_level(int(telegram_id)) == "trial":
+        return TRIAL_SALES_MENU_UZ if get_user_language(telegram_id) == "uz" else TRIAL_SALES_MENU_RU
     return SALES_MENU_UZ if get_user_language(telegram_id) == "uz" else SALES_MENU_RU
 
 
@@ -3865,6 +4007,8 @@ def report_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
 
 
 def settings_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
+    if telegram_id is not None and subscription_access_level(int(telegram_id)) == "trial":
+        return TRIAL_SETTINGS_MENU_UZ if get_user_language(telegram_id) == "uz" else TRIAL_SETTINGS_MENU_RU
     return SETTINGS_MENU_UZ if get_user_language(telegram_id) == "uz" else SETTINGS_MENU_RU
 
 
@@ -4007,6 +4151,8 @@ def subscription_full_text(telegram_id: int) -> str:
             f"Holat: {status}\n"
             f"Trial tugash vaqti: <b>{_fmt_dt(row.get('trial_until'))}</b>\n"
             f"To‘langan muddat: <b>{_fmt_dt(row.get('subscription_until'))}</b>\n\n"
+            "🎁 Trialda: bugungi savdo, yangi savdo xabarlari va ertalabki hisobot.\n"
+            "💎 To‘liq obunada: botning barcha imkoniyatlari.\n\n"
             "Tariflar:\n"
             f"<b>{escape(SUBSCRIPTION_PLANS_TEXT_UZ)}</b>\n\n"
             "Tarifni tanlash va chek yuborish: <code>/subscribe</code>\n\n"
@@ -4021,6 +4167,8 @@ def subscription_full_text(telegram_id: int) -> str:
         f"Статус: {status}\n"
         f"Trial до: <b>{_fmt_dt(row.get('trial_until'))}</b>\n"
         f"Оплачено до: <b>{_fmt_dt(row.get('subscription_until'))}</b>\n\n"
+        "🎁 В trial: продажи за сегодня, уведомления о новых продажах и утренний отчёт.\n"
+        "💎 В полной подписке: все функции бота.\n\n"
         "Тарифы:\n"
         f"<b>{escape(SUBSCRIPTION_PLANS_TEXT)}</b>\n\n"
         "Выбрать тариф и отправить чек: <code>/subscribe</code>\n\n"
@@ -4049,6 +4197,190 @@ class PaymentStates(StatesGroup):
 
 class ProductSettingsStates(StatesGroup):
     waiting_for_value = State()
+
+
+TRIAL_ALLOWED_COMMANDS = frozenset(
+    {
+        "start",
+        "help",
+        "menu",
+        "cancel",
+        "status",
+        "connect_shop",
+        "staff_connect",
+        "addshop",
+        "connect",
+        "reconnect",
+        "disconnect",
+        "pinguzum",
+        "shops",
+        "setshop",
+        "language",
+        "lang",
+        "til",
+        "video",
+        "api_video",
+        "instruction",
+        "api_token",
+        "token_help",
+        "how_token",
+        "security",
+        "privacy",
+        "support",
+        "subscribe",
+        "my_payments",
+        "my_subscription",
+        "subscription",
+        "today",
+        "sales_today",
+        "morning_report",
+        "daily_report",
+        "sales_notify_status",
+        "sales_notify_mode",
+        "sales_notifications",
+    }
+)
+
+TRIAL_ALLOWED_BUTTONS = frozenset(
+    {
+        "💰 Продажи",
+        "💰 Savdo",
+        "📊 Сегодня",
+        "📊 Bugun",
+        "🌙 Утренний отчёт",
+        "🌙 Ertalabki hisobot",
+        "💸 Уведомления о продажах",
+        "💸 Savdo xabarlari",
+        "💎 Полная версия",
+        "💎 To‘liq versiya",
+        "💎 Подписка",
+        "💎 Obuna",
+        "⚙️ Настройки",
+        "⚙️ Sozlamalar",
+        "⬅️ Настройки",
+        "⬅️ Sozlamalar",
+        "🏠 Главное",
+        "🏠 Asosiy",
+        "🏪 Магазины",
+        "🏪 Do‘konlar",
+        "🔐 Подключение Uzum",
+        "🔐 Uzum ulanishi",
+        "🔌 Подключить",
+        "🔌 Подключить магазин",
+        "🔌 Ulash",
+        "🔌 Do‘konni ulash",
+        "🔌 Обновить API-ключ",
+        "🔌 API-kalitni yangilash",
+        "✅ Проверить подключение",
+        "✅ Ulanishni tekshirish",
+        "🎥 Видеоинструкция",
+        "🎥 Как подключить",
+        "🎥 API ulash videosi",
+        "🎥 Qanday ulash kerak",
+        "🌐 Язык",
+        "🌐 Til",
+        "ℹ️ Помощь",
+        "ℹ️ Yordam",
+        "❓ Помощь",
+        "🔐 Безопасность",
+        "🔐 Xavfsizlik",
+        "❌ Отмена",
+        "❌ Bekor qilish",
+    }
+)
+
+TRIAL_ALLOWED_CALLBACK_PREFIXES = (
+    "set_lang:",
+    "shop_select:",
+    "payplan:",
+    "paycancel:",
+    "salesmode:",
+)
+
+
+async def send_trial_premium_locked(
+    event: Message | CallbackQuery,
+    telegram_id: int,
+) -> None:
+    """Show one consistent, actionable upgrade screen to a trial user."""
+    lang = get_user_language(telegram_id)
+    if lang == "uz":
+        text = (
+            "🔒 <b>Bu funksiya to‘liq obunada mavjud</b>\n\n"
+            f"{TRIAL_DAYS} kunlik sinovda quyidagilar ochiq:\n"
+            "✅ bugungi savdolar\n"
+            "✅ yangi savdolar haqida xabarlar\n"
+            "✅ ertalabki hisobot\n\n"
+            "To‘liq obunada ombor, FBO/FBS tahlili, foyda, Excel, "
+            "yo‘qotishlar, bekor qilishlar, avtohisobotlar va boshqa imkoniyatlar ochiladi.\n\n"
+            "Tarifni tanlang 👇"
+        )
+        alert = "Bu funksiya faqat to‘liq obunada mavjud"
+    else:
+        text = (
+            "🔒 <b>Эта функция доступна в полной подписке</b>\n\n"
+            f"В пробном периоде на {TRIAL_DAYS} дня доступны:\n"
+            "✅ продажи за сегодня\n"
+            "✅ уведомления о новых продажах\n"
+            "✅ утренний отчёт\n\n"
+            "Полная подписка открывает склад, аналитику FBO/FBS, прибыль, Excel, "
+            "потери, отмены, автоотчёты и остальные функции.\n\n"
+            "Выберите тариф 👇"
+        )
+        alert = "Функция доступна только в полной подписке"
+
+    if isinstance(event, CallbackQuery):
+        await event.answer(alert, show_alert=True)
+        if event.message:
+            await event.message.answer(text, reply_markup=payment_plan_markup(lang))
+        return
+    await event.answer(text, reply_markup=payment_plan_markup(lang))
+
+
+class TrialFeatureMiddleware(BaseMiddleware):
+    """Prevent stale keyboards and direct commands from bypassing trial limits."""
+
+    async def __call__(self, handler: Any, event: Any, data: dict[str, Any]) -> Any:
+        user = getattr(event, "from_user", None)
+        if user is None or subscription_access_level(int(user.id)) != "trial":
+            return await handler(event, data)
+
+        if isinstance(event, CallbackQuery):
+            callback_data = str(event.data or "")
+            if callback_data.startswith(TRIAL_ALLOWED_CALLBACK_PREFIXES):
+                return await handler(event, data)
+            await send_trial_premium_locked(event, int(user.id))
+            return None
+
+        if not isinstance(event, Message):
+            return await handler(event, data)
+
+        state = data.get("state")
+        current_state = await state.get_state() if state is not None else None
+        text = str(event.text or "").strip()
+        if current_state in {
+            ConnectStates.waiting_for_token.state,
+            ConnectStates.waiting_for_shop_id.state,
+        } and not text.startswith("/"):
+            return await handler(event, data)
+        if current_state == PaymentStates.waiting_for_receipt.state and (
+            bool(event.photo) or event.document is not None
+        ):
+            return await handler(event, data)
+
+        if text.startswith("/"):
+            command = text.split(maxsplit=1)[0].split("@", 1)[0].lstrip("/").lower()
+            if command in TRIAL_ALLOWED_COMMANDS:
+                return await handler(event, data)
+        elif text in TRIAL_ALLOWED_BUTTONS:
+            return await handler(event, data)
+
+        await send_trial_premium_locked(event, int(user.id))
+        return None
+
+
+dp.message.outer_middleware(TrialFeatureMiddleware())
+dp.callback_query.outer_middleware(TrialFeatureMiddleware())
 
 
 def get_tg_id(message: Message) -> int:
@@ -4662,26 +4994,27 @@ def _web_subscription_payload(telegram_id: int) -> tuple[str, str | None]:
         return "unknown", None
 
     blocked = bool(int(_web_row_value(subscription, "blocked", 0) or 0))
-    parsed: list[datetime] = []
-    for field in ("subscription_until", "trial_until"):
-        value = _web_row_value(subscription, field)
-        if not value:
-            continue
-        try:
-            dt = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=timezone.utc)
-            parsed.append(dt.astimezone(timezone.utc))
-        except (TypeError, ValueError):
-            continue
-
-    until = max(parsed) if parsed else None
+    paid_until = _dt_from_db(_web_row_value(subscription, "subscription_until"))
+    trial_until = _dt_from_db(_web_row_value(subscription, "trial_until"))
+    now = datetime.now(timezone.utc)
     if blocked:
         state = "blocked"
-    elif until and until > datetime.now(timezone.utc):
+        until = max(
+            (value for value in (paid_until, trial_until) if value is not None),
+            default=None,
+        )
+    elif is_admin(telegram_id) or (paid_until and paid_until > now):
         state = "active"
+        until = paid_until
+    elif trial_until and trial_until > now:
+        state = "trial"
+        until = trial_until
     else:
         state = "expired"
+        until = max(
+            (value for value in (paid_until, trial_until) if value is not None),
+            default=None,
+        )
     return state, _web_iso(until)
 
 
@@ -4824,6 +5157,8 @@ def web_cabinet_markup(message: Message) -> InlineKeyboardMarkup:
 @dp.message(Command("site", "web", "cabinet"))
 async def open_web_cabinet_command(message: Message) -> None:
     telegram_id = upsert_from_message(message)
+    if not await require_premium_subscription(message, telegram_id):
+        return
     locale = get_user_language(telegram_id)
     try:
         # Сначала передаём сайт-сайту зашифрованный Uzum-токен, подписку,
@@ -4872,19 +5207,29 @@ async def start(message: Message) -> None:
     if lang == "uz":
         connected = "✅ ulangan" if is_connected else "❌ ulanmagan"
     sub_line = subscription_status_text(telegram_id)
+    trial = subscription_access_level(telegram_id) == "trial"
 
     if lang == "uz":
         if is_connected:
-            text = (
-                "👋 <b>Seller.pro.uz</b>\n\n"
-                f"Do‘kon: {connected}\n"
-                f"Kirish: {sub_line}\n\n"
-                "<b>Nimadan boshlash kerak?</b>\n"
-                "🏠 <b>Do‘kon holati</b> — asosiy raqamlarni bir joyda ko‘rish\n"
-                "🚨 <b>Hozir muhim</b> — nimaga e’tibor berish va nima qilish\n"
-                "💰 <b>Savdo</b> va 📦 <b>Ombor</b> — kundalik ishlar\n\n"
-                "Kerakli tugmani pastdan bosing 👇"
-            )
+            if trial:
+                text = (
+                    "👋 <b>Seller.pro.uz</b>\n\n"
+                    f"Do‘kon: {connected}\nKirish: {sub_line}\n\n"
+                    "🎁 <b>Sinov davrida ochiq:</b>\n"
+                    "💰 bugungi savdolar\n💸 yangi savdo xabarlari\n🌙 ertalabki hisobot\n\n"
+                    "Kerakli tugmani pastdan bosing 👇"
+                )
+            else:
+                text = (
+                    "👋 <b>Seller.pro.uz</b>\n\n"
+                    f"Do‘kon: {connected}\n"
+                    f"Kirish: {sub_line}\n\n"
+                    "<b>Nimadan boshlash kerak?</b>\n"
+                    "🏠 <b>Do‘kon holati</b> — asosiy raqamlarni bir joyda ko‘rish\n"
+                    "🚨 <b>Hozir muhim</b> — nimaga e’tibor berish va nima qilish\n"
+                    "💰 <b>Savdo</b> va 📦 <b>Ombor</b> — kundalik ishlar\n\n"
+                    "Kerakli tugmani pastdan bosing 👇"
+                )
         else:
             text = (
                 "👋 <b>Seller.pro.uz</b>\n\n"
@@ -4898,16 +5243,25 @@ async def start(message: Message) -> None:
             )
     else:
         if is_connected:
-            text = (
-                "👋 <b>Seller.pro.uz</b>\n\n"
-                f"Магазин: {connected}\n"
-                f"Доступ: {sub_line}\n\n"
-                "<b>С чего начать?</b>\n"
-                "🏠 <b>Обзор магазина</b> — главные цифры на одном экране\n"
-                "🚨 <b>Важно сейчас</b> — что требует внимания и что сделать\n"
-                "💰 <b>Продажи</b> и 📦 <b>Склад</b> — ежедневная работа\n\n"
-                "Нажмите нужную кнопку внизу 👇"
-            )
+            if trial:
+                text = (
+                    "👋 <b>Seller.pro.uz</b>\n\n"
+                    f"Магазин: {connected}\nДоступ: {sub_line}\n\n"
+                    "🎁 <b>В пробном периоде открыты:</b>\n"
+                    "💰 продажи за сегодня\n💸 уведомления о новых продажах\n🌙 утренний отчёт\n\n"
+                    "Нажмите нужную кнопку внизу 👇"
+                )
+            else:
+                text = (
+                    "👋 <b>Seller.pro.uz</b>\n\n"
+                    f"Магазин: {connected}\n"
+                    f"Доступ: {sub_line}\n\n"
+                    "<b>С чего начать?</b>\n"
+                    "🏠 <b>Обзор магазина</b> — главные цифры на одном экране\n"
+                    "🚨 <b>Важно сейчас</b> — что требует внимания и что сделать\n"
+                    "💰 <b>Продажи</b> и 📦 <b>Склад</b> — ежедневная работа\n\n"
+                    "Нажмите нужную кнопку внизу 👇"
+                )
         else:
             text = (
                 "👋 <b>Seller.pro.uz</b>\n\n"
@@ -6308,7 +6662,12 @@ async def _send_premium_period_report(
         return
     telegram_id, client, shop_id = req
     lang = get_user_language(telegram_id)
-    await message.answer(wait_uz if lang == "uz" else wait_ru, reply_markup=sales_menu_for_message(message))
+    trial = subscription_access_level(telegram_id) == "trial"
+    if trial:
+        wait_text = "⌛ Bugungi savdolar yuklanmoqda..." if lang == "uz" else "⌛ Загружаю продажи за сегодня..."
+    else:
+        wait_text = wait_uz if lang == "uz" else wait_ru
+    await message.answer(wait_text, reply_markup=sales_menu_for_message(message))
     try:
         rows, _, source_info = await _load_finance_range_flexible(
             client,
@@ -6316,6 +6675,14 @@ async def _send_premium_period_report(
             date_from,
             date_to,
         )
+        stats = _build_noorza_today_stats(rows)
+        if trial:
+            # Trial demonstrates the core sales picture without exposing the
+            # paid profit, comparison and top-product analytics.
+            text = _format_noorza_today(shop_id, stats, rows)
+            await message.answer(text, reply_markup=sales_menu_for_message(message))
+            return
+
         shift_ms = max(1, int(comparison_shift_days)) * 24 * 60 * 60 * 1000
         previous_rows, _, _ = await _load_finance_range_flexible(
             client,
@@ -6323,7 +6690,6 @@ async def _send_premium_period_report(
             date_from - shift_ms,
             date_to - shift_ms,
         )
-        stats = _build_noorza_today_stats(rows)
         previous_stats = _build_noorza_today_stats(previous_rows)
         costs = get_unit_cost_map(telegram_id, shop_id)
         unit_rows = _build_unit_rows_from_finance(rows, costs)
@@ -7845,28 +8211,28 @@ async def subscribe(message: Message) -> None:
     if lang == "uz":
         text = (
             "💎 <b>Uzum Seller Assistant obunasi</b>\n\n"
-            "Nimalar kiradi:\n"
+            f"🎁 <b>{TRIAL_DAYS} kunlik sinov:</b> bugungi savdo, yangi savdo xabarlari va ertalabki hisobot.\n\n"
+            "<b>To‘liq obunaga kiradi:</b>\n"
             "✅ bugun, kecha, 7 va 30 kunlik FBO/FBS savdolar\n"
             "✅ qoldiqlar va tugab borayotgan tovarlar\n"
             "✅ Uzum API bergan bo‘lsa, yo‘qolgan tovarlar\n"
             "✅ yangi savdolar haqida xabarlar\n"
             "✅ bir nechta do‘kon bilan ishlash\n"
-            "✅ Excel hisobot va ertalabki hisobot\n\n"
-            f"🎁 Trial: yangi foydalanuvchi uchun <b>{TRIAL_DAYS} kun</b>\n\n"
+            "✅ Excel, foyda, ertalabki va avtomatik hisobotlar\n\n"
             "💰 <b>Tarifni tanlang</b>\n\n"
             "Keyingi bosqichda to‘lov rekvizitlari chiqadi. To‘lovdan so‘ng chekni shu yerga yuborasiz."
         )
     else:
         text = (
             "💎 <b>Подписка Uzum Seller Assistant</b>\n\n"
-            "Что входит:\n"
+            f"🎁 <b>Пробный период {TRIAL_DAYS} дня:</b> продажи за сегодня, уведомления о новых продажах и утренний отчёт.\n\n"
+            "<b>В полную подписку входят:</b>\n"
             "✅ продажи FBO/FBS за сегодня, вчера, 7 и 30 дней\n"
             "✅ остатки и товары, которые заканчиваются\n"
             "✅ потерянные товары, если Uzum отдаёт их в API\n"
             "✅ уведомления о новых продажах\n"
             "✅ работа с несколькими магазинами\n"
-            "✅ Excel-отчёт и утренний отчёт\n\n"
-            f"🎁 Trial: <b>{TRIAL_DAYS} дня</b> для нового пользователя\n\n"
+            "✅ Excel, прибыль, утренние и автоматические отчёты\n\n"
             "💰 <b>Выберите тариф</b>\n\n"
             "На следующем шаге появятся реквизиты. После оплаты вы отправите чек прямо сюда."
         )
@@ -9632,8 +9998,8 @@ def order_key(order: Any) -> str:
     return "hash:" + hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
-def connected_users_for_order_watch() -> list[dict[str, Any]]:
-    """Берём всех пользователей, у кого подключён Uzum-токен и выбран магазин."""
+def connected_users_for_order_watch(access_feature: str = "premium") -> list[dict[str, Any]]:
+    """Return connected users whose subscription permits this watcher."""
     with db.connect() as conn:
         rows = conn.execute(
             """
@@ -9643,7 +10009,11 @@ def connected_users_for_order_watch() -> list[dict[str, Any]]:
               AND default_shop_id IS NOT NULL
             """
         ).fetchall()
-    return [dict(row) for row in rows if has_active_subscription(int(row["telegram_id"]))]
+    return [
+        dict(row)
+        for row in rows
+        if feature_access_allowed(int(row["telegram_id"]), access_feature)
+    ]
 
 
 async def check_new_orders_once() -> None:
@@ -11191,6 +11561,8 @@ async def button_lost(message: Message) -> None:
 
 @dp.message(F.text == "💎 Obuna")
 @dp.message(F.text == "💎 Подписка")
+@dp.message(F.text == "💎 To‘liq versiya")
+@dp.message(F.text == "💎 Полная версия")
 async def button_subscription(message: Message) -> None:
     await subscribe(message)
 
@@ -11202,18 +11574,28 @@ async def button_help(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     lang = get_user_language(telegram_id)
     connected = db.has_uzum_connection(telegram_id)
+    trial = subscription_access_level(telegram_id) == "trial"
     if lang == "uz":
         if connected:
-            text = (
-                "ℹ️ <b>Qayerga bosish kerak?</b>\n\n"
-                "🏠 <b>Do‘kon holati</b> — asosiy ko‘rsatkichlar\n"
-                "💰 <b>Savdo</b> — davr, foyda va top tovarlar\n"
-                "📦 <b>Ombor</b> — qoldiq, yo‘qotish va yetkazish rejasi\n"
-                "🚨 <b>Hozir muhim</b> — birinchi navbatdagi muammolar\n"
-                "📊 <b>Hisobotlar</b> — Excel va tayyor xulosalar\n"
-                "⚙️ <b>Sozlamalar</b> — xabarnomalar, moliya va ulanish\n\n"
-                "Muammo bo‘lsa, pastdagi tugma orqali administratorga yozing."
-            )
+            if trial:
+                text = (
+                    "ℹ️ <b>Sinov davri</b>\n\n"
+                    "💰 <b>Savdo</b> — bugungi savdolar\n"
+                    "💸 <b>Savdo xabarlari</b> — yangi savdolarni darhol yoki soatlik olish\n"
+                    "🌙 <b>Ertalabki hisobot</b> — kunlik qisqa hisobot\n\n"
+                    "Qolgan imkoniyatlar to‘liq obunada ochiladi."
+                )
+            else:
+                text = (
+                    "ℹ️ <b>Qayerga bosish kerak?</b>\n\n"
+                    "🏠 <b>Do‘kon holati</b> — asosiy ko‘rsatkichlar\n"
+                    "💰 <b>Savdo</b> — davr, foyda va top tovarlar\n"
+                    "📦 <b>Ombor</b> — qoldiq, yo‘qotish va yetkazish rejasi\n"
+                    "🚨 <b>Hozir muhim</b> — birinchi navbatdagi muammolar\n"
+                    "📊 <b>Hisobotlar</b> — Excel va tayyor xulosalar\n"
+                    "⚙️ <b>Sozlamalar</b> — xabarnomalar, moliya va ulanish\n\n"
+                    "Muammo bo‘lsa, pastdagi tugma orqali administratorga yozing."
+                )
         else:
             text = (
                 "ℹ️ <b>Do‘konni ulash</b>\n\n"
@@ -11224,16 +11606,25 @@ async def button_help(message: Message) -> None:
             )
     else:
         if connected:
-            text = (
-                "ℹ️ <b>Куда нажимать?</b>\n\n"
-                "🏠 <b>Обзор магазина</b> — главные показатели\n"
-                "💰 <b>Продажи</b> — периоды, прибыль и топ товаров\n"
-                "📦 <b>Склад</b> — остатки, потери и план поставки\n"
-                "🚨 <b>Важно сейчас</b> — проблемы, требующие действий\n"
-                "📊 <b>Отчёты</b> — Excel и готовые сводки\n"
-                "⚙️ <b>Настройки</b> — уведомления, финансы и подключение\n\n"
-                "Если что-то не получается, напишите администратору кнопкой ниже."
-            )
+            if trial:
+                text = (
+                    "ℹ️ <b>Пробный период</b>\n\n"
+                    "💰 <b>Продажи</b> — продажи за сегодня\n"
+                    "💸 <b>Уведомления о продажах</b> — сразу или сводкой раз в час\n"
+                    "🌙 <b>Утренний отчёт</b> — ежедневная краткая сводка\n\n"
+                    "Остальные возможности открываются в полной подписке."
+                )
+            else:
+                text = (
+                    "ℹ️ <b>Куда нажимать?</b>\n\n"
+                    "🏠 <b>Обзор магазина</b> — главные показатели\n"
+                    "💰 <b>Продажи</b> — периоды, прибыль и топ товаров\n"
+                    "📦 <b>Склад</b> — остатки, потери и план поставки\n"
+                    "🚨 <b>Важно сейчас</b> — проблемы, требующие действий\n"
+                    "📊 <b>Отчёты</b> — Excel и готовые сводки\n"
+                    "⚙️ <b>Настройки</b> — уведомления, финансы и подключение\n\n"
+                    "Если что-то не получается, напишите администратору кнопкой ниже."
+                )
         else:
             text = (
                 "ℹ️ <b>Как подключить магазин</b>\n\n"
@@ -11274,15 +11665,18 @@ async def section_notifications(message: Message) -> None:
 @dp.message(F.text.in_({"⚙️ Настройки", "⚙️ Sozlamalar", "⬅️ Настройки", "⬅️ Sozlamalar"}))
 async def section_settings(message: Message) -> None:
     telegram_id = upsert_from_message(message)
+    trial = subscription_access_level(telegram_id) == "trial"
     if get_user_language(telegram_id) == "uz":
         text = (
-            "⚙️ <b>Sozlamalar</b>\n\n"
-            "Xabarnomalar, do‘konlar, moliya va Uzum ulanishini shu yerda boshqaring."
+            "⚙️ <b>Sinov sozlamalari</b>\n\nSavdo xabarlari, do‘konlar va Uzum ulanishini boshqaring."
+            if trial
+            else "⚙️ <b>Sozlamalar</b>\n\nXabarnomalar, do‘konlar, moliya va Uzum ulanishini shu yerda boshqaring."
         )
     else:
         text = (
-            "⚙️ <b>Настройки</b>\n\n"
-            "Уведомления, магазины, финансы и подключение Uzum собраны здесь."
+            "⚙️ <b>Настройки пробного периода</b>\n\nЗдесь можно настроить уведомления о продажах, магазины и подключение Uzum."
+            if trial
+            else "⚙️ <b>Настройки</b>\n\nУведомления, магазины, финансы и подключение Uzum собраны здесь."
         )
     await message.answer(text, reply_markup=settings_menu_for_message(message))
 
@@ -11363,8 +11757,13 @@ async def button_notify_status(message: Message) -> None:
 
 @dp.message(F.text == "💸 Новые продажи")
 @dp.message(F.text == "💸 Продажи Finance")
+@dp.message(F.text == "💸 Уведомления о продажах")
+@dp.message(F.text == "💸 Savdo xabarlari")
 async def button_sales_notify_status(message: Message) -> None:
-    await sales_notify_status(message)
+    if str(message.text or "") in {"💸 Уведомления о продажах", "💸 Savdo xabarlari"}:
+        await sales_mode_screen(message)
+    else:
+        await sales_notify_status(message)
 
 
 @dp.message(F.text == "📦 Изменение остатков")
@@ -13115,19 +13514,23 @@ async def daily_report_loop() -> None:
             now = datetime.now(UZT)
             for row in _connected_users_basic():
                 telegram_id = int(row["telegram_id"])
+                access_level = subscription_access_level(telegram_id)
+                premium = access_level in {"admin", "paid"}
                 settings = ensure_product_settings(telegram_id)
                 due: list[tuple[str, str, int]] = []
                 if int(settings.get("daily_enabled") or 0) and now.hour >= int(settings.get("daily_hour") or 0):
                     due.append(("daily", now.strftime("%Y-%m-%d"), 1))
                 if (
-                    int(settings.get("weekly_enabled") or 0)
+                    premium
+                    and int(settings.get("weekly_enabled") or 0)
                     and now.weekday() == int(settings.get("weekly_weekday") or 0)
                     and now.hour >= int(settings.get("weekly_hour") or 0)
                 ):
                     iso = now.isocalendar()
                     due.append(("weekly", f"{iso.year}-W{iso.week:02d}", 7))
                 if (
-                    int(settings.get("monthly_enabled") or 0)
+                    premium
+                    and int(settings.get("monthly_enabled") or 0)
                     and now.day == int(settings.get("monthly_day") or 1)
                     and now.hour >= int(settings.get("monthly_hour") or 0)
                 ):
@@ -13204,9 +13607,12 @@ async def subscription_reminder_loop() -> None:
 # Если один и тот же Uzum API-токен / магазин подключён у нескольких Telegram-пользователей
 # (например, владелец и жена), старые watcher-функции делали одинаковый запрос для каждого пользователя.
 # Ниже мы переопределяем check_*_once: один запрос на связку token+shop, потом рассылка всем пользователям группы.
-def connected_watch_groups(*setting_fields: str) -> list[dict[str, Any]]:
+def connected_watch_groups(
+    *setting_fields: str,
+    access_feature: str = "premium",
+) -> list[dict[str, Any]]:
     groups: dict[str, dict[str, Any]] = {}
-    for row in connected_users_for_order_watch():
+    for row in connected_users_for_order_watch(access_feature):
         telegram_id = int(row["telegram_id"])
         if setting_fields and not any(
             product_setting_enabled(telegram_id, field)
@@ -14123,6 +14529,7 @@ def sales_mode_selection_text(telegram_id: int) -> str:
     settings = ensure_product_settings(telegram_id)
     shop_id = db.get_default_shop_id(telegram_id)
     shop_text = str(shop_id) if shop_id is not None else "—"
+    trial = subscription_access_level(telegram_id) == "trial"
     if normalize_lang(lang) == "uz":
         return (
             "💸 <b>Savdo xabarlari rejimi</b>\n\n"
@@ -14131,8 +14538,12 @@ def sales_mode_selection_text(telegram_id: int) -> str:
             "⚡ <b>Darhol</b> — har bir yangi savdo alohida xabar bo‘lib keladi. "
             "Savdosi kam do‘konlar uchun qulay.\n\n"
             "🕐 <b>Har soatda hisobot</b> — bot savdolarni yig‘adi va soatiga bitta xabar yuboradi: "
-            "buyurtmalar, dona, tushum, komissiya, logistika, to‘lov va top tovarlar.\n\n"
-            "🚫 Bekor qilingan buyurtmalar tanlangan rejimdan qat’i nazar alohida tezkor xabar bo‘lib keladi."
+            "buyurtmalar, dona, tushum, komissiya, logistika, to‘lov va top tovarlar."
+            + (
+                "\n\n🚫 Bekor qilingan buyurtmalar tanlangan rejimdan qat’i nazar alohida tezkor xabar bo‘lib keladi."
+                if not trial
+                else ""
+            )
         )
     return (
         "💸 <b>Режим уведомлений о продажах</b>\n\n"
@@ -14141,8 +14552,12 @@ def sales_mode_selection_text(telegram_id: int) -> str:
         "⚡ <b>Сразу</b> — каждая новая продажа приходит отдельным сообщением. "
         "Удобно для небольших магазинов.\n\n"
         "🕐 <b>Сводка раз в час</b> — бот собирает продажи и присылает одно сообщение: "
-        "заказы, количество товаров, выручка, комиссия, логистика, выплата и топ товаров.\n\n"
-        "🚫 Отмены остаются отдельными срочными уведомлениями независимо от выбранного режима."
+        "заказы, количество товаров, выручка, комиссия, логистика, выплата и топ товаров."
+        + (
+            "\n\n🚫 Отмены остаются отдельными срочными уведомлениями независимо от выбранного режима."
+            if not trial
+            else ""
+        )
     )
 
 
@@ -14313,9 +14728,10 @@ async def sales_mode_screen(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     if not await require_active_subscription(message, telegram_id):
         return
+    back_to = "trial" if subscription_access_level(telegram_id) == "trial" else "automation"
     await message.answer(
         sales_mode_selection_text(telegram_id),
-        reply_markup=sales_mode_selection_markup(telegram_id),
+        reply_markup=sales_mode_selection_markup(telegram_id, back_to=back_to),
     )
 
 
@@ -14328,6 +14744,8 @@ async def sales_mode_callback(callback: CallbackQuery) -> None:
     action = parts[1] if len(parts) > 1 else ""
     back_to = parts[2] if len(parts) > 2 else "automation"
     lang = get_user_language(telegram_id)
+    if subscription_access_level(telegram_id) == "trial":
+        back_to = "trial"
 
     if action == "menu":
         if callback.message:
@@ -14340,7 +14758,19 @@ async def sales_mode_callback(callback: CallbackQuery) -> None:
 
     if action == "back":
         if callback.message:
-            if back_to == "sales":
+            if back_to == "trial":
+                await callback.message.edit_text(
+                    "💸 Savdo xabarlari sozlamalari saqlandi."
+                    if normalize_lang(lang) == "uz"
+                    else "💸 Настройки уведомлений о продажах сохранены."
+                )
+                await callback.message.answer(
+                    "Kerakli sinov funksiyasini tanlang 👇"
+                    if normalize_lang(lang) == "uz"
+                    else "Выберите доступную функцию пробного периода 👇",
+                    reply_markup=sales_menu_for_user(telegram_id),
+                )
+            elif back_to == "sales":
                 await callback.message.edit_text(
                     notification_section_text(telegram_id, "sales"),
                     reply_markup=notification_section_markup(telegram_id, "sales"),
@@ -14370,7 +14800,12 @@ async def sales_mode_callback(callback: CallbackQuery) -> None:
             clear_queue=True,
         )
     if callback.message:
-        if back_to == "sales":
+        if back_to == "trial":
+            await callback.message.edit_text(
+                sales_mode_selection_text(telegram_id),
+                reply_markup=sales_mode_selection_markup(telegram_id, back_to="trial"),
+            )
+        elif back_to == "sales":
             await callback.message.edit_text(
                 notification_section_text(telegram_id, "sales"),
                 reply_markup=notification_section_markup(telegram_id, "sales"),
@@ -18382,6 +18817,22 @@ async def _deliver_pending_notifications() -> None:
             telegram_id = int(row["telegram_id"])
             shop_id = int(row["shop_id"])
             event_type = str(row["event_type"])
+            required_feature = (
+                "sales_notifications"
+                if event_type in {"sale", "sale_digest"}
+                else "premium"
+            )
+            if not feature_access_allowed(telegram_id, required_feature):
+                # Do not retry an event that is no longer allowed after a
+                # subscription transition.  The durable row remains auditable.
+                _mark_notification_sent(notification_id)
+                logging.info(
+                    "Notification suppressed by access type=%s user=%s shop=%s",
+                    event_type,
+                    telegram_id,
+                    shop_id,
+                )
+                continue
 
             if event_type == "sale_digest":
                 summary = payload.get("summary")
@@ -19211,11 +19662,15 @@ _cleanup_release_state()
 # Preserves per-user instant/hourly modes while using the durable outbox and
 # adaptive Finance pagination from RELEASE_HARDENING.
 # =============================================================================
-PREMIUM_RELEASE_VERSION = "2026.07.18-premium-r4-production"
+PREMIUM_RELEASE_VERSION = "2026.07.18-premium-r5-trial-gated"
 
 
 async def check_new_sales_once() -> None:
-    for group in connected_watch_groups("notify_sales", "notify_cancellations"):
+    for group in connected_watch_groups(
+        "notify_sales",
+        "notify_cancellations",
+        access_feature="sales_notifications",
+    ):
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(value) for value in group["telegram_ids"]]
@@ -19241,7 +19696,16 @@ async def check_new_sales_once() -> None:
                 known_identities=known_union,
                 baseline=baseline_group,
             )
-            cancel_rows = await _load_cancel_status_rows(client, shop_id)
+            need_cancellations = any(
+                has_paid_subscription(telegram_id)
+                and product_setting_enabled(telegram_id, "notify_cancellations")
+                for telegram_id in telegram_ids
+            )
+            cancel_rows = (
+                await _load_cancel_status_rows(client, shop_id)
+                if need_cancellations
+                else []
+            )
 
             merged: dict[str, dict[str, Any]] = {}
             for item in recent_rows + cancel_rows:
@@ -19278,9 +19742,12 @@ async def check_new_sales_once() -> None:
             previous = state_by_user.get(telegram_id, {})
             initialized = initialized_by_user.get(telegram_id, False)
             sales_mode = get_sales_notification_mode(telegram_id)
-            cancellations_enabled = product_setting_enabled(
-                telegram_id,
-                "notify_cancellations",
+            cancellations_enabled = (
+                has_paid_subscription(telegram_id)
+                and product_setting_enabled(
+                    telegram_id,
+                    "notify_cancellations",
+                )
             )
 
             if not initialized:
@@ -19418,6 +19885,7 @@ async def main() -> None:
         CANCEL_WATCH_DEEP_SCAN_INTERVAL_SECONDS,
     )
     logging.info("PREMIUM_UI_LOADED: compact main menu + guided sections + honest financial wording")
+    logging.info("TRIAL_FEATURE_GATING_LOADED: sales today + sale alerts + morning report")
     logging.info("LEGACY_CANCEL_STATUS_FILTER_SCAN_DISABLED: finance orders are scanned without unsupported status parameters")
     logging.info("SKU_LABELS_INTERFACE_LOADED: official barcode types + PDF SKU labels")
     logging.info("STOCK_TRUTH_LOADED: SKU-level FBO/FBS totals + supply forecast")
