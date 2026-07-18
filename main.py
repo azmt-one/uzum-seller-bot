@@ -18125,8 +18125,10 @@ def build_fbo_acceptance_notification(summary: dict[str, Any], *, lang: str = "r
 
 def _fbo_pdf_font_paths() -> tuple[Path, Path]:
     configured = str(os.getenv("PDF_FONT_PATH", "") or "").strip()
+    app_dir = Path(__file__).resolve().parent
     regular_candidates = [
         Path(configured) if configured else None,
+        app_dir / "DejaVuSans.ttf",
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
         Path("/usr/share/fonts/dejavu/DejaVuSans.ttf"),
         Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
@@ -18136,6 +18138,7 @@ def _fbo_pdf_font_paths() -> tuple[Path, Path]:
         raise RuntimeError("Не найден Unicode-шрифт для PDF. Укажите PDF_FONT_PATH.")
     bold_candidates = [
         regular.with_name(regular.name.replace(".ttf", "-Bold.ttf")),
+        app_dir / "DejaVuSans-Bold.ttf",
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
         Path("/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"),
         Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"),
@@ -20642,7 +20645,7 @@ _cleanup_release_state()
 # Preserves per-user instant/hourly modes while using the durable outbox and
 # adaptive Finance pagination from RELEASE_HARDENING.
 # =============================================================================
-PREMIUM_RELEASE_VERSION = "2026.07.18-premium-r7-pagination-fix"
+PREMIUM_RELEASE_VERSION = "2026.07.18-premium-r8-bundled-pdf-font"
 
 
 async def check_new_sales_once() -> None:
@@ -20867,6 +20870,15 @@ async def main() -> None:
     logging.info("PREMIUM_UI_LOADED: compact main menu + guided sections + honest financial wording")
     logging.info("TRIAL_FEATURE_GATING_LOADED: sales today + sale alerts + morning report")
     logging.info("MANAGEMENT_PDF_LOADED: sales + profit + stock + cancellations + returns + defects")
+    try:
+        pdf_regular_font, pdf_bold_font = _fbo_pdf_font_paths()
+        logging.info(
+            "PDF_FONT_READY: regular=%s bold=%s",
+            pdf_regular_font,
+            pdf_bold_font,
+        )
+    except RuntimeError as error:
+        logging.warning("PDF_FONT_MISSING: %s", error)
     logging.info("LEGACY_CANCEL_STATUS_FILTER_SCAN_DISABLED: finance orders are scanned without unsupported status parameters")
     logging.info("SKU_LABELS_INTERFACE_LOADED: official barcode types + PDF SKU labels")
     logging.info("STOCK_TRUTH_LOADED: SKU-level FBO/FBS totals + supply forecast")
