@@ -8,10 +8,12 @@ import json
 import logging
 import math
 import os
+import sqlite3
 import tempfile
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from datetime import date, datetime, timedelta, timezone
 from html import escape
 from urllib.parse import urlencode
@@ -922,6 +924,40 @@ BARCODE_MAX_SKUS = min(100, max(1, int(os.getenv("BARCODE_MAX_SKUS", "100") or "
 BARCODE_MAX_AMOUNT_PER_SKU = 100
 # Дополнительный безопасный лимит, чтобы PDF не получился слишком большим для Telegram.
 BARCODE_MAX_TOTAL_LABELS = min(5000, max(1, int(os.getenv("BARCODE_MAX_TOTAL_LABELS", "1000") or "1000")))
+COST_IMPORT_MAX_FILE_BYTES = max(
+    1_048_576,
+    min(
+        20 * 1_048_576,
+        int(
+            os.getenv("COST_IMPORT_MAX_FILE_BYTES", str(5 * 1_048_576))
+            or str(5 * 1_048_576)
+        ),
+    ),
+)
+COST_IMPORT_MAX_UNCOMPRESSED_BYTES = max(
+    COST_IMPORT_MAX_FILE_BYTES,
+    min(
+        100 * 1_048_576,
+        int(
+            os.getenv(
+                "COST_IMPORT_MAX_UNCOMPRESSED_BYTES",
+                str(50 * 1_048_576),
+            )
+            or str(50 * 1_048_576)
+        ),
+    ),
+)
+COST_IMPORT_MAX_ROWS = max(
+    100,
+    min(50_000, int(os.getenv("COST_IMPORT_MAX_ROWS", "10000") or "10000")),
+)
+MAX_CONCURRENT_USER_HANDLERS = max(
+    5,
+    min(
+        500,
+        int(os.getenv("MAX_CONCURRENT_USER_HANDLERS", "40") or "40"),
+    ),
+)
 
 def _parse_admin_ids() -> set[int]:
     values: list[str] = []
@@ -1283,8 +1319,11 @@ def extend_subscription_days(telegram_id: int, days: int) -> datetime:
 
 def set_trial_days(telegram_id: int, days: int) -> datetime:
     ensure_subscription(telegram_id)
+    row = get_subscription_row(telegram_id) or {}
     now = _utc_now()
-    new_until = now + timedelta(days=max(1, int(days)))
+    current_until = _dt_from_db(row.get("trial_until"))
+    base = max(now, current_until) if current_until is not None else now
+    new_until = base + timedelta(days=max(1, int(days)))
     with db.connect() as conn:
         conn.execute(
             "UPDATE subscriptions SET trial_until = ?, blocked = 0, updated_at = ? WHERE telegram_id = ?",
@@ -4683,6 +4722,8 @@ TRIAL_ALLOWED_BUTTONS = frozenset(
         "🏪 Do‘konlar",
         "🔐 Подключение Uzum",
         "🔐 Uzum ulanishi",
+        "🔐 API и подключение",
+        "🔐 API va ulanish",
         "🔌 Подключить",
         "🔌 Подключить магазин",
         "🔌 Ulash",
@@ -4797,6 +4838,41 @@ class TrialFeatureMiddleware(BaseMiddleware):
         return None
 
 
+_ACTIVE_USER_HANDLERS: set[int] = set()
+
+
+class UserConcurrencyMiddleware(BaseMiddleware):
+    """Drop duplicate in-flight work and cap global user-handler concurrency."""
+
+    async def __call__(self, handler: Any, event: Any, data: dict[str, Any]) -> Any:
+        user = getattr(event, "from_user", None)
+        if user is None:
+            return await handler(event, data)
+        telegram_id = int(user.id)
+        overloaded = (
+            telegram_id in _ACTIVE_USER_HANDLERS
+            or len(_ACTIVE_USER_HANDLERS) >= MAX_CONCURRENT_USER_HANDLERS
+        )
+        if overloaded:
+            if isinstance(event, CallbackQuery):
+                try:
+                    await event.answer(
+                        "⏳ Дождитесь завершения предыдущего запроса",
+                        show_alert=False,
+                    )
+                except Exception:
+                    pass
+            return None
+
+        _ACTIVE_USER_HANDLERS.add(telegram_id)
+        try:
+            return await handler(event, data)
+        finally:
+            _ACTIVE_USER_HANDLERS.discard(telegram_id)
+
+
+dp.message.outer_middleware(UserConcurrencyMiddleware())
+dp.callback_query.outer_middleware(UserConcurrencyMiddleware())
 dp.message.outer_middleware(TrialFeatureMiddleware())
 dp.callback_query.outer_middleware(TrialFeatureMiddleware())
 
@@ -6137,6 +6213,76 @@ async def setshop(message: Message) -> None:
     await message.answer(f"✅ Основной магазин выбран: <code>{shop_id}</code>", reply_markup=menu_for_message(message))
 
 
+async def send_stock_list(message: Message, *, mode: str = "all") -> None:
+    """Load and display SKU-level stock for all, FBO or FBS inventory."""
+    req = await require_connection(message)
+    if req is None:
+        return
+    telegram_id, client, shop_id = req
+    lang = get_user_language(telegram_id)
+    safe_mode = mode if mode in {"all", "fbo", "fbs"} else "all"
+
+    try:
+        rows = await load_sku_rows(client, shop_id, max_pages=50)
+        if safe_mode == "fbo":
+            visible_rows = [row for row in rows if float(row.get("fbo") or 0) > 0]
+        elif safe_mode == "fbs":
+            visible_rows = [row for row in rows if float(row.get("fbs") or 0) > 0]
+        else:
+            visible_rows = rows
+
+        title_by_mode = {
+            "all": ("📦 <b>Остатки по SKU</b>", "📦 <b>SKU qoldiqlari</b>"),
+            "fbo": ("🏭 <b>Остатки FBO</b>", "🏭 <b>FBO qoldiqlari</b>"),
+            "fbs": ("🏠 <b>Остатки FBS/DBS</b>", "🏠 <b>FBS/DBS qoldiqlari</b>"),
+        }
+        ru_title, uz_title = title_by_mode[safe_mode]
+        total_fbo = sum(max(0.0, float(row.get("fbo") or 0)) for row in visible_rows)
+        total_fbs = sum(max(0.0, float(row.get("fbs") or 0)) for row in visible_rows)
+        total_units = sum(max(0.0, float(row.get("total") or 0)) for row in visible_rows)
+        if lang == "uz":
+            summary = [
+                f"🏪 Do‘kon: <code>{shop_id}</code>",
+                f"🔖 SKU: <b>{len(visible_rows)}</b>",
+                f"📦 FBO: <b>{clean_num(total_fbo)}</b> · FBS/DBS: <b>{clean_num(total_fbs)}</b> · Jami: <b>{clean_num(total_units)}</b>",
+            ]
+            empty_text = (
+                "FBO omborida musbat qoldiqli SKU topilmadi."
+                if safe_mode == "fbo"
+                else "FBS/DBS omborida musbat qoldiqli SKU topilmadi."
+                if safe_mode == "fbs"
+                else "SKU qoldiqlari topilmadi."
+            )
+        else:
+            summary = [
+                f"🏪 Магазин: <code>{shop_id}</code>",
+                f"🔖 SKU: <b>{len(visible_rows)}</b>",
+                f"📦 FBO: <b>{clean_num(total_fbo)}</b> · FBS/DBS: <b>{clean_num(total_fbs)}</b> · Всего: <b>{clean_num(total_units)}</b>",
+            ]
+            empty_text = (
+                "Не найдено SKU с положительным остатком FBO."
+                if safe_mode == "fbo"
+                else "Не найдено SKU с положительным остатком FBS/DBS."
+                if safe_mode == "fbs"
+                else "SKU-остатки не найдены."
+            )
+
+        items = [format_sku_stock_line(row, mode=safe_mode) for row in visible_rows]
+        await send_paginated_list(
+            message,
+            kind=f"stock_{safe_mode}",
+            title=uz_title if lang == "uz" else ru_title,
+            items=items,
+            summary=summary,
+            empty_text=empty_text,
+            section="stock",
+            page_size=5,
+            reply_markup=stock_menu_for_message(message),
+        )
+    except Exception as error:
+        await send_api_error(message, error)
+
+
 @dp.message(Command("products"))
 async def products(message: Message) -> None:
     """Показывает варианты SKU с корректным разделением FBO и FBS/DBS."""
@@ -6167,7 +6313,12 @@ async def lowstock(message: Message) -> None:
     telegram_id = message.from_user.id if message.from_user else 0
     lang = get_user_language(telegram_id)
     arg = parse_args(message.text or "")
-    threshold = int(arg) if arg.isdigit() else LOW_STOCK_THRESHOLD
+    settings = ensure_product_settings(telegram_id)
+    threshold = (
+        min(100_000, int(arg))
+        if arg.isdigit()
+        else max(0, int(settings.get("low_stock_threshold") or LOW_STOCK_THRESHOLD))
+    )
 
     try:
         rows = await load_sku_rows(client, shop_id, max_pages=50)
@@ -6182,7 +6333,7 @@ async def lowstock(message: Message) -> None:
             return
 
         items = [format_sku_stock_line(row, mode="all") for row in low]
-        title = f"⚠️ <b>Kam qoldiqdagi tovarlar</b>" if lang == "uz" else f"⚠️ <b>Низкие остатки</b>"
+        title = "⚠️ <b>Kam qoldiqdagi tovarlar</b>" if lang == "uz" else "⚠️ <b>Низкие остатки</b>"
         summary = [
             f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
             f"📉 Chegara: ≤ <b>{threshold}</b> dona" if lang == "uz" else f"📉 Порог: ≤ <b>{threshold}</b> шт.",
@@ -9749,6 +9900,46 @@ async def admin_payments(message: Message) -> None:
         await message.answer("💳 Чеков на проверке и подтверждённых оплат пока нет.", reply_markup=menu_for_message(message))
 
 
+def create_sqlite_backup(source_path: str | Path, destination_path: str | Path) -> Path:
+    """Create a transactionally consistent SQLite snapshot, including WAL data."""
+    source = Path(source_path)
+    destination = Path(destination_path)
+    if not source.is_file():
+        raise FileNotFoundError(str(source))
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.unlink(missing_ok=True)
+
+    source_conn: sqlite3.Connection | None = None
+    destination_conn: sqlite3.Connection | None = None
+    try:
+        source_conn = sqlite3.connect(
+            str(source),
+            timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+        )
+        destination_conn = sqlite3.connect(
+            str(destination),
+            timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+        )
+        source_conn.backup(destination_conn, pages=1000, sleep=0.05)
+        destination_conn.commit()
+        integrity = destination_conn.execute("PRAGMA integrity_check").fetchone()
+        if not integrity or str(integrity[0]).lower() != "ok":
+            raise RuntimeError(f"SQLite backup integrity check failed: {integrity!r}")
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+    finally:
+        if destination_conn is not None:
+            destination_conn.close()
+        if source_conn is not None:
+            source_conn.close()
+    try:
+        destination.chmod(0o600)
+    except OSError:
+        pass
+    return destination
+
+
 @dp.message(Command("backup_db"))
 async def admin_backup_db(message: Message) -> None:
     admin_id = upsert_from_message(message)
@@ -9758,11 +9949,20 @@ async def admin_backup_db(message: Message) -> None:
     if not path.exists():
         await message.answer(f"❌ База не найдена: <code>{escape(str(path))}</code>", reply_markup=menu_for_message(message))
         return
-    await message.answer("📦 Отправляю резервную копию базы. Храните файл аккуратно — там данные пользователей.", reply_markup=menu_for_message(message))
+    await message.answer("📦 Создаю целостную резервную копию базы. Храните файл аккуратно — там данные пользователей.", reply_markup=menu_for_message(message))
+    backup_path = Path(tempfile.gettempdir()) / f"bot_backup_{admin_id}_{time.time_ns()}.db"
     try:
-        await message.answer_document(FSInputFile(str(path), filename=f"bot_backup_{datetime.now(UZT).strftime('%Y%m%d_%H%M')}.db"))
+        await asyncio.to_thread(create_sqlite_backup, path, backup_path)
+        await message.answer_document(
+            FSInputFile(
+                str(backup_path),
+                filename=f"bot_backup_{datetime.now(UZT).strftime('%Y%m%d_%H%M')}.db",
+            )
+        )
     except Exception as e:
         await send_api_error(message, e)
+    finally:
+        backup_path.unlink(missing_ok=True)
 
 @dp.message(Command("trial"))
 async def admin_trial(message: Message) -> None:
@@ -9776,7 +9976,11 @@ async def admin_trial(message: Message) -> None:
     target = int(parts[0])
     days = int(parts[1])
     new_until = set_trial_days(target, days)
-    await message.answer(f"🎁 Trial для <code>{target}</code> до <b>{_fmt_dt(new_until)}</b>", reply_markup=menu_for_message(message))
+    await message.answer(
+        f"🎁 Пользователю <code>{target}</code> добавлено <b>{max(1, days)}</b> дн. trial. "
+        f"Новый срок: <b>{_fmt_dt(new_until)}</b>",
+        reply_markup=menu_for_message(message),
+    )
 
 
 @dp.message(Command("block"))
@@ -11977,7 +12181,7 @@ async def button_important_now(message: Message) -> None:
     await business_control_center(message)
 
 
-@dp.message(F.text.in_({"🧮 Финансы", "🧮 Moliya"}))
+@dp.message(F.text.in_({"🧮 Финансы", "🧮 Moliya", "💰 Себестоимость и расходы", "💰 Tannarx va xarajat"}))
 async def button_finance_section(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     text = (
@@ -11988,7 +12192,7 @@ async def button_finance_section(message: Message) -> None:
     await message.answer(text, reply_markup=finance_menu_for_message(message))
 
 
-@dp.message(F.text.in_({"🔐 Подключение Uzum", "🔐 Uzum ulanishi"}))
+@dp.message(F.text.in_({"🔐 Подключение Uzum", "🔐 Uzum ulanishi", "🔐 API и подключение", "🔐 API va ulanish"}))
 async def button_connection_section(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     connected = db.has_uzum_connection(telegram_id)
@@ -13990,33 +14194,104 @@ def _detect_cost_columns(ws) -> tuple[int, int, int | None, int]:
     return 1, 2, 3, 1
 
 
+def _validate_cost_workbook_file(path: str | Path) -> None:
+    workbook_path = Path(path)
+    if workbook_path.stat().st_size > COST_IMPORT_MAX_FILE_BYTES:
+        raise ValueError(
+            f"Файл слишком большой. Максимум: {COST_IMPORT_MAX_FILE_BYTES // 1_048_576} МБ."
+        )
+    try:
+        with zipfile.ZipFile(workbook_path) as archive:
+            members = archive.infolist()
+            if any(member.flag_bits & 0x1 for member in members):
+                raise ValueError("Защищённые паролем Excel-файлы не поддерживаются.")
+            unpacked_size = sum(max(0, int(member.file_size)) for member in members)
+            if unpacked_size > COST_IMPORT_MAX_UNCOMPRESSED_BYTES:
+                raise ValueError("Excel-файл содержит слишком большой объём распакованных данных.")
+    except zipfile.BadZipFile as error:
+        raise ValueError("Файл повреждён или не является корректным .xlsx.") from error
+
+
 def _parse_costs_workbook(path: str) -> tuple[list[dict[str, Any]], list[str]]:
+    _validate_cost_workbook_file(path)
     wb = load_workbook(path, data_only=True, read_only=True)
-    ws = wb.active
-    sku_col, cost_col, title_col, start_row = _detect_cost_columns(ws)
-    imported: list[dict[str, Any]] = []
-    errors: list[str] = []
-    seen: set[str] = set()
-    for row_idx, row in enumerate(ws.iter_rows(min_row=start_row, values_only=True), start=start_row):
-        sku_val = row[sku_col - 1] if len(row) >= sku_col else None
-        cost_val = row[cost_col - 1] if len(row) >= cost_col else None
-        title_val = row[title_col - 1] if title_col and len(row) >= title_col else ""
-        sku = str(sku_val or "").strip()
-        if not sku:
-            continue
-        cost = _parse_excel_cost_value(cost_val)
-        if cost is None:
-            errors.append(f"Строка {row_idx}: неверная себестоимость для {sku}")
-            continue
-        key = _unit_sku_key(sku)
-        if not key:
-            errors.append(f"Строка {row_idx}: неверный SKU")
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        imported.append({"sku": sku, "cost": float(cost), "title": str(title_val or "").strip()})
-    return imported, errors
+    try:
+        ws = wb.active
+        sku_col, cost_col, title_col, start_row = _detect_cost_columns(ws)
+        imported: list[dict[str, Any]] = []
+        errors: list[str] = []
+        seen: set[str] = set()
+        for row_idx, row in enumerate(
+            ws.iter_rows(min_row=start_row, values_only=True),
+            start=start_row,
+        ):
+            if row_idx - start_row >= COST_IMPORT_MAX_ROWS:
+                errors.append(
+                    f"Достигнут лимит импорта: {COST_IMPORT_MAX_ROWS} строк. Остальные строки пропущены."
+                )
+                break
+            sku_val = row[sku_col - 1] if len(row) >= sku_col else None
+            cost_val = row[cost_col - 1] if len(row) >= cost_col else None
+            title_val = row[title_col - 1] if title_col and len(row) >= title_col else ""
+            sku = str(sku_val or "").strip()
+            if not sku:
+                continue
+            cost = _parse_excel_cost_value(cost_val)
+            if cost is None:
+                errors.append(f"Строка {row_idx}: неверная себестоимость для {sku}")
+                continue
+            key = _unit_sku_key(sku)
+            if not key:
+                errors.append(f"Строка {row_idx}: неверный SKU")
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            imported.append(
+                {
+                    "sku": sku,
+                    "cost": float(cost),
+                    "title": str(title_val or "").strip(),
+                }
+            )
+        return imported, errors
+    finally:
+        wb.close()
+
+
+def _save_unit_costs_bulk(
+    telegram_id: int,
+    shop_id: int,
+    items: list[dict[str, Any]],
+) -> int:
+    init_unit_economy_tables()
+    now_text = _dt_to_db(_utc_now()) or ""
+    values = [
+        (
+            int(telegram_id),
+            int(shop_id),
+            _unit_sku_key(item.get("sku")),
+            str(item.get("title") or item.get("sku") or "").strip(),
+            float(item.get("cost") or 0),
+            now_text,
+        )
+        for item in items
+        if _unit_sku_key(item.get("sku"))
+    ]
+    with db.connect() as conn:
+        conn.executemany(
+            """
+            INSERT INTO unit_costs (telegram_id, shop_id, sku_key, title, cost, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(telegram_id, shop_id, sku_key) DO UPDATE SET
+                title = excluded.title,
+                cost = excluded.cost,
+                updated_at = excluded.updated_at
+            """,
+            values,
+        )
+        conn.commit()
+    return len(values)
 
 
 @dp.message(Command("cost_template", "costs_template", "template_costs"))
@@ -14081,30 +14356,46 @@ async def receive_costs_excel(message: Message, state: FSMContext) -> None:
             reply_markup=menu_for_message(message),
         )
         return
-    tmp_path = str(Path(tempfile.gettempdir()) / f"costs_{telegram_id}_{int(datetime.now().timestamp())}.xlsx")
+    if document.file_size and int(document.file_size) > COST_IMPORT_MAX_FILE_BYTES:
+        await message.answer(
+            (
+                f"Excel fayl juda katta. Maksimum: {COST_IMPORT_MAX_FILE_BYTES // 1_048_576} MB."
+                if lang == "uz"
+                else f"Excel-файл слишком большой. Максимум: {COST_IMPORT_MAX_FILE_BYTES // 1_048_576} МБ."
+            ),
+            reply_markup=menu_for_message(message),
+        )
+        return
+    tmp_path = str(
+        Path(tempfile.gettempdir()) / f"costs_{telegram_id}_{time.time_ns()}.xlsx"
+    )
     try:
         await bot.download(document, destination=tmp_path)
-        items, errors = _parse_costs_workbook(tmp_path)
+        items, errors = await asyncio.to_thread(_parse_costs_workbook, tmp_path)
         if not items:
             await message.answer(
                 "Faylda saqlash uchun SKU va tannarx topilmadi." if lang == "uz" else "В файле не нашёл SKU и себестоимость для сохранения.",
                 reply_markup=menu_for_message(message),
             )
             return
-        for item in items:
-            save_unit_cost(telegram_id, int(shop_id), item["sku"], float(item["cost"]), title=item.get("title") or item["sku"])
+        saved_count = await asyncio.to_thread(
+            _save_unit_costs_bulk,
+            telegram_id,
+            int(shop_id),
+            items,
+        )
         await state.clear()
         preview = "\n".join([f"• <code>{escape(i['sku'])}</code> — <b>{_format_money(float(i['cost']))}</b>" for i in items[:10]])
         more = max(0, len(items) - 10)
         if lang == "uz":
-            text = f"✅ <b>Tannarxlar saqlandi</b>\n\n🏪 Do‘kon: <code>{shop_id}</code>\n📦 Saqlandi: <b>{len(items)}</b> SKU"
+            text = f"✅ <b>Tannarxlar saqlandi</b>\n\n🏪 Do‘kon: <code>{shop_id}</code>\n📦 Saqlandi: <b>{saved_count}</b> SKU"
             if preview:
                 text += "\n\n" + preview
             if more:
                 text += f"\n...yana {more} ta"
             text += "\n\nEndi <b>🧾 Unit iqtisodiyot</b> yoki <b>💰 Foyda</b> bo‘limini tekshiring."
         else:
-            text = f"✅ <b>Себестоимость сохранена</b>\n\n🏪 Магазин: <code>{shop_id}</code>\n📦 Сохранено: <b>{len(items)}</b> SKU"
+            text = f"✅ <b>Себестоимость сохранена</b>\n\n🏪 Магазин: <code>{shop_id}</code>\n📦 Сохранено: <b>{saved_count}</b> SKU"
             if preview:
                 text += "\n\n" + preview
             if more:
@@ -14114,6 +14405,15 @@ async def receive_costs_excel(message: Message, state: FSMContext) -> None:
             text += ("\n\n⚠️ Ошибки: " if lang != "uz" else "\n\n⚠️ Xatolar: ") + str(len(errors))
             text += "\n" + "\n".join(escape(e) for e in errors[:5])
         await message.answer(text, reply_markup=sales_menu_for_message(message))
+    except ValueError as error:
+        await message.answer(
+            (
+                f"❌ Excel faylni yuklab bo‘lmadi: {escape(str(error))}"
+                if lang == "uz"
+                else f"❌ Не удалось импортировать Excel: {escape(str(error))}"
+            ),
+            reply_markup=menu_for_message(message),
+        )
     except Exception as e:
         await send_api_error(message, e)
     finally:
@@ -15810,7 +16110,7 @@ async def sales_mode_callback(callback: CallbackQuery) -> None:
 
 
 @dp.message(Command("loss_defect_notify_status", "warehouse_loss_notifications"))
-@dp.message(F.text.in_({"🧭 Потери и брак", "🧭 Yo‘qotish va yaroqsiz"}))
+@dp.message(F.text == "🧭 Yo‘qotish va yaroqsiz")
 async def loss_defect_notification_status(message: Message) -> None:
     req = await require_connection(message)
     if req is None:
@@ -15875,6 +16175,8 @@ async def fbo_acceptance_notification_status(message: Message) -> None:
 
 @dp.message(Command("supply_settings", "replenishment_settings"))
 @dp.message(F.text.in_({
+    "⚙️ Срок поставки",
+    "⚙️ Yetkazish muddati",
     "⚙️ Параметры поставки",
     "⚙️ Yetkazish sozlamasi",
     "🚚 Настройки поставки",
@@ -16393,7 +16695,12 @@ async def business_action_callback(callback: CallbackQuery) -> None:
         logging.exception("Business action callback failed user=%s shop=%s", telegram_id, shop_id)
 
 
-@dp.message(F.text.in_({"🚚 План поставки", "🚚 Yetkazib berish rejasi"}))
+@dp.message(F.text.in_({
+    "🚚 Что заказать",
+    "🚚 Nima buyurtma qilish",
+    "🚚 План поставки",
+    "🚚 Yetkazib berish rejasi",
+}))
 async def supply_plan_button(message: Message) -> None:
     await smart_lowstock(message)
 
@@ -18765,7 +19072,7 @@ SALE_DIGEST_THRESHOLD = max(
     0, min(1000, int(os.getenv("SALE_DIGEST_THRESHOLD", "25") or "25"))
 )
 NOTIFICATION_MAX_ATTEMPTS = max(
-    0, min(1000, int(os.getenv("NOTIFICATION_MAX_ATTEMPTS", "0") or "0"))
+    0, min(1000, int(os.getenv("NOTIFICATION_MAX_ATTEMPTS", "10") or "10"))
 )
 WATCH_STATE_RETENTION_DAYS = max(
     7, min(365, int(os.getenv("WATCH_STATE_RETENTION_DAYS", "45") or "45"))
@@ -20309,8 +20616,7 @@ async def _stock_rows_for_watch(
 
 
 async def check_low_stock_once() -> None:
-    threshold = max(0, LOW_STOCK_THRESHOLD)
-    for group in connected_watch_groups():
+    for group in connected_watch_groups("notify_low_stock"):
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(value) for value in group["telegram_ids"]]
@@ -20323,6 +20629,11 @@ async def check_low_stock_once() -> None:
         current = _minimal_stock_snapshot(rows)
         rows_by_key = {stock_row_key(row): row for row in rows}
         for telegram_id in telegram_ids:
+            settings = ensure_product_settings(telegram_id)
+            threshold = max(
+                0,
+                int(settings.get("low_stock_threshold") or LOW_STOCK_THRESHOLD),
+            )
             previous = _load_stock_watch_snapshot(telegram_id, shop_id, "low")
             if previous is None:
                 _save_stock_watch_snapshot(telegram_id, shop_id, "low", current)
@@ -20377,7 +20688,7 @@ async def check_low_stock_once() -> None:
 
 
 async def check_out_of_stock_once() -> None:
-    for group in connected_watch_groups():
+    for group in connected_watch_groups("notify_out_of_stock"):
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(value) for value in group["telegram_ids"]]
@@ -20441,7 +20752,7 @@ async def check_out_of_stock_once() -> None:
 
 
 async def check_stock_change_once() -> None:
-    for group in connected_watch_groups():
+    for group in connected_watch_groups("notify_stock_change"):
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(value) for value in group["telegram_ids"]]
@@ -20701,7 +21012,7 @@ _cleanup_release_state()
 # Preserves per-user instant/hourly modes while using the durable outbox and
 # adaptive Finance pagination from RELEASE_HARDENING.
 # =============================================================================
-PREMIUM_RELEASE_VERSION = "2026.07.19-premium-r9-loss-report-fix"
+PREMIUM_RELEASE_VERSION = "2026.07.19-premium-r11-stability-security"
 
 
 async def check_new_sales_once() -> None:
@@ -20926,6 +21237,7 @@ async def main() -> None:
     logging.info("PREMIUM_UI_LOADED: compact main menu + guided sections + honest financial wording")
     logging.info("TRIAL_FEATURE_GATING_LOADED: sales today + sale alerts + morning report")
     logging.info("MANAGEMENT_PDF_LOADED: sales + profit + stock + cancellations + returns + defects")
+    logging.info("STABILITY_SECURITY_LOADED: stock routes + watcher settings + safe backup + bounded Excel import")
     try:
         pdf_regular_font, pdf_bold_font = _fbo_pdf_font_paths()
         logging.info(
