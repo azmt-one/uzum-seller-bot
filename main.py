@@ -34,6 +34,7 @@ from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from db import Database, TokenCipher
+from seller_pdf_report import build_seller_pdf_report
 from subscription_automation import (
     build_reminder_draft,
     parse_reminder_days,
@@ -2495,6 +2496,33 @@ def init_product_value_tables() -> None:
         )
         conn.execute(
             """
+            CREATE TABLE IF NOT EXISTS loss_defect_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id INTEGER NOT NULL,
+                shop_id INTEGER NOT NULL,
+                event_key TEXT NOT NULL,
+                sku_key TEXT NOT NULL,
+                product_title TEXT,
+                sku_id TEXT,
+                barcode TEXT,
+                missing_delta INTEGER NOT NULL DEFAULT 0,
+                defected_delta INTEGER NOT NULL DEFAULT 0,
+                missing_qty INTEGER NOT NULL DEFAULT 0,
+                defected_qty INTEGER NOT NULL DEFAULT 0,
+                estimated_value REAL NOT NULL DEFAULT 0,
+                detected_at TEXT NOT NULL,
+                UNIQUE (telegram_id, shop_id, event_key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_loss_defect_events_period
+            ON loss_defect_events (telegram_id, shop_id, detected_at)
+            """
+        )
+        conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS fbo_acceptance_watch (
                 telegram_id INTEGER NOT NULL,
                 shop_id INTEGER NOT NULL,
@@ -2972,6 +3000,85 @@ def save_product_loss_snapshot(
                 ),
             )
         conn.commit()
+
+
+def record_loss_defect_events(
+    telegram_id: int,
+    shop_id: int,
+    changes: list[dict[str, Any]],
+) -> None:
+    """Persist watcher deltas so period PDF reports can show new defects/losses."""
+    if not changes:
+        return
+    init_product_value_tables()
+    detected_at = _dt_to_db(_utc_now()) or ""
+    with db.connect() as conn:
+        for item in changes:
+            sku_key = str(item.get("sku_key") or "unknown")
+            event_source = "|".join(
+                (
+                    sku_key,
+                    str(max(0, int(item.get("missing_qty") or 0))),
+                    str(max(0, int(item.get("defected_qty") or 0))),
+                )
+            )
+            event_key = hashlib.sha256(event_source.encode("utf-8")).hexdigest()
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO loss_defect_events (
+                    telegram_id, shop_id, event_key, sku_key, product_title,
+                    sku_id, barcode, missing_delta, defected_delta,
+                    missing_qty, defected_qty, estimated_value, detected_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    int(telegram_id),
+                    int(shop_id),
+                    event_key,
+                    sku_key,
+                    str(item.get("product_title") or ""),
+                    str(item.get("sku_id") or ""),
+                    str(item.get("barcode") or ""),
+                    max(0, int(item.get("missing_delta") or 0)),
+                    max(0, int(item.get("defected_delta") or 0)),
+                    max(0, int(item.get("missing_qty") or 0)),
+                    max(0, int(item.get("defected_qty") or 0)),
+                    max(0.0, float(item.get("estimated_value") or 0)),
+                    detected_at,
+                ),
+            )
+        conn.commit()
+
+
+def list_loss_defect_events(
+    telegram_id: int,
+    shop_id: int,
+    date_from_ms: int,
+    date_to_ms: int,
+) -> list[dict[str, Any]]:
+    """Return recorded deltas detected inside the selected Uzbekistan period."""
+    init_product_value_tables()
+    date_from = datetime.fromtimestamp(date_from_ms / 1000, timezone.utc)
+    date_to = datetime.fromtimestamp(date_to_ms / 1000, timezone.utc)
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT product_title, sku_id, barcode, missing_delta,
+                   defected_delta, missing_qty, defected_qty,
+                   estimated_value, detected_at
+            FROM loss_defect_events
+            WHERE telegram_id = ? AND shop_id = ?
+              AND detected_at >= ? AND detected_at <= ?
+            ORDER BY detected_at DESC, id DESC
+            """,
+            (
+                int(telegram_id),
+                int(shop_id),
+                _dt_to_db(date_from) or "",
+                _dt_to_db(date_to) or "",
+            ),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def get_fbo_acceptance_watch_state(
@@ -3790,7 +3897,7 @@ NOTIFY_MENU_UZ = ReplyKeyboardMarkup(
 
 REPORT_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Excel-отчёт")],
+        [KeyboardButton(text="📄 PDF-отчёт"), KeyboardButton(text="📊 Excel-отчёт")],
         [KeyboardButton(text="🌙 Краткий отчёт"), KeyboardButton(text="💰 Прибыль")],
         [KeyboardButton(text="📈 Эффект рекомендаций"), KeyboardButton(text="📅 Автоотчёты")],
         [KeyboardButton(text="🏠 Главное")],
@@ -3801,7 +3908,7 @@ REPORT_MENU_RU = ReplyKeyboardMarkup(
 
 REPORT_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Excel hisobot")],
+        [KeyboardButton(text="📄 PDF hisobot"), KeyboardButton(text="📊 Excel hisobot")],
         [KeyboardButton(text="🌙 Qisqa hisobot"), KeyboardButton(text="💰 Foyda")],
         [KeyboardButton(text="📈 Tavsiyalar ta’siri"), KeyboardButton(text="📅 Avtohisobotlar")],
         [KeyboardButton(text="🏠 Asosiy")],
@@ -4085,6 +4192,317 @@ def admin_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
     except Exception:
         telegram_id = None
     return admin_menu_for_user(telegram_id)
+
+
+# --- Универсальная постраничность для длинных списков ---
+LIST_PAGE_SIZE = max(
+    5,
+    min(20, int(os.getenv("LIST_PAGE_SIZE", "10") or "10")),
+)
+PAGED_LIST_TTL_SECONDS = max(
+    300,
+    int(os.getenv("PAGED_LIST_TTL_SECONDS", "1800") or "1800"),
+)
+PAGED_LIST_MAX_SESSIONS = max(
+    20,
+    int(os.getenv("PAGED_LIST_MAX_SESSIONS", "200") or "200"),
+)
+_paged_list_cache: dict[tuple[int, str], dict[str, Any]] = {}
+
+
+def _page_size_safe(value: Any = None) -> int:
+    try:
+        raw = int(value or LIST_PAGE_SIZE)
+    except (TypeError, ValueError):
+        raw = LIST_PAGE_SIZE
+    return max(5, min(20, raw))
+
+
+def _paged_kind_key(value: Any) -> str:
+    safe = "".join(
+        char
+        for char in str(value or "list").lower()
+        if char.isascii() and (char.isalnum() or char in {"_", "-"})
+    )
+    return safe[:24] or "list"
+
+
+def _prune_paged_list_cache() -> None:
+    now = time.monotonic()
+    stale = [
+        key
+        for key, session in _paged_list_cache.items()
+        if now - float(session.get("created_at") or 0) > PAGED_LIST_TTL_SECONDS
+    ]
+    for key in stale:
+        _paged_list_cache.pop(key, None)
+
+    overflow = len(_paged_list_cache) - PAGED_LIST_MAX_SESSIONS
+    if overflow <= 0:
+        return
+    oldest = sorted(
+        _paged_list_cache,
+        key=lambda key: float(_paged_list_cache[key].get("created_at") or 0),
+    )
+    for key in oldest[:overflow]:
+        _paged_list_cache.pop(key, None)
+
+
+def _section_text_and_markup(
+    section: str,
+    telegram_id: int,
+    lang: str,
+) -> tuple[str, ReplyKeyboardMarkup]:
+    if section == "sales":
+        text = (
+            "💰 <b>Savdo</b>\nKerakli davr yoki hisobotni tanlang 👇"
+            if lang == "uz"
+            else "💰 <b>Продажи</b>\nВыберите период или отчёт 👇"
+        )
+        return text, sales_menu_for_user(telegram_id)
+    if section == "stock":
+        text = (
+            "📦 <b>Ombor</b>\nQoldiq, prognoz yoki yo‘qotishlarni tanlang 👇"
+            if lang == "uz"
+            else "📦 <b>Склад</b>\nВыберите остатки, прогноз или потери 👇"
+        )
+        return text, stock_menu_for_user(telegram_id)
+    if section == "attention":
+        text = (
+            "🚨 <b>Hozir muhim</b>\nKerakli bo‘limni tanlang 👇"
+            if lang == "uz"
+            else "🚨 <b>Важно сейчас</b>\nВыберите нужный раздел 👇"
+        )
+        return text, attention_menu_for_user(telegram_id)
+    if section == "reports":
+        text = (
+            "📊 <b>Hisobotlar</b>\nPDF, Excel, foyda va tayyor hisobotlar 👇"
+            if lang == "uz"
+            else "📊 <b>Отчёты</b>\nPDF, Excel, прибыль и готовые отчёты 👇"
+        )
+        return text, report_menu_for_user(telegram_id)
+    text = "🏠 <b>Asosiy menyu</b>" if lang == "uz" else "🏠 <b>Главное меню</b>"
+    return text, main_menu_for_user(telegram_id)
+
+
+def _paged_markup(
+    kind: str,
+    page: int,
+    total_pages: int,
+    lang: str,
+    section: str = "main",
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = []
+    if total_pages > 1:
+        navigation: list[InlineKeyboardButton] = []
+        if page > 0:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="⬅️ Oldingi" if lang == "uz" else "⬅️ Назад",
+                    callback_data=f"pglist:{kind}:{page - 1}",
+                )
+            )
+        navigation.append(
+            InlineKeyboardButton(
+                text=f"{page + 1}/{total_pages}",
+                callback_data="pgnoop",
+            )
+        )
+        if page < total_pages - 1:
+            navigation.append(
+                InlineKeyboardButton(
+                    text="Keyingi ➡️" if lang == "uz" else "Далее ➡️",
+                    callback_data=f"pglist:{kind}:{page + 1}",
+                )
+            )
+        rows.append(navigation)
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="⬅️ Bo‘limga" if lang == "uz" else "⬅️ В раздел",
+                callback_data=f"pgsection:{section}",
+            ),
+            InlineKeyboardButton(
+                text="🏠 Menyu" if lang == "uz" else "🏠 Меню",
+                callback_data="pgmain",
+            ),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _paged_text(session: dict[str, Any], page: int) -> str:
+    items = [str(item) for item in (session.get("items") or [])]
+    page_size = _page_size_safe(session.get("page_size"))
+    total = len(items)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(int(page), total_pages - 1))
+    start_index = page * page_size
+    chunk = items[start_index:start_index + page_size]
+    start_number = start_index + 1 if total else 0
+    end_number = start_index + len(chunk)
+    lang = normalize_lang(session.get("lang"))
+    if lang == "uz":
+        meta = (
+            f"Ko‘rsatilmoqda: <b>{start_number}–{end_number}</b> / <b>{total}</b>\n"
+            f"Sahifa: <b>{page + 1}/{total_pages}</b>"
+        )
+    else:
+        meta = (
+            f"Показано: <b>{start_number}–{end_number}</b> из <b>{total}</b>\n"
+            f"Страница: <b>{page + 1}/{total_pages}</b>"
+        )
+    parts = [
+        str(session.get("title") or ""),
+        *[str(value) for value in (session.get("summary") or []) if value],
+        meta,
+    ]
+    if chunk:
+        parts.append("\n\n".join(chunk))
+    return "\n\n".join(part for part in parts if part)
+
+
+async def send_paginated_list(
+    message: Message,
+    *,
+    kind: str,
+    title: str,
+    items: list[str],
+    summary: list[str] | None = None,
+    empty_text: str | None = None,
+    section: str = "main",
+    page_size: int | None = None,
+    reply_markup: ReplyKeyboardMarkup | None = None,
+) -> None:
+    user_id = message.from_user.id if message.from_user else 0
+    lang = get_user_language(user_id)
+    if not items:
+        await message.answer(
+            empty_text
+            or ("Ma’lumot topilmadi." if lang == "uz" else "Данные не найдены."),
+            reply_markup=reply_markup or menu_for_message(message),
+        )
+        return
+
+    _prune_paged_list_cache()
+    safe_kind = _paged_kind_key(kind)
+    safe_section = section if section in {"sales", "stock", "attention", "reports"} else "main"
+    session = {
+        "title": title,
+        "summary": list(summary or []),
+        "items": list(items),
+        "lang": lang,
+        "section": safe_section,
+        "page_size": _page_size_safe(page_size),
+        "created_at": time.monotonic(),
+    }
+    _paged_list_cache[(int(user_id), safe_kind)] = session
+    total_pages = max(
+        1,
+        (len(items) + int(session["page_size"]) - 1) // int(session["page_size"]),
+    )
+    await message.answer(
+        _paged_text(session, 0),
+        reply_markup=_paged_markup(
+            safe_kind,
+            0,
+            total_pages,
+            lang,
+            safe_section,
+        ),
+    )
+
+
+@dp.callback_query(F.data == "pgnoop")
+async def paged_noop_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "pgmain")
+async def paged_main_callback(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id if callback.from_user else 0
+    lang = get_user_language(user_id)
+    text, markup = _section_text_and_markup("main", user_id, lang)
+    if callback.message:
+        await callback.message.answer(text, reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("pgsection:"))
+async def paged_section_callback(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id if callback.from_user else 0
+    lang = get_user_language(user_id)
+    section = str(callback.data or "").split(":", 1)[-1]
+    text, markup = _section_text_and_markup(section, user_id, lang)
+    if callback.message:
+        await callback.message.answer(text, reply_markup=markup)
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("pglist:"))
+async def paged_list_callback(callback: CallbackQuery) -> None:
+    user_id = callback.from_user.id if callback.from_user else 0
+    lang = get_user_language(user_id)
+    if not has_paid_subscription(user_id):
+        if subscription_access_level(user_id) == "trial":
+            await send_trial_premium_locked(callback, user_id)
+        else:
+            await callback.answer(
+                "Obuna tugagan" if lang == "uz" else "Подписка закончилась",
+                show_alert=True,
+            )
+        return
+    try:
+        _, raw_kind, raw_page = str(callback.data or "").split(":", 2)
+        kind = _paged_kind_key(raw_kind)
+        page = int(raw_page)
+    except (TypeError, ValueError):
+        await callback.answer()
+        return
+
+    _prune_paged_list_cache()
+    session = _paged_list_cache.get((int(user_id), kind))
+    if not session:
+        await callback.answer(
+            "Ro‘yxat eskirdi. Bo‘limni qayta oching."
+            if lang == "uz"
+            else "Список устарел. Откройте раздел заново.",
+            show_alert=True,
+        )
+        return
+
+    page_size = _page_size_safe(session.get("page_size"))
+    total_pages = max(
+        1,
+        (len(session.get("items") or []) + page_size - 1) // page_size,
+    )
+    page = max(0, min(page, total_pages - 1))
+    try:
+        if callback.message:
+            await callback.message.edit_text(
+                _paged_text(session, page),
+                reply_markup=_paged_markup(
+                    kind,
+                    page,
+                    total_pages,
+                    str(session.get("lang") or lang),
+                    str(session.get("section") or "main"),
+                ),
+            )
+        await callback.answer()
+    except Exception:
+        logging.exception(
+            "Paged list callback failed user=%s kind=%s page=%s",
+            user_id,
+            kind,
+            page,
+        )
+        await callback.answer(
+            "Sahifani ochib bo‘lmadi"
+            if lang == "uz"
+            else "Не получилось открыть страницу",
+            show_alert=True,
+        )
 
 
 # Переопределяем тексты подписки после инициализации языка, чтобы /my_subscription был на выбранном языке.
@@ -4680,7 +5098,18 @@ async def load_products(
         if not items:
             break
         all_products.extend(items)
-        if len(items) < page_size:
+        total_products: int | None = None
+        if isinstance(data, dict):
+            raw_total = data.get("totalProductsAmount")
+            try:
+                if raw_total is not None:
+                    total_products = max(0, int(raw_total))
+            except (TypeError, ValueError):
+                total_products = None
+        if total_products is not None and total_products > 0:
+            if len(all_products) >= total_products:
+                break
+        elif len(items) < page_size:
             break
     return all_products
 
@@ -6806,7 +7235,7 @@ def _loss_row_key(row: dict[str, Any]) -> str:
     )
 
 
-async def _load_all_time_loss_rows(
+async def _load_all_time_loss_rows_legacy(
     client: UzumClient,
     shop_id: int,
 ) -> tuple[list[dict[str, Any]], list[str]]:
@@ -6964,7 +7393,11 @@ async def lost_goods(message: Message) -> None:
         reply_markup=stock_menu_for_message(message),
     )
     try:
-        rows, unavailable_filters = await _load_all_time_loss_rows(client, shop_id)
+        rows, unavailable_filters = await _load_all_time_loss_rows(
+            client,
+            shop_id,
+            force_refresh=True,
+        )
 
         if not rows:
             text = (
@@ -6974,6 +7407,15 @@ async def lost_goods(message: Message) -> None:
                 else f"🧭 <b>Потерянные товары за весь период</b>\n🏪 Магазин: <code>{shop_id}</code>\n\n"
                 "Uzum API не вернул SKU с накопленной недостачей или браком."
             )
+            if unavailable_filters:
+                filters_text = ", ".join(unavailable_filters)
+                text += (
+                    f"\n\n⚠️ Ayrim filtrlar vaqtincha ishlamadi: <code>{escape(filters_text)}</code>. "
+                    "Natija to‘liq bo‘lmasligi mumkin."
+                    if lang == "uz"
+                    else f"\n\n⚠️ Часть фильтров временно недоступна: <code>{escape(filters_text)}</code>. "
+                    "Нельзя достоверно утверждать, что потерь нет."
+                )
             await message.answer(text, reply_markup=stock_menu_for_message(message))
             return
 
@@ -7386,6 +7828,43 @@ async def sales_30(message: Message) -> None:
     await _send_sales_details(message, 30)
 
 
+def _problem_finance_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return normalized cancellation/return pieces, including partial cases."""
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for item in rows:
+        reason: Any = _deep_pick_value(
+            item,
+            (
+                "cancelReason",
+                "cancellationReason",
+                "returnReason",
+                "reason",
+                "reasonText",
+            ),
+        )
+        if isinstance(reason, dict):
+            reason = pick(reason, "title", "name", "text", "value", "description")
+        for piece in _normalize_finance_rows([item]):
+            if piece.get("kind") not in {"cancel", "return"}:
+                continue
+            row = {**piece, "reason": str(reason or "")}
+            identity = "|".join(
+                (
+                    str(row.get("kind") or ""),
+                    str(row.get("order_id") or ""),
+                    str(row.get("sku") or ""),
+                    str(row.get("qty") or 0),
+                    str(row.get("status") or ""),
+                )
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            result.append(row)
+    return result
+
+
 @dp.message(Command("cancellations", "cancels", "returns"))
 async def cancellations_report(message: Message) -> None:
     req = await require_connection(message)
@@ -7402,14 +7881,10 @@ async def cancellations_report(message: Message) -> None:
     try:
         date_from, date_to = _days_range_ms(30)
         rows, _, _ = await _load_finance_range_flexible(client, shop_id, date_from, date_to)
-        problem_rows = [
-            item
-            for item in rows
-            if _is_cancelled_status(_finance_status(item)) or _is_returned_status(_finance_status(item))
-        ]
-        cancelled = sum(1 for item in problem_rows if _is_cancelled_status(_finance_status(item)))
-        returned = sum(1 for item in problem_rows if _is_returned_status(_finance_status(item)))
-        amount = sum(_finance_gross_revenue(item) for item in problem_rows)
+        problem_rows = _problem_finance_rows(rows)
+        cancelled = sum(1 for item in problem_rows if item.get("kind") == "cancel")
+        returned = sum(1 for item in problem_rows if item.get("kind") == "return")
+        amount = sum(float(item.get("revenue") or 0) for item in problem_rows)
         title = "🚫 <b>Bekor qilish va qaytarishlar — 30 kun</b>" if lang == "uz" else "🚫 <b>Отмены и возвраты — 30 дней</b>"
         summary = [
             f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
@@ -7418,17 +7893,18 @@ async def cancellations_report(message: Message) -> None:
         ]
         items: list[str] = []
         for index, item in enumerate(problem_rows, start=1):
-            status = _finance_status(item)
-            kind = "Qaytarish" if _is_returned_status(status) else "Bekor qilish"
+            status = str(item.get("status") or "-")
+            is_return = item.get("kind") == "return"
+            kind = "Qaytarish" if is_return else "Bekor qilish"
             if lang != "uz":
-                kind = "Возврат" if _is_returned_status(status) else "Отмена"
-            reason = _deep_pick_value(item, ("cancelReason", "cancellationReason", "returnReason", "reason"))
+                kind = "Возврат" if is_return else "Отмена"
+            reason = item.get("reason")
             reason_line = f"\n💬 Sabab: {escape(_short_text(str(reason), 100))}" if reason and lang == "uz" else f"\n💬 Причина: {escape(_short_text(str(reason), 100))}" if reason else ""
             items.append(
-                f"{index}. <b>{kind}</b> — {escape(_short_text(_finance_title(item), 70))}\n"
-                f"🔖 SKU: <code>{escape(_short_text(_finance_sku_key_for_stats(item), 55))}</code>\n"
-                f"🆔 <code>{escape(_finance_order_key_for_stats(item))}</code> | "
-                f"{_format_money(_finance_gross_revenue(item))}\n"
+                f"{index}. <b>{kind}</b> — {escape(_short_text(str(item.get('title') or 'Товар'), 70))}\n"
+                f"🔖 SKU: <code>{escape(_short_text(str(item.get('sku') or '-'), 55))}</code>\n"
+                f"🆔 <code>{escape(str(item.get('order_id') or '-'))}</code> | "
+                f"{_format_money(float(item.get('revenue') or 0))}\n"
                 f"📌 {escape(status)}{reason_line}"
             )
         if not items:
@@ -9960,6 +10436,509 @@ async def report_excel(message: Message) -> None:
                 pass
 
 
+# --- Четырёхстраничный управленческий PDF-отчёт ---
+PDF_REPORT_PERIODS: dict[str, tuple[str, str, int]] = {
+    "today": ("Сегодня", "Bugun", 1),
+    "7d": ("7 дней", "7 kun", 7),
+    "30d": ("30 дней", "30 kun", 30),
+}
+_PDF_REPORT_IN_PROGRESS: set[tuple[int, int]] = set()
+
+
+def _pdf_report_period_markup(lang: str) -> InlineKeyboardMarkup:
+    uz = normalize_lang(lang) == "uz"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Bugun" if uz else "Сегодня",
+                    callback_data="pdfreport:today",
+                ),
+                InlineKeyboardButton(
+                    text="7 kun" if uz else "7 дней",
+                    callback_data="pdfreport:7d",
+                ),
+                InlineKeyboardButton(
+                    text="30 kun" if uz else "30 дней",
+                    callback_data="pdfreport:30d",
+                ),
+            ]
+        ]
+    )
+
+
+def _pdf_report_range(period_key: str) -> tuple[int, int, int]:
+    if period_key == "today":
+        date_from, date_to = _today_range_ms()
+        return date_from, date_to, 1
+    if period_key == "7d":
+        date_from, date_to = _last_7_days_range_ms()
+        return date_from, date_to, 7
+    if period_key == "30d":
+        date_from, date_to = _days_range_ms(30)
+        return date_from, date_to, 30
+    raise ValueError("Неизвестный период PDF-отчёта")
+
+
+def _pdf_report_period_label(date_from_ms: int, date_to_ms: int) -> str:
+    date_from = datetime.fromtimestamp(date_from_ms / 1000, UZT)
+    date_to = datetime.fromtimestamp(date_to_ms / 1000, UZT)
+    if date_from.date() == date_to.date():
+        return date_from.strftime("%d.%m.%Y")
+    return f"{date_from:%d.%m.%Y} - {date_to:%d.%m.%Y}"
+
+
+def _pdf_problem_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return _problem_finance_rows(rows)
+
+
+def _pdf_management_actions(
+    stock_rows: list[dict[str, Any]],
+    stats: dict[str, Any],
+    profit: dict[str, Any],
+    defect_events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    actions: list[dict[str, Any]] = []
+    zero_count = sum(
+        1
+        for row in stock_rows
+        if not row.get("loss_only") and float(row.get("total") or 0) <= 0
+    )
+    low_count = sum(
+        1
+        for row in stock_rows
+        if float(row.get("total") or 0) > 0
+        and (
+            float(row.get("total") or 0)
+            <= float(row.get("low_stock_threshold") or 5)
+            or (
+                row.get("days_left") is not None
+                and float(row.get("days_left") or 0) <= 7
+            )
+        )
+    )
+    if zero_count or low_count:
+        actions.append({
+            "priority": "critical" if zero_count else "warning",
+            "title_ru": "Устранить дефицит",
+            "title_uz": "Qoldiq xavfini bartaraf etish",
+            "body_ru": f"Нет в наличии: {zero_count} SKU; низкий остаток: {low_count}. Сначала подготовьте поставку по этим позициям.",
+            "body_uz": f"Qoldiq yo‘q: {zero_count} SKU; kam qoldiq: {low_count}. Avval shu pozitsiyalar yetkazib berishini tayyorlang.",
+        })
+
+    cancellations = int(stats.get("cancelled") or 0)
+    returns = float(stats.get("returns") or 0)
+    if cancellations or returns:
+        actions.append({
+            "priority": "warning",
+            "title_ru": "Разобрать отмены и возвраты",
+            "title_uz": "Bekor va qaytarishni tahlil qilish",
+            "body_ru": f"Отменено строк: {cancellations}; возвращено: {returns:g} шт. Проверьте причины и проблемные SKU на странице 4.",
+            "body_uz": f"Bekor qatorlar: {cancellations}; qaytarilgan: {returns:g} dona. Sabab va muammoli SKUlarni 4-sahifada tekshiring.",
+        })
+
+    defected_delta = sum(int(item.get("defected_delta") or 0) for item in defect_events)
+    missing_delta = sum(int(item.get("missing_delta") or 0) for item in defect_events)
+    if defected_delta or missing_delta:
+        actions.append({
+            "priority": "critical" if defected_delta else "warning",
+            "title_ru": "Проверить потери и брак FBO",
+            "title_uz": "FBO yo‘qotish va brakni tekshirish",
+            "body_ru": f"За период зафиксировано: брак +{defected_delta}, потери +{missing_delta}. Сверьте акты и компенсации Uzum.",
+            "body_uz": f"Davrda qayd etildi: brak +{defected_delta}, yo‘qotish +{missing_delta}. Uzum dalolatnoma va kompensatsiyasini tekshiring.",
+        })
+
+    missing_costs = int(profit.get("missing_count") or 0)
+    if missing_costs:
+        actions.append({
+            "priority": "warning",
+            "title_ru": "Заполнить себестоимость",
+            "title_uz": "Tannarxni to‘ldirish",
+            "body_ru": f"Без себестоимости осталось {missing_costs} SKU. До заполнения прибыль показана только по известной части продаж.",
+            "body_uz": f"{missing_costs} SKU tannarxsiz. To‘ldirilguncha foyda faqat ma’lum savdo qismi bo‘yicha ko‘rsatiladi.",
+        })
+
+    no_sales_count = sum(
+        1
+        for row in stock_rows
+        if float(row.get("total") or 0) > 0 and float(row.get("sold_7") or 0) <= 0
+    )
+    if no_sales_count and len(actions) < 4:
+        actions.append({
+            "priority": "info",
+            "title_ru": "Проверить товары без продаж",
+            "title_uz": "Savdosiz tovarlarni tekshirish",
+            "body_ru": f"У {no_sales_count} SKU есть остаток, но нет продаж за 7 дней. Проверьте цену, контент и продвижение.",
+            "body_uz": f"{no_sales_count} SKUda qoldiq bor, lekin 7 kunda savdo yo‘q. Narx, kontent va reklamani tekshiring.",
+        })
+    return actions[:4]
+
+
+async def _collect_seller_pdf_payload(
+    client: UzumClient,
+    telegram_id: int,
+    shop_id: int,
+    period_key: str,
+) -> dict[str, Any]:
+    date_from, date_to, period_days = _pdf_report_range(period_key)
+    shift_ms = period_days * 24 * 60 * 60 * 1000
+    previous_from, previous_to = date_from - shift_ms, date_to - shift_ms
+
+    rows, _, source_info = await _load_finance_range_flexible(
+        client,
+        shop_id,
+        date_from,
+        date_to,
+    )
+    await asyncio.sleep(0.1)
+    comparison_available = True
+    try:
+        previous_rows, _, _ = await _load_finance_range_flexible(
+            client,
+            shop_id,
+            previous_from,
+            previous_to,
+        )
+    except Exception:
+        comparison_available = False
+        previous_rows = []
+        logging.exception(
+            "PDF report: previous period unavailable user=%s shop=%s period=%s",
+            telegram_id,
+            shop_id,
+            period_key,
+        )
+
+    if period_key == "7d":
+        sales_7 = rows
+    else:
+        await asyncio.sleep(0.1)
+        try:
+            week_from, week_to = _last_7_days_range_ms()
+            sales_7, _, _ = await _load_finance_range_flexible(
+                client,
+                shop_id,
+                week_from,
+                week_to,
+            )
+        except Exception:
+            sales_7 = []
+            logging.exception(
+                "PDF report: seven-day stock velocity unavailable user=%s shop=%s",
+                telegram_id,
+                shop_id,
+            )
+
+    stats = _build_noorza_today_stats(rows)
+    previous_stats = _build_noorza_today_stats(previous_rows)
+    costs = get_unit_cost_map(telegram_id, shop_id)
+    products = _build_unit_rows_from_finance(rows, costs)
+    profit = _profit_summary_from_unit_rows(products, stats)
+    product_settings = ensure_product_settings(telegram_id)
+
+    stock_rows: list[dict[str, Any]] = []
+    stock_data_available = True
+    try:
+        stock_raw = await load_sku_rows(client, shop_id, max_pages=50)
+        stock_rows, _ = _build_stock_report_rows(stock_raw, sales_7)
+        threshold = int(product_settings.get("low_stock_threshold") or 5)
+        for row in stock_rows:
+            row["low_stock_threshold"] = threshold
+    except Exception:
+        stock_data_available = False
+        logging.exception(
+            "PDF report: stock section unavailable user=%s shop=%s",
+            telegram_id,
+            shop_id,
+        )
+
+    cumulative_defects: list[dict[str, Any]] = []
+    loss_data_available = True
+    unavailable_loss_filters: list[str] = []
+    try:
+        loss_raw, unavailable_loss_filters = await _load_all_time_loss_rows(
+            client,
+            shop_id,
+        )
+        _, cumulative_losses = _build_stock_report_rows(loss_raw, sales_7)
+        cumulative_defects = [
+            row for row in cumulative_losses if float(row.get("defected") or 0) > 0
+        ]
+    except Exception:
+        loss_data_available = False
+        logging.exception(
+            "PDF report: cumulative loss section unavailable user=%s shop=%s",
+            telegram_id,
+            shop_id,
+        )
+
+    defect_events = list_loss_defect_events(
+        telegram_id,
+        shop_id,
+        date_from,
+        date_to,
+    )
+    daily = _daily_report_rows(rows, date_from, date_to)
+    for row in daily:
+        date_value = row.get("date")
+        row["label"] = (
+            date_value.strftime("%d.%m")
+            if isinstance(date_value, datetime)
+            else str(date_value or "")
+        )
+
+    problems = _pdf_problem_rows(rows)
+    data_notes: list[str] = []
+    if "Достигнут защитный лимит" in source_info:
+        data_notes.append("finance_rows_truncated")
+    if unavailable_loss_filters:
+        data_notes.append("loss_filters_unavailable")
+    if not comparison_available:
+        data_notes.append("comparison_unavailable")
+    if not stock_data_available:
+        data_notes.append("stock_unavailable")
+    if not loss_data_available:
+        data_notes.append("loss_data_unavailable")
+
+    return {
+        "shop_id": shop_id,
+        "generated_at": datetime.now(UZT).replace(tzinfo=None),
+        "period_key": period_key,
+        "period_days": period_days,
+        "period_label": _pdf_report_period_label(date_from, date_to),
+        "stats": stats,
+        "previous_stats": previous_stats,
+        "comparison_available": comparison_available,
+        "profit": profit,
+        "daily": daily,
+        "products": products,
+        "stock": stock_rows,
+        "stock_data_available": stock_data_available,
+        "problems": problems,
+        "defect_events": defect_events,
+        "cumulative_defects": cumulative_defects,
+        "loss_data_available": loss_data_available,
+        "actions": _pdf_management_actions(
+            stock_rows,
+            stats,
+            profit,
+            defect_events,
+        ),
+        "data_notes": data_notes,
+    }
+
+
+async def _build_seller_pdf_for_user(
+    client: UzumClient,
+    telegram_id: int,
+    shop_id: int,
+    period_key: str,
+    *,
+    lang: str,
+) -> tuple[Path, dict[str, Any]]:
+    payload = await _collect_seller_pdf_payload(
+        client,
+        telegram_id,
+        shop_id,
+        period_key,
+    )
+    regular_font, bold_font = _fbo_pdf_font_paths()
+    timestamp = datetime.now(UZT).strftime("%Y-%m-%d_%H-%M-%S")
+    filename = (
+        Path(tempfile.gettempdir())
+        / f"sellerpro_pdf_{shop_id}_{period_key}_{timestamp}.pdf"
+    )
+    await asyncio.to_thread(
+        build_seller_pdf_report,
+        payload,
+        filename,
+        lang=lang,
+        regular_font_path=regular_font,
+        bold_font_path=bold_font,
+    )
+    return filename, payload
+
+
+@dp.message(Command("pdf_report"))
+@dp.message(Command("management_pdf"))
+async def seller_pdf_report_menu(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    if not await require_premium_subscription(message, telegram_id):
+        return
+    req = await require_connection(message)
+    if req is None:
+        return
+    lang = get_user_language(telegram_id)
+    await message.answer(
+        (
+            "📄 <b>Boshqaruv PDF hisoboti</b>\n\n"
+            "Davrni tanlang. Hisobotda savdo, foyda, qoldiq, tavsiyalar, "
+            "bekor qilish, qaytarish va brak bo‘ladi."
+            if lang == "uz"
+            else "📄 <b>Управленческий PDF-отчёт</b>\n\n"
+            "Выберите период. В отчёте будут продажи, прибыль, остатки, "
+            "рекомендации, отмены, возвраты и брак."
+        ),
+        reply_markup=_pdf_report_period_markup(lang),
+    )
+
+
+@dp.callback_query(F.data.startswith("pdfreport:"))
+async def seller_pdf_report_callback(callback: CallbackQuery) -> None:
+    telegram_id = int(callback.from_user.id)
+    lang = get_user_language(telegram_id)
+    if not has_paid_subscription(telegram_id):
+        if subscription_access_level(telegram_id) == "trial":
+            await send_trial_premium_locked(callback, telegram_id)
+        else:
+            await callback.answer(
+                "Obuna tugagan" if lang == "uz" else "Подписка закончилась",
+                show_alert=True,
+            )
+        return
+
+    period_key = str(callback.data or "").partition(":")[2]
+    if period_key not in PDF_REPORT_PERIODS:
+        await callback.answer(
+            "Noto‘g‘ri davr" if lang == "uz" else "Неизвестный период",
+            show_alert=True,
+        )
+        return
+    client = get_uzum_for_user(telegram_id)
+    shop_id = db.get_default_shop_id(telegram_id)
+    if client is None or shop_id is None:
+        await callback.answer(
+            "Avval do‘konni ulang" if lang == "uz" else "Сначала подключите магазин",
+            show_alert=True,
+        )
+        return
+    shop_id = int(shop_id)
+    progress_key = (telegram_id, shop_id)
+    if progress_key in _PDF_REPORT_IN_PROGRESS:
+        await callback.answer(
+            "Hisobot allaqachon tayyorlanmoqda"
+            if lang == "uz"
+            else "Отчёт уже формируется",
+            show_alert=True,
+        )
+        return
+    if callback.message is None:
+        await callback.answer()
+        return
+
+    await callback.answer(
+        "Tayyorlashni boshladim" if lang == "uz" else "Начал подготовку"
+    )
+    await callback.message.answer(
+        (
+            "⌛ Ma’lumotlarni yig‘ib, PDF tayyorlayapman. Bu biroz vaqt olishi mumkin..."
+            if lang == "uz"
+            else "⌛ Собираю данные и формирую PDF. Это может занять немного времени..."
+        )
+    )
+    _PDF_REPORT_IN_PROGRESS.add(progress_key)
+    filename: Path | None = None
+    try:
+        filename, payload = await _build_seller_pdf_for_user(
+            client,
+            telegram_id,
+            shop_id,
+            period_key,
+            lang=lang,
+        )
+        stats = dict(payload.get("stats") or {})
+        profit = dict(payload.get("profit") or {})
+        coverage = float(profit.get("coverage") or 0)
+        if float(stats.get("revenue") or 0) <= 0:
+            quality_note = (
+                "Davrda savdo topilmadi."
+                if lang == "uz"
+                else "За период продажи не найдены."
+            )
+        elif coverage >= 0.999:
+            quality_note = (
+                "✅ Tannarx qamrovi: 100%."
+                if lang == "uz"
+                else "✅ Покрытие себестоимостью: 100%."
+            )
+        else:
+            quality_note = (
+                f"⚠️ Tannarx qamrovi: {coverage * 100:.1f}%. Foyda faqat ma’lum qism bo‘yicha."
+                if lang == "uz"
+                else f"⚠️ Покрытие себестоимостью: {coverage * 100:.1f}%. Прибыль показана только по известной части."
+            )
+        data_notes = set(payload.get("data_notes") or [])
+        if "finance_rows_truncated" in data_notes:
+            quality_note += (
+                "\n⚠️ Finance qatorlari texnik limitga yetdi; davrni qisqartiring."
+                if lang == "uz"
+                else "\n⚠️ Достигнут технический лимит строк Finance; выберите меньший период."
+            )
+        if "loss_filters_unavailable" in data_notes:
+            quality_note += (
+                "\n⚠️ Uzumning ayrim brak filtrlari vaqtincha ishlamadi."
+                if lang == "uz"
+                else "\n⚠️ Часть фильтров брака Uzum была временно недоступна."
+            )
+        if "stock_unavailable" in data_notes:
+            quality_note += (
+                "\n⚠️ Qoldiq bo‘limi Uzum API xatosi sababli mavjud emas."
+                if lang == "uz"
+                else "\n⚠️ Раздел остатков недоступен из-за ответа Uzum API."
+            )
+        if "loss_data_unavailable" in data_notes:
+            quality_note += (
+                "\n⚠️ Jamlangan brak ma’lumoti vaqtincha mavjud emas."
+                if lang == "uz"
+                else "\n⚠️ Накопительные данные брака временно недоступны."
+            )
+        if "comparison_unavailable" in data_notes:
+            quality_note += (
+                "\n⚠️ Oldingi davr bilan taqqoslash vaqtincha mavjud emas."
+                if lang == "uz"
+                else "\n⚠️ Сравнение с предыдущим периодом временно недоступно."
+            )
+        public_name = f"SellerPro_{shop_id}_{period_key}.pdf"
+        await callback.message.answer_document(
+            FSInputFile(str(filename), filename=public_name),
+            caption=(
+                "✅ <b>Boshqaruv PDF hisoboti tayyor</b>\n"
+                f"Davr: {escape(str(payload.get('period_label') or '-'))}\n"
+                f"{quality_note}"
+                if lang == "uz"
+                else "✅ <b>Управленческий PDF-отчёт готов</b>\n"
+                f"Период: {escape(str(payload.get('period_label') or '-'))}\n"
+                f"{quality_note}"
+            ),
+            reply_markup=report_menu_for_user(telegram_id),
+        )
+    except Exception as error:
+        logging.exception(
+            "PDF report failed user=%s shop=%s period=%s",
+            telegram_id,
+            shop_id,
+            period_key,
+        )
+        raw = escape(str(error))
+        await callback.message.answer(
+            (
+                "⚠️ <b>PDF hisobotni yaratib bo‘lmadi</b>\n"
+                f"<code>{raw[:900]}</code>"
+                if lang == "uz"
+                else "⚠️ <b>Не удалось сформировать PDF-отчёт</b>\n"
+                f"<code>{raw[:900]}</code>"
+            ),
+            reply_markup=report_menu_for_user(telegram_id),
+        )
+    finally:
+        _PDF_REPORT_IN_PROGRESS.discard(progress_key)
+        if filename is not None:
+            try:
+                filename.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 # --- Уведомления о новых заказах ---
 # Логика простая и безопасная:
 # 1) при первом запуске бот запоминает текущие CREATED-заказы и не спамит ими;
@@ -10984,7 +11963,7 @@ async def button_notifications_section_simple(message: Message) -> None:
 async def button_reports_section_simple(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     lang = get_user_language(telegram_id)
-    text = "📊 <b>Hisobotlar</b>\nExcel, foyda va tayyor hisobotlar 👇" if lang == "uz" else "📊 <b>Отчёты</b>\nExcel, прибыль и готовые отчёты 👇"
+    text = "📊 <b>Hisobotlar</b>\nPDF, Excel, foyda va tayyor hisobotlar 👇" if lang == "uz" else "📊 <b>Отчёты</b>\nPDF, Excel, прибыль и готовые отчёты 👇"
     await message.answer(text, reply_markup=report_menu_for_message(message))
 
 
@@ -11736,6 +12715,12 @@ async def button_orders(message: Message) -> None:
 @dp.message(F.text == "📄 Excel-отчёт")
 async def button_excel_report(message: Message) -> None:
     await report_excel(message)
+
+
+@dp.message(F.text == "📄 PDF-отчёт")
+@dp.message(F.text == "📄 PDF hisobot")
+async def button_pdf_report(message: Message) -> None:
+    await seller_pdf_report_menu(message)
 
 
 @dp.message(F.text == "⚙️ Статус")
@@ -17164,8 +18149,10 @@ def build_fbo_acceptance_notification(summary: dict[str, Any], *, lang: str = "r
 
 def _fbo_pdf_font_paths() -> tuple[Path, Path]:
     configured = str(os.getenv("PDF_FONT_PATH", "") or "").strip()
+    app_dir = Path(__file__).resolve().parent
     regular_candidates = [
         Path(configured) if configured else None,
+        app_dir / "DejaVuSans.ttf",
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
         Path("/usr/share/fonts/dejavu/DejaVuSans.ttf"),
         Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
@@ -17175,6 +18162,7 @@ def _fbo_pdf_font_paths() -> tuple[Path, Path]:
         raise RuntimeError("Не найден Unicode-шрифт для PDF. Укажите PDF_FONT_PATH.")
     bold_candidates = [
         regular.with_name(regular.name.replace(".ttf", "-Bold.ttf")),
+        app_dir / "DejaVuSans-Bold.ttf",
         Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
         Path("/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf"),
         Path("/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf"),
@@ -17401,6 +18389,12 @@ async def check_loss_defect_once() -> None:
                 )
                 continue
 
+            all_changes = calculate_loss_defect_changes(
+                previous,
+                current,
+                notify_losses=True,
+                notify_defects=True,
+            )
             changes = calculate_loss_defect_changes(
                 previous,
                 current,
@@ -17434,6 +18428,19 @@ async def check_loss_defect_once() -> None:
                         shop_id,
                     )
             if delivered:
+                if all_changes:
+                    try:
+                        record_loss_defect_events(
+                            telegram_id,
+                            shop_id,
+                            all_changes,
+                        )
+                    except Exception:
+                        logging.exception(
+                            "Loss/defect watcher: event history failed user=%s shop=%s",
+                            telegram_id,
+                            shop_id,
+                        )
                 save_product_loss_snapshot(
                     telegram_id,
                     shop_id,
@@ -17774,9 +18781,9 @@ LOSS_REPORT_MAX_REQUESTS = max(
 )
 LOSS_REPORT_FILTERS = tuple(
     value.strip().upper()
-    for value in os.getenv("LOSS_REPORT_FILTERS", "ALL,ARCHIVE").replace(";", ",").split(",")
+    for value in os.getenv("LOSS_REPORT_FILTERS", "ALL,ARCHIVE,DEFECTED").replace(";", ",").split(",")
     if value.strip()
-) or ("ALL", "ARCHIVE")
+) or ("ALL", "ARCHIVE", "DEFECTED")
 # Kept only as an in-memory scheduler.  No unsupported status query parameters
 # are sent to Uzum Finance API.
 _CANCEL_DEEP_SCAN_LAST_ATTEMPT: dict[int, float] = {}
@@ -19521,10 +20528,22 @@ _LOSS_REPORT_CACHE: dict[int, tuple[float, list[dict[str, Any]], list[str]]] = {
 async def _load_all_time_loss_rows(
     client: UzumClient,
     shop_id: int,
+    *,
+    force_refresh: bool = False,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     cached = _LOSS_REPORT_CACHE.get(int(shop_id))
-    if cached and time.monotonic() - cached[0] <= LOSS_REPORT_CACHE_SECONDS:
+    if (
+        not force_refresh
+        and cached
+        and time.monotonic() - cached[0] <= LOSS_REPORT_CACHE_SECONDS
+    ):
         import copy
+        logging.info(
+            "Loss report cache hit shop=%s rows=%s unavailable_filters=%s",
+            shop_id,
+            len(cached[1]),
+            ",".join(cached[2]) or "none",
+        )
         return copy.deepcopy(cached[1]), list(cached[2])
 
     merged: dict[str, dict[str, Any]] = {}
@@ -19544,6 +20563,13 @@ async def _load_all_time_loss_rows(
                 product_filter=product_filter,
             )
             successful_filters += 1
+            logging.info(
+                "Loss report scan shop=%s filter=%s products=%s max_pages=%s",
+                shop_id,
+                product_filter,
+                len(products),
+                pages_per_filter,
+            )
         except Exception as exc:
             first_error = first_error or exc
             unavailable_filters.append(product_filter)
@@ -19598,12 +20624,25 @@ async def _load_all_time_loss_rows(
             str(row.get("product_title") or row.get("sku_full_title") or ""),
         )
     )
-    import copy
-    _LOSS_REPORT_CACHE[int(shop_id)] = (
-        time.monotonic(),
-        copy.deepcopy(rows),
-        list(unavailable_filters),
+    logging.info(
+        "Loss report completed shop=%s filters=%s rows=%s unavailable_filters=%s force_refresh=%s",
+        shop_id,
+        ",".join(filters),
+        len(rows),
+        ",".join(unavailable_filters) or "none",
+        force_refresh,
     )
+    # Не сохраняем пустой или частичный результат: временный ответ Uzum не
+    # должен превращаться в ложное «потерь нет» на весь срок кэша.
+    if rows and not unavailable_filters:
+        import copy
+        _LOSS_REPORT_CACHE[int(shop_id)] = (
+            time.monotonic(),
+            copy.deepcopy(rows),
+            [],
+        )
+    else:
+        _LOSS_REPORT_CACHE.pop(int(shop_id), None)
     return rows, unavailable_filters
 
 
@@ -19662,7 +20701,7 @@ _cleanup_release_state()
 # Preserves per-user instant/hourly modes while using the durable outbox and
 # adaptive Finance pagination from RELEASE_HARDENING.
 # =============================================================================
-PREMIUM_RELEASE_VERSION = "2026.07.18-premium-r5-trial-gated"
+PREMIUM_RELEASE_VERSION = "2026.07.19-premium-r9-loss-report-fix"
 
 
 async def check_new_sales_once() -> None:
@@ -19886,6 +20925,16 @@ async def main() -> None:
     )
     logging.info("PREMIUM_UI_LOADED: compact main menu + guided sections + honest financial wording")
     logging.info("TRIAL_FEATURE_GATING_LOADED: sales today + sale alerts + morning report")
+    logging.info("MANAGEMENT_PDF_LOADED: sales + profit + stock + cancellations + returns + defects")
+    try:
+        pdf_regular_font, pdf_bold_font = _fbo_pdf_font_paths()
+        logging.info(
+            "PDF_FONT_READY: regular=%s bold=%s",
+            pdf_regular_font,
+            pdf_bold_font,
+        )
+    except RuntimeError as error:
+        logging.warning("PDF_FONT_MISSING: %s", error)
     logging.info("LEGACY_CANCEL_STATUS_FILTER_SCAN_DISABLED: finance orders are scanned without unsupported status parameters")
     logging.info("SKU_LABELS_INTERFACE_LOADED: official barcode types + PDF SKU labels")
     logging.info("STOCK_TRUTH_LOADED: SKU-level FBO/FBS totals + supply forecast")
