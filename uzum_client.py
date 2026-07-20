@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 import httpx
 
@@ -87,8 +87,62 @@ class UzumClient:
         params = {"page": page, "size": size}
         return await self._request("GET", "/v3/fbs/sku/stocks", params=params)
 
-    async def get_expenses(self, *, shop_id: int | None = None, page: int = 0, size: int = 20) -> Any:
+    async def get_expenses(
+        self,
+        *,
+        shop_id: int | None = None,
+        shop_ids: Iterable[int] | None = None,
+        date_from: int | None = None,
+        date_to: int | None = None,
+        sources: Iterable[str] | None = None,
+        page: int = 0,
+        size: int = 20,
+    ) -> Any:
         params: dict[str, Any] = {"page": page, "size": size}
-        if shop_id is not None:
-            params["shopIds"] = shop_id
+        resolved_shop_ids = [int(value) for value in (shop_ids or [])]
+        if shop_id is not None and int(shop_id) not in resolved_shop_ids:
+            resolved_shop_ids.append(int(shop_id))
+        if resolved_shop_ids:
+            params["shopIds"] = resolved_shop_ids
+        if date_from is not None:
+            params["dateFrom"] = int(date_from)
+        if date_to is not None:
+            params["dateTo"] = int(date_to)
+        source_values = [str(value) for value in (sources or []) if str(value).strip()]
+        if source_values:
+            params["sources"] = source_values
         return await self._request("GET", "/v1/finance/expenses", params=params)
+
+    async def get_fbo_invoices(
+        self,
+        shop_id: int,
+        *,
+        page: int = 0,
+        size: int = 20,
+    ) -> Any:
+        params = {"page": int(page), "size": int(size)}
+        return await self._request("GET", f"/v1/shop/{int(shop_id)}/invoice", params=params)
+
+    async def get_fbo_invoice_products(self, shop_id: int, invoice_id: int) -> Any:
+        params = {"invoiceId": int(invoice_id)}
+        return await self._request(
+            "GET",
+            f"/v1/shop/{int(shop_id)}/invoice/products",
+            params=params,
+        )
+
+    async def get_returns(
+        self,
+        shop_id: int,
+        *,
+        page: int = 0,
+        size: int = 20,
+    ) -> Any:
+        params = {"page": int(page), "size": int(size)}
+        return await self._request("GET", f"/v1/shop/{int(shop_id)}/return", params=params)
+
+    async def get_return(self, shop_id: int, return_id: int) -> Any:
+        return await self._request(
+            "GET",
+            f"/v1/shop/{int(shop_id)}/return/{int(return_id)}",
+        )

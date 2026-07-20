@@ -8,7 +8,7 @@ import shutil
 import sqlite3
 import tempfile
 import unittest
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -17,7 +17,7 @@ from cryptography.fernet import Fernet
 from openpyxl import Workbook
 
 
-TEST_ROOT = Path(tempfile.mkdtemp(prefix="sellerpro-r11-tests-"))
+TEST_ROOT = Path(tempfile.mkdtemp(prefix="sellerpro-r12-tests-"))
 atexit.register(shutil.rmtree, TEST_ROOT, True)
 os.environ["TELEGRAM_BOT_TOKEN"] = f"{123456}:{'A' * 35}"
 os.environ["ENCRYPTION_KEY"] = Fernet.generate_key().decode()
@@ -33,7 +33,7 @@ class ReleaseRegressionTests(unittest.TestCase):
     def test_release_marker_and_stock_function_are_current(self) -> None:
         self.assertEqual(
             main.PREMIUM_RELEASE_VERSION,
-            "2026.07.19-premium-r11-stability-security",
+            "2026.07.20-premium-r12-uzum-finance-reminders",
         )
         self.assertTrue(callable(main.send_stock_list))
 
@@ -141,6 +141,177 @@ class ReleaseRegressionTests(unittest.TestCase):
         self.assertEqual(len(items), 3)
         self.assertTrue(any("лимит" in error.lower() for error in errors))
 
+    def test_manual_cost_is_preserved_but_never_used_for_profit(self) -> None:
+        telegram_id = 9_876_543_211
+        shop_id = 501
+        main.save_unit_cost(telegram_id, shop_id, "SKU-1", 123_456, "Legacy")
+        self.assertEqual(main.get_unit_cost_map(telegram_id, shop_id), {})
+
+        main._replace_uzum_sku_financials(
+            telegram_id,
+            shop_id,
+            [{"sku_id": "SKU-1", "purchase_price": 42_000}],
+        )
+        costs = main.get_unit_cost_map(telegram_id, shop_id)
+        self.assertEqual(costs["sku-1"]["cost"], 42_000)
+        self.assertEqual(costs["sku-1"]["source"], "uzum")
+
+    def test_logistics_notification_settings_are_user_controllable(self) -> None:
+        self.assertIn("notify_supply_reminders", main.AUTOMATION_BOOL_FIELDS)
+        self.assertIn("notify_return_pickup", main.AUTOMATION_BOOL_FIELDS)
+        self.assertIn(
+            "notify_supply_reminders",
+            main.NOTIFICATION_SECTION_FIELDS["stock"],
+        )
+        self.assertIn(
+            "notify_return_pickup",
+            main.NOTIFICATION_SECTION_FIELDS["stock"],
+        )
+
+    def test_logistics_outbox_key_is_idempotent(self) -> None:
+        telegram_id = 9_876_543_212
+        shop_id = 502
+        event_key = "invoice:77:slot:2026-07-20T12:00:00+00:00:24h"
+        first = main._enqueue_notification(
+            "supply_reminder",
+            telegram_id,
+            shop_id,
+            event_key,
+            {"text": "test"},
+        )
+        second = main._enqueue_notification(
+            "supply_reminder",
+            telegram_id,
+            shop_id,
+            event_key,
+            {"text": "test"},
+        )
+        self.assertTrue(first)
+        self.assertFalse(second)
+
+    def test_logistics_messages_are_bilingual_and_escaped(self) -> None:
+        invoice = {
+            "id": 77,
+            "invoiceNumber": "<INV-77>",
+            "status": "CREATED",
+            "warehouseName": "<Main>",
+            "timeSlotReservation": {
+                "timeFrom": "2026-07-20T17:00:00+05:00",
+                "timeTo": "2026-07-20T18:00:00+05:00",
+            },
+        }
+        ru = main.build_supply_reminder_message(
+            invoice,
+            shop_id=42,
+            bucket="24h",
+            lang="ru",
+        )
+        uz = main.build_supply_reminder_message(
+            invoice,
+            shop_id=42,
+            bucket="3h",
+            lang="uz",
+        )
+        self.assertIn("Срок поставки", ru)
+        self.assertIn("Yetkazish vaqti", uz)
+        self.assertNotIn("<INV-77>", ru)
+        self.assertIn("&lt;INV-77&gt;", ru)
+
+    def test_business_profit_deducts_each_expense_once(self) -> None:
+        result = main.calculate_business_profit(
+            {
+                "profit": 700_000,
+                "cost_total": 300_000,
+                "coverage": 1.0,
+                "missing_count": 0,
+            },
+            {
+                "revenue": 1_200_000,
+                "commission": 120_000,
+                "logistics": 80_000,
+                "payout_total": 1_000_000,
+            },
+            {
+                "tax_percent": 5,
+                "advertising_monthly": 30_000,
+                "storage_monthly": 20_000,
+                "other_monthly": 10_000,
+            },
+            days=30,
+            uzum_expenses={
+                "available": True,
+                "total": 40_000,
+                "order_charge": 200_000,
+            },
+        )
+        self.assertEqual(result["tax_expense"], 60_000)
+        self.assertEqual(result["operating_expenses"], 160_000)
+        self.assertEqual(result["net_profit"], 540_000)
+        self.assertEqual(result["uzum_order_charge_already_in_payout"], 200_000)
+        self.assertTrue(result["complete"])
+
+    def test_no_sales_period_can_be_complete_without_fake_cost_coverage(self) -> None:
+        result = main.calculate_business_profit(
+            {"profit": 0, "cost_total": 0, "coverage": 0, "missing_count": 0},
+            {"revenue": 0},
+            {"tax_percent": 0},
+            uzum_expenses={"available": True, "total": 0},
+        )
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["coverage"], 0)
+
+    def test_hourly_digest_queue_is_persistent_and_idempotent(self) -> None:
+        telegram_id = 9_876_543_213
+        shop_id = 503
+        now = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+        item = {
+            "orderId": "ORDER-77",
+            "id": "SALE-77",
+            "skuId": 1001,
+            "productTitle": "Test product",
+            "skuTitle": "SKU-1001",
+            "status": "DELIVERED",
+            "amount": 2,
+            "sellerPrice": 100_000,
+            "commission": 20_000,
+            "logisticDeliveryFee": 10_000,
+            "sellerProfit": 170_000,
+        }
+        main.set_sales_notification_mode(telegram_id, "hourly")
+        main.reset_sales_digest_schedule(
+            telegram_id,
+            shop_id,
+            now=now - timedelta(hours=2),
+            clear_queue=True,
+        )
+        first = main.enqueue_sales_digest_events(
+            telegram_id,
+            shop_id,
+            [item],
+            detected_at=now - timedelta(minutes=10),
+        )
+        second = main.enqueue_sales_digest_events(
+            telegram_id,
+            shop_id,
+            [item],
+            detected_at=now - timedelta(minutes=5),
+        )
+        summary = main.load_sales_digest_summary(
+            telegram_id,
+            shop_id,
+            period_start=now - timedelta(hours=2),
+            period_end=now,
+        )
+        self.assertEqual(main.get_sales_notification_mode(telegram_id), "hourly")
+        self.assertEqual(first, 1)
+        self.assertEqual(second, 0)
+        self.assertEqual(summary["positions"], 1)
+        self.assertEqual(summary["orders"], 1)
+        self.assertEqual(summary["units"], 2)
+        self.assertEqual(summary["revenue"], 200_000)
+        self.assertIn("Продажи за час", main.build_sales_digest_message(summary, lang="ru"))
+        self.assertIn("Soatlik savdo hisoboti", main.build_sales_digest_message(summary, lang="uz"))
+
 
 class StockRouteAsyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_stock_route_loads_and_paginates_rows(self) -> None:
@@ -194,6 +365,77 @@ class StockRouteAsyncTests(unittest.IsolatedAsyncioTestCase):
             release.set()
         self.assertEqual(await first, "done")
         self.assertNotIn(event.from_user.id, main._ACTIVE_USER_HANDLERS)
+
+    async def test_return_pagination_deduplicates_and_stops_on_short_page(self) -> None:
+        client = SimpleNamespace(
+            get_returns=AsyncMock(
+                side_effect=[
+                    {"payload": {"returnList": [{"id": 1}, {"id": 2}]}},
+                    {"payload": {"returnList": [{"id": 2}]}},
+                ]
+            )
+        )
+        rows = await main._load_return_invoices(
+            client,
+            42,
+            max_pages=5,
+            page_size=2,
+        )
+        self.assertEqual([row["id"] for row in rows], [1, 2])
+        self.assertEqual(client.get_returns.await_count, 2)
+
+    async def test_due_hourly_digest_is_sent_once_and_queue_is_cleared(self) -> None:
+        telegram_id = 9_876_543_214
+        shop_id = 504
+        now = datetime(2026, 7, 20, 12, 0, tzinfo=timezone.utc)
+        item = {
+            "orderId": "ORDER-88",
+            "id": "SALE-88",
+            "skuId": 1002,
+            "productTitle": "Hourly product",
+            "skuTitle": "SKU-1002",
+            "status": "DELIVERED",
+            "amount": 1,
+            "sellerPrice": 150_000,
+            "sellerProfit": 120_000,
+        }
+        main.reset_sales_digest_schedule(
+            telegram_id,
+            shop_id,
+            now=now - timedelta(hours=2),
+            clear_queue=True,
+        )
+        main.enqueue_sales_digest_events(
+            telegram_id,
+            shop_id,
+            [item],
+            detected_at=now - timedelta(minutes=15),
+        )
+        with (
+            patch.object(main.bot, "send_message", new=AsyncMock()) as sender,
+            patch.object(main, "get_user_language", return_value="ru"),
+        ):
+            sent = await main.maybe_send_hourly_sales_digest(
+                telegram_id,
+                shop_id,
+                now=now,
+            )
+            sent_again = await main.maybe_send_hourly_sales_digest(
+                telegram_id,
+                shop_id,
+                now=now,
+            )
+
+        self.assertTrue(sent)
+        self.assertFalse(sent_again)
+        sender.assert_awaited_once()
+        summary = main.load_sales_digest_summary(
+            telegram_id,
+            shop_id,
+            period_start=now - timedelta(hours=1),
+            period_end=now,
+        )
+        self.assertEqual(summary["positions"], 0)
 
 
 if __name__ == "__main__":

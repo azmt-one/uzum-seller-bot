@@ -360,7 +360,9 @@ def _page_summary(c: canvas.Canvas, payload: dict[str, Any], lang: str) -> None:
     stats = dict(payload.get("stats") or {})
     previous = dict(payload.get("previous_stats") or {})
     profit = dict(payload.get("profit") or {})
-    coverage = _num(profit.get("coverage"))
+    business = dict(payload.get("business_profit") or {})
+    coverage = _num(business.get("coverage", profit.get("coverage")))
+    business_complete = bool(business.get("complete"))
     comparison_available = bool(payload.get("comparison_available", True))
     revenue_change = _change(stats.get("revenue"), previous.get("revenue")) if comparison_available else None
     orders_change = _change(stats.get("orders"), previous.get("orders")) if comparison_available else None
@@ -374,10 +376,15 @@ def _page_summary(c: canvas.Canvas, payload: dict[str, Any], lang: str) -> None:
     _kpi(c, MARGIN + card_w + gap, y1, card_w, 70, _t(lang, "Заказы", "Buyurtmalar"), str(int(_num(stats.get("orders")))), _change_text(orders_change, lang), PURPLE, PURPLE_SOFT)
     _kpi(c, MARGIN + 2 * (card_w + gap), y1, card_w, 70, _t(lang, "Продано", "Sotildi"), f"{_qty(stats.get('units'))} {_t(lang, 'шт.', 'dona')}", _t(lang, "чистое количество", "sof miqdor"), BLUE, BLUE_SOFT)
     _kpi(c, MARGIN, y2, card_w, 70, _t(lang, "К выплате", "To‘lovga"), _money(stats.get("payout_total"), lang), _percent(_num(stats.get("payout_total")) / max(1.0, _num(stats.get("revenue")))), GREEN, GREEN_SOFT)
-    profit_label = _t(lang, "Расчётная прибыль" if coverage >= 0.999 else "Известная прибыль", "Hisobiy foyda" if coverage >= 0.999 else "Ma’lum foyda")
-    profit_accent = RED if _num(profit.get("profit")) < 0 else PURPLE
-    profit_soft = RED_SOFT if _num(profit.get("profit")) < 0 else PURPLE_SOFT
-    _kpi(c, MARGIN + card_w + gap, y2, card_w, 70, profit_label, _money(profit.get("profit"), lang), _t(lang, f"покрытие {coverage * 100:.1f}%", f"qamrov {coverage * 100:.1f}%"), profit_accent, profit_soft)
+    result_value = _num(business.get("net_profit", profit.get("profit")))
+    profit_label = _t(
+        lang,
+        "Чистая прибыль" if business_complete else "Известный результат",
+        "Sof foyda" if business_complete else "Ma’lum natija",
+    )
+    profit_accent = RED if result_value < 0 else PURPLE
+    profit_soft = RED_SOFT if result_value < 0 else PURPLE_SOFT
+    _kpi(c, MARGIN + card_w + gap, y2, card_w, 70, profit_label, _money(result_value, lang), _t(lang, f"покрытие {coverage * 100:.1f}%", f"qamrov {coverage * 100:.1f}%"), profit_accent, profit_soft)
     _kpi(c, MARGIN + 2 * (card_w + gap), y2, card_w, 70, _t(lang, "Отмены", "Bekor qilish"), str(int(_num(stats.get("cancelled")))), _t(lang, f"доля {_num(stats.get('cancellation_rate')) * 100:.1f}%", f"ulushi {_num(stats.get('cancellation_rate')) * 100:.1f}%"), ORANGE, ORANGE_SOFT)
 
     chart_y, chart_h = 315, 172
@@ -416,7 +423,7 @@ def _page_summary(c: canvas.Canvas, payload: dict[str, Any], lang: str) -> None:
         (trend_color, trend_title, _t(lang, f"Выручка к предыдущему периоду: {_change_text(revenue_change, lang)}.", f"Tushum oldingi davrga nisbatan: {_change_text(revenue_change, lang)}.")),
         (stock_insight_color, stock_insight_title, stock_insight_body),
         (RED, _t(lang, "Отмены и возвраты", "Bekor va qaytarish"), _t(lang, f"Отменено {int(_num(stats.get('cancelled')))}, возвращено {_qty(stats.get('returns'))} шт.", f"Bekor {int(_num(stats.get('cancelled')))}, qaytarilgan {_qty(stats.get('returns'))} dona.")),
-        (PURPLE, _t(lang, "Себестоимость", "Tannarx"), _t(lang, f"Без себестоимости: {missing_count} SKU. Общая прибыль не завышается.", f"Tannarxsiz: {missing_count} SKU. Umumiy foyda oshirib ko‘rsatilmaydi.")),
+        (PURPLE, _t(lang, "Себестоимость Uzum", "Uzum tannarxi"), _t(lang, f"Без purchasePrice: {missing_count} SKU. Значения не подставляются.", f"purchasePricesiz: {missing_count} SKU. Qiymatlar taxmin qilinmaydi.")),
     ]
     c.setFillColor(INK)
     c.setFont(FONT_BOLD, 11)
@@ -439,19 +446,34 @@ def _page_summary(c: canvas.Canvas, payload: dict[str, Any], lang: str) -> None:
 def _page_finance(c: canvas.Canvas, payload: dict[str, Any], lang: str) -> None:
     stats = dict(payload.get("stats") or {})
     profit = dict(payload.get("profit") or {})
-    coverage = _num(profit.get("coverage"))
+    business = dict(payload.get("business_profit") or {})
+    coverage = _num(business.get("coverage", profit.get("coverage")))
+    business_complete = bool(business.get("complete"))
     _header(c, 2, _t(lang, "Продажи и прибыль", "Savdo va foyda"), _t(lang, "Расходы площадки, себестоимость и товары, формирующие результат", "Platforma xarajatlari, tannarx va natijani shakllantiruvchi tovarlar"), lang)
-    _section(c, _t(lang, "Куда уходит выручка", "Tushum qayerga ketadi"), _t(lang, "Прибыль считается только по товарам с заполненной себестоимостью", "Foyda faqat tannarxi kiritilgan tovarlar bo‘yicha hisoblanadi"), MARGIN, H - 135)
+    _section(c, _t(lang, "Куда уходит выручка", "Tushum qayerga ketadi"), _t(lang, "Себестоимость берётся только из Uzum purchasePrice", "Tannarx faqat Uzum purchasePrice’dan olinadi"), MARGIN, H - 135)
     _rounded(c, MARGIN, 522, W - 2 * MARGIN, 170, white, 12)
     c.setStrokeColor(LINE)
     c.roundRect(MARGIN, 522, W - 2 * MARGIN, 170, 12, fill=0, stroke=1)
     bar_x, bar_w = MARGIN + 16, W - 2 * MARGIN - 32
     maximum = max(1.0, _num(stats.get("revenue")))
-    _bar(c, bar_x, 638, bar_w, _num(profit.get("cost_total")), maximum, PURPLE, _t(lang, "Известная себестоимость", "Ma’lum tannarx"), _money(profit.get("cost_total"), lang))
-    _bar(c, bar_x, 603, bar_w, _num(stats.get("commission")), maximum, BLUE, _t(lang, "Комиссия Uzum", "Uzum komissiyasi"), _money(stats.get("commission"), lang))
-    _bar(c, bar_x, 568, bar_w, _num(stats.get("logistics")), maximum, ORANGE, _t(lang, "Логистика", "Logistika"), _money(stats.get("logistics"), lang))
-    profit_value = _num(profit.get("profit"))
-    _bar(c, bar_x, 533, bar_w, profit_value, maximum, RED if profit_value < 0 else GREEN, _t(lang, "Известная прибыль", "Ma’lum foyda"), _money(profit_value, lang))
+    _bar(c, bar_x, 638, bar_w, _num(profit.get("cost_total")), maximum, PURPLE, _t(lang, "Себестоимость Uzum (известная)", "Uzum tannarxi (ma’lum)"), _money(profit.get("cost_total"), lang))
+    platform_costs = _num(stats.get("commission")) + _num(stats.get("logistics"))
+    _bar(c, bar_x, 603, bar_w, platform_costs, maximum, BLUE, _t(lang, "Комиссия и логистика Uzum", "Uzum komissiya va logistika"), _money(platform_costs, lang))
+    other_costs = (
+        _num(business.get("uzum_expense_total"))
+        + _num(business.get("tax_expense"))
+        + _num(business.get("advertising_expense"))
+        + _num(business.get("storage_expense"))
+        + _num(business.get("other_expense"))
+    )
+    _bar(c, bar_x, 568, bar_w, other_costs, maximum, ORANGE, _t(lang, "Расходы Uzum, налог и внешние", "Uzum xarajatlari, soliq va tashqi"), _money(other_costs, lang))
+    profit_value = _num(business.get("net_profit", profit.get("profit")))
+    result_label = _t(
+        lang,
+        "Чистая прибыль" if business_complete else "Результат по известным данным",
+        "Sof foyda" if business_complete else "Ma’lum ma’lumotlar natijasi",
+    )
+    _bar(c, bar_x, 533, bar_w, profit_value, maximum, RED if profit_value < 0 else GREEN, result_label, _money(profit_value, lang))
 
     _section(c, _t(lang, "Товары-лидеры", "Yetakchi tovarlar"), _t(lang, "Топ по выручке с оценкой прибыли и маржи", "Tushum bo‘yicha top, foyda va marja bahosi"), MARGIN, 494)
     product_rows: list[list[str]] = []
@@ -482,10 +504,13 @@ def _page_finance(c: canvas.Canvas, payload: dict[str, Any], lang: str) -> None:
     c.setFillColor(PURPLE)
     c.setFont(FONT_BOLD, 8.5)
     c.drawString(MARGIN + 14, 121, _t(lang, "Как читать прибыль", "Foydani qanday o‘qish kerak"))
+    expenses_available = bool(business.get("uzum_expenses_available", True))
     note = _t(
         lang,
-        "При покрытии ниже 100% показана только известная прибыль по заполненным SKU. Бот не подставляет среднюю себестоимость и не выдаёт частичный результат за общую прибыль.",
-        "Qamrov 100% dan past bo‘lsa, faqat tannarxi kiritilgan SKUlar bo‘yicha ma’lum foyda ko‘rsatiladi. Bot o‘rtacha tannarxni o‘ylab topmaydi.",
+        "При покрытии ниже 100% результат относится только к SKU с purchasePrice. Бот не подставляет среднюю себестоимость."
+        + (" Расходы Uzum временно недоступны — итог неполный." if not expenses_available else ""),
+        "Qamrov 100% dan past bo‘lsa, natija faqat purchasePrice bor SKUlarga tegishli. Bot o‘rtacha tannarxni taxmin qilmaydi."
+        + (" Uzum xarajatlari vaqtincha olinmadi — natija to‘liq emas." if not expenses_available else ""),
     )
     _paragraph(c, note, MARGIN + 14, 107, W - 2 * MARGIN - 28, size=7.5, leading=10.5, color=MUTED)
     _footer(c, 2, lang)

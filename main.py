@@ -57,6 +57,14 @@ from formatters import (
     status_display,
 )
 from uzum_client import UzumClient
+from uzum_finance import (
+    build_stock_records,
+    expense_items,
+    parse_api_datetime,
+    return_reminder_bucket,
+    summarize_expenses,
+    supply_reminder_bucket,
+)
 
 # --- Самостоятельный генератор управленческого Excel-отчёта ---
 NAVY = "17365D"
@@ -329,16 +337,16 @@ def build_premium_workbook(
     default_note = _t(
         lang,
         (
-            "Чистая прибыль учитывает введённые налоги, рекламу, хранение и прочие расходы. "
-            "Точность зависит от покрытия продаж себестоимостью."
+            "Результат учитывает налог, расходы Uzum и внешние расходы. Себестоимость берётся "
+            "только из Uzum purchasePrice; при неполных данных итог не считается окончательной чистой прибылью."
             if business_profit
-            else "Расчётная прибыль учитывает комиссию, логистику и загруженную себестоимость. Налоги, реклама, хранение и другие расходы в неё не входят."
+            else "Расчётная прибыль учитывает комиссию, логистику и себестоимость Uzum purchasePrice. Налог и дополнительные расходы в неё не входят."
         ),
         (
-            "Sof foyda kiritilgan soliq, reklama, saqlash va boshqa xarajatlarni hisobga oladi. "
-            "Aniqlik tannarx bilan qamrovga bog‘liq."
+            "Natija soliq, Uzum xarajatlari va tashqi xarajatlarni hisobga oladi. Tannarx faqat "
+            "Uzum purchasePrice’dan olinadi; ma’lumot to‘liq bo‘lmasa, yakuniy sof foyda deb ko‘rsatilmaydi."
             if business_profit
-            else "Hisobiy foyda komissiya, logistika va yuklangan tannarxni hisobga oladi. Soliq, reklama, saqlash va boshqa xarajatlar kiritilmagan."
+            else "Hisobiy foyda komissiya, logistika va Uzum purchasePrice tannarxini hisobga oladi. Soliq va qo‘shimcha xarajatlar kiritilmagan."
         ),
     )
     ws.cell(note_row + 1, 1, default_note)
@@ -365,10 +373,16 @@ def build_premium_workbook(
         ws.add_chart(chart, "N4")
     _finalize(ws, freeze=f"A{summary_start + 1}", max_width=48)
 
-    # 2. Net profit with seller-entered operating expenses
+    # 2. Business result with Uzum ledger and seller-entered external expenses
     if business_profit:
-        ws = wb.create_sheet(_sheet_name(lang, "Чистая прибыль", "Sof foyda"))
-        _title(ws, _t(lang, "Чистая прибыль и расходы — 30 дней", "Sof foyda va xarajatlar — 30 kun"), end_col=4)
+        result_is_complete = bool(business_profit.get("complete"))
+        result_name = _t(
+            lang,
+            "Чистая прибыль" if result_is_complete else "Результат по известным данным",
+            "Sof foyda" if result_is_complete else "Ma’lum ma’lumotlar natijasi",
+        )
+        ws = wb.create_sheet(_sheet_name(lang, "Прибыль", "Foyda"))
+        _title(ws, f"{result_name} — 30 {_t(lang, 'дней', 'kun')}", end_col=4)
         ws.append([
             _t(lang, "Показатель", "Ko‘rsatkich"),
             _t(lang, "Сумма", "Summa"),
@@ -379,12 +393,13 @@ def build_premium_workbook(
             (_t(lang, "Выручка", "Tushum"), business_profit.get("revenue"), "Uzum Finance API", ""),
             (_t(lang, "Комиссия", "Komissiya"), business_profit.get("commission"), "Uzum Finance API", ""),
             (_t(lang, "Логистика", "Logistika"), business_profit.get("logistics"), "Uzum Finance API", ""),
-            (_t(lang, "Себестоимость", "Tannarx"), business_profit.get("cost_total"), _t(lang, "Данные продавца", "Sotuvchi ma’lumoti"), ""),
+            (_t(lang, "Себестоимость", "Tannarx"), business_profit.get("cost_total"), "Uzum purchasePrice", ""),
             (_t(lang, "Налог", "Soliq"), business_profit.get("tax_expense"), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi"), f"{float(finance_settings.get('tax_percent') or 0):.2f}%"),
-            (_t(lang, "Реклама", "Reklama"), business_profit.get("advertising_expense"), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi"), _t(lang, "За 30 дней", "30 kun uchun")),
-            (_t(lang, "Хранение", "Saqlash"), business_profit.get("storage_expense"), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi"), _t(lang, "За 30 дней", "30 kun uchun")),
-            (_t(lang, "Другие расходы", "Boshqa xarajat"), business_profit.get("other_expense"), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi"), _t(lang, "За 30 дней", "30 kun uchun")),
-            (_t(lang, "Чистая прибыль", "Sof foyda"), business_profit.get("net_profit"), _t(lang, "Расчёт бота", "Bot hisobi"), f"{float(business_profit.get('net_margin') or 0):.1f}%"),
+            (_t(lang, "Расходы Uzum", "Uzum xarajatlari"), business_profit.get("uzum_expense_total"), "Uzum Finance API", ""),
+            (_t(lang, "Внешняя реклама", "Tashqi reklama"), business_profit.get("advertising_expense"), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi"), _t(lang, "За 30 дней", "30 kun uchun")),
+            (_t(lang, "Внешнее хранение", "Tashqi saqlash"), business_profit.get("storage_expense"), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi"), _t(lang, "За 30 дней", "30 kun uchun")),
+            (_t(lang, "Другие внешние расходы", "Boshqa tashqi xarajat"), business_profit.get("other_expense"), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi"), _t(lang, "За 30 дней", "30 kun uchun")),
+            (result_name, business_profit.get("net_profit"), _t(lang, "Расчёт бота", "Bot hisobi"), f"{float(business_profit.get('net_margin') or 0):.1f}%"),
         ]
         for row in expense_rows:
             ws.append(list(row))
@@ -402,8 +417,8 @@ def build_premium_workbook(
         ws.cell(note_row, 2).number_format = "0.0%"
         ws.cell(note_row + 1, 1, _t(
             lang,
-            "Если покрытие ниже 100%, чистая прибыль неполная: для части продаж не указана себестоимость.",
-            "Qamrov 100% dan past bo‘lsa, sof foyda to‘liq emas: ayrim savdolarning tannarxi kiritilmagan.",
+            "Себестоимость берётся только из Uzum purchasePrice. Если покрытие ниже 100% или API расходов недоступен, показан только результат по известным данным.",
+            "Tannarx faqat Uzum purchasePrice’dan olinadi. Qamrov 100% dan past yoki xarajatlar API mavjud bo‘lmasa, faqat ma’lum ma’lumotlar natijasi ko‘rsatiladi.",
         ))
         ws.merge_cells(start_row=note_row + 1, start_column=1, end_row=note_row + 1, end_column=4)
         _finalize(ws, freeze="A3", max_width=55)
@@ -534,10 +549,13 @@ def build_premium_workbook(
 
     # 6. Stock with sell-through forecast
     ws = wb.create_sheet(_sheet_name(lang, "Остатки", "Qoldiqlar"))
-    _title(ws, _t(lang, "Остатки и прогноз пополнения", "Qoldiq va to‘ldirish prognozi"), end_col=15)
+    _title(ws, _t(lang, "Остатки и прогноз пополнения", "Qoldiq va to‘ldirish prognozi"), end_col=20)
     headers = [
         "Product ID", "SKU ID", "Barcode", _t(lang, "Товар", "Tovar"), "SKU",
-        _t(lang, "Цена", "Narx"), "FBO", "FBS/DBS", _t(lang, "Итого", "Jami"),
+        _t(lang, "Цена продажи", "Sotuv narxi"), _t(lang, "Себестоимость Uzum", "Uzum tannarxi"),
+        "ИКПУ / МХИК", _t(lang, "Платное хранение", "Pullik saqlash"),
+        _t(lang, "Тариф хранения", "Saqlash tarifi"), _t(lang, "Начислено хранения", "Saqlash hisoblandi"),
+        "FBO", "FBS/DBS", _t(lang, "Итого", "Jami"),
         _t(lang, "Продано за 7 дней", "7 kunda sotildi"), _t(lang, "Хватит, дней", "Yetadi, kun"),
         _t(lang, "Потеряно", "Yo‘qolgan"), _t(lang, "Брак", "Yaroqsiz"),
         _t(lang, "Статус", "Holat"), _t(lang, "Рекомендуемое действие", "Tavsiya etilgan amal"),
@@ -547,19 +565,22 @@ def build_premium_workbook(
         ws.append([
             str(row.get("product_id") or ""), str(row.get("sku_id") or ""), str(row.get("barcode") or ""),
             row.get("title"), str(row.get("sku") or ""), float(row.get("price") or 0),
+            row.get("purchase_price"), str(row.get("ikpu") or ""),
+            _t(lang, "Да", "Ha") if row.get("paid_storage") else _t(lang, "Нет", "Yo‘q"),
+            row.get("paid_storage_price_item"), row.get("paid_storage_amount"),
             float(row.get("fbo") or 0), float(row.get("fbs") or 0), float(row.get("total") or 0),
             float(row.get("sold_7") or 0), row.get("days_left"), float(row.get("missing") or 0),
             float(row.get("defected") or 0), row.get("status"),
             row.get("action_uz") if lang == "uz" else row.get("action_ru"),
         ])
     end = ws.max_row
-    _header(ws, 2, 1, 15)
-    _style_body(ws, 3, end, 1, 15)
-    _money(ws, ("F",), 3)
-    _add_table(ws, 2, end, 15, "StockForecast")
+    _header(ws, 2, 1, 20)
+    _style_body(ws, 3, end, 1, 20)
+    _money(ws, ("F", "G", "J", "K"), 3)
+    _add_table(ws, 2, end, 20, "StockForecast")
     if end >= 3:
-        ws.conditional_formatting.add(f"I3:I{end}", ColorScaleRule(start_type="min", start_color=RED, mid_type="percentile", mid_value=50, mid_color=AMBER, end_type="max", end_color=GREEN))
-        ws.conditional_formatting.add(f"K3:K{end}", ColorScaleRule(start_type="min", start_color=RED, mid_type="percentile", mid_value=50, mid_color=AMBER, end_type="max", end_color=GREEN))
+        ws.conditional_formatting.add(f"N3:N{end}", ColorScaleRule(start_type="min", start_color=RED, mid_type="percentile", mid_value=50, mid_color=AMBER, end_type="max", end_color=GREEN))
+        ws.conditional_formatting.add(f"P3:P{end}", ColorScaleRule(start_type="min", start_color=RED, mid_type="percentile", mid_value=50, mid_color=AMBER, end_type="max", end_color=GREEN))
     _finalize(ws, freeze="A3", max_width=48)
 
     # 7. Full action list
@@ -691,6 +712,18 @@ FBO_ACCEPTANCE_CHECK_INTERVAL_SECONDS = int(
 FBO_ACCEPTANCE_INVOICE_PAGES = max(
     1,
     min(20, int(os.getenv("FBO_ACCEPTANCE_INVOICE_PAGES", "5") or "5")),
+)
+LOGISTICS_REMINDER_CHECK_INTERVAL_SECONDS = max(
+    300,
+    int(os.getenv("LOGISTICS_REMINDER_CHECK_INTERVAL_SECONDS", "1800") or "1800"),
+)
+LOGISTICS_REMINDER_INVOICE_PAGES = max(
+    1,
+    min(20, int(os.getenv("LOGISTICS_REMINDER_INVOICE_PAGES", "5") or "5")),
+)
+LOGISTICS_REMINDER_RETURN_PAGES = max(
+    1,
+    min(20, int(os.getenv("LOGISTICS_REMINDER_RETURN_PAGES", "5") or "5")),
 )
 UZUM_API_MIN_INTERVAL_SECONDS = max(
     0.1,
@@ -1803,6 +1836,37 @@ def init_unit_economy_tables() -> None:
             )
             """
         )
+        # The legacy ``unit_costs`` table is intentionally preserved so an
+        # upgrade never destroys seller data.  New profit calculations read
+        # exclusively from this Uzum-sourced cache.
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS uzum_sku_financials (
+                telegram_id INTEGER NOT NULL,
+                shop_id INTEGER NOT NULL,
+                sku_key TEXT NOT NULL,
+                aliases_json TEXT NOT NULL DEFAULT '[]',
+                sku_id TEXT,
+                barcode TEXT,
+                seller_item_code TEXT,
+                sku_title TEXT,
+                product_title TEXT,
+                purchase_price REAL,
+                ikpu TEXT,
+                paid_storage_price_item REAL,
+                paid_storage_amount REAL,
+                paid_storage INTEGER NOT NULL DEFAULT 0,
+                fetched_at TEXT NOT NULL,
+                PRIMARY KEY (telegram_id, shop_id, sku_key)
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_uzum_sku_financials_cost
+            ON uzum_sku_financials (telegram_id, shop_id, purchase_price)
+            """
+        )
         conn.commit()
 
 
@@ -1843,13 +1907,63 @@ def delete_unit_cost(telegram_id: int, shop_id: int, sku: str) -> bool:
 
 
 def get_unit_cost_map(telegram_id: int, shop_id: int) -> dict[str, dict[str, Any]]:
+    """Return only costs fetched from Uzum; legacy manual rows are ignored."""
     init_unit_economy_tables()
     with db.connect() as conn:
         rows = conn.execute(
-            "SELECT sku_key, title, cost, updated_at FROM unit_costs WHERE telegram_id = ? AND shop_id = ?",
+            """
+            SELECT sku_key, aliases_json, sku_id, barcode, seller_item_code,
+                   sku_title, product_title, purchase_price, ikpu,
+                   paid_storage_price_item, paid_storage_amount, paid_storage,
+                   fetched_at
+            FROM uzum_sku_financials
+            WHERE telegram_id = ? AND shop_id = ? AND purchase_price > 0
+            """,
             (int(telegram_id), int(shop_id)),
         ).fetchall()
-    return {str(r["sku_key"]): dict(r) for r in rows}
+    result: dict[str, dict[str, Any]] = {}
+    for raw_row in rows:
+        row = dict(raw_row)
+        entry = {
+            **row,
+            "cost": float(row.get("purchase_price") or 0),
+            "title": str(row.get("product_title") or row.get("sku_title") or ""),
+            "source": "uzum",
+            "updated_at": row.get("fetched_at"),
+        }
+        aliases: list[str] = []
+        try:
+            decoded = json.loads(str(row.get("aliases_json") or "[]"))
+            if isinstance(decoded, list):
+                aliases.extend(str(value) for value in decoded)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+        aliases.extend(
+            str(row.get(field) or "")
+            for field in ("sku_key", "sku_id", "barcode", "seller_item_code", "sku_title")
+        )
+        for alias in aliases:
+            key = _unit_sku_key(alias)
+            if key and key not in {"-", "—"}:
+                result[key] = entry
+    return result
+
+
+def list_uzum_sku_financials(
+    telegram_id: int,
+    shop_id: int,
+) -> list[dict[str, Any]]:
+    init_unit_economy_tables()
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM uzum_sku_financials
+            WHERE telegram_id = ? AND shop_id = ?
+            ORDER BY product_title COLLATE NOCASE, sku_title COLLATE NOCASE
+            """,
+            (int(telegram_id), int(shop_id)),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def list_unit_costs(telegram_id: int, shop_id: int, limit: int = 50) -> list[dict[str, Any]]:
@@ -2379,6 +2493,8 @@ PRODUCT_SETTING_FIELDS = {
     "notify_losses",
     "notify_defects",
     "notify_fbo_acceptance",
+    "notify_supply_reminders",
+    "notify_return_pickup",
     "daily_enabled",
     "daily_hour",
     "weekly_enabled",
@@ -2418,6 +2534,8 @@ def init_product_value_tables() -> None:
                 notify_losses INTEGER NOT NULL DEFAULT 1,
                 notify_defects INTEGER NOT NULL DEFAULT 1,
                 notify_fbo_acceptance INTEGER NOT NULL DEFAULT 1,
+                notify_supply_reminders INTEGER NOT NULL DEFAULT 1,
+                notify_return_pickup INTEGER NOT NULL DEFAULT 1,
                 daily_enabled INTEGER NOT NULL DEFAULT 0,
                 daily_hour INTEGER NOT NULL DEFAULT 9,
                 weekly_enabled INTEGER NOT NULL DEFAULT 0,
@@ -2437,7 +2555,13 @@ def init_product_value_tables() -> None:
         existing_product_columns = {
             str(row[1]) for row in conn.execute("PRAGMA table_info(product_settings)").fetchall()
         }
-        for column in ("notify_losses", "notify_defects", "notify_fbo_acceptance"):
+        for column in (
+            "notify_losses",
+            "notify_defects",
+            "notify_fbo_acceptance",
+            "notify_supply_reminders",
+            "notify_return_pickup",
+        ):
             if column not in existing_product_columns:
                 conn.execute(
                     f"ALTER TABLE product_settings ADD COLUMN {column} INTEGER NOT NULL DEFAULT 1"
@@ -3876,7 +4000,7 @@ SALES_MORE_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Бизнес-сводка"), KeyboardButton(text="🌐 Все магазины")],
         [KeyboardButton(text="🐢 Не продаётся"), KeyboardButton(text="🧾 Юнит-экономика")],
-        [KeyboardButton(text="📥 Себестоимость Excel"), KeyboardButton(text="🧮 Расходы и налоги")],
+        [KeyboardButton(text="🔄 Себестоимость Uzum"), KeyboardButton(text="🧮 Расходы и налоги")],
         [KeyboardButton(text="⬅️ Продажи"), KeyboardButton(text="🏠 Главное")],
     ],
     resize_keyboard=True,
@@ -3887,7 +4011,7 @@ SALES_MORE_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Biznes xulosa"), KeyboardButton(text="🌐 Barcha do‘konlar")],
         [KeyboardButton(text="🐢 Sotilmayapti"), KeyboardButton(text="🧾 Unit iqtisodiyot")],
-        [KeyboardButton(text="📥 Tannarx Excel"), KeyboardButton(text="🧮 Xarajat va soliq")],
+        [KeyboardButton(text="🔄 Uzum tannarxi"), KeyboardButton(text="🧮 Xarajat va soliq")],
         [KeyboardButton(text="⬅️ Savdo"), KeyboardButton(text="🏠 Asosiy")],
     ],
     resize_keyboard=True,
@@ -3898,6 +4022,7 @@ STOCK_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📦 Все остатки"), KeyboardButton(text="🚚 Что заказать")],
         [KeyboardButton(text="🧭 Потери и брак"), KeyboardButton(text="🏷 Этикетки SKU")],
+        [KeyboardButton(text="🧾 ИКПУ / МХИК")],
         [KeyboardButton(text="⚙️ Срок поставки")],
         [KeyboardButton(text="🏠 Главное")],
     ],
@@ -3909,6 +4034,7 @@ STOCK_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📦 Barcha qoldiq"), KeyboardButton(text="🚚 Nima buyurtma qilish")],
         [KeyboardButton(text="🧭 Yo‘qotish va brak"), KeyboardButton(text="🏷 SKU etiketkalari")],
+        [KeyboardButton(text="🧾 IKPU / MXIK")],
         [KeyboardButton(text="⚙️ Yetkazish muddati")],
         [KeyboardButton(text="🏠 Asosiy")],
     ],
@@ -3984,7 +4110,7 @@ SETTINGS_MENU_UZ = ReplyKeyboardMarkup(
 
 FINANCE_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📥 Себестоимость Excel")],
+        [KeyboardButton(text="🔄 Себестоимость Uzum"), KeyboardButton(text="🧾 Расходы Uzum")],
         [KeyboardButton(text="🧮 Расходы и налоги"), KeyboardButton(text="💰 Прибыль")],
         [KeyboardButton(text="🧾 Юнит-экономика")],
         [KeyboardButton(text="⬅️ Настройки"), KeyboardButton(text="🏠 Главное")],
@@ -3995,7 +4121,7 @@ FINANCE_MENU_RU = ReplyKeyboardMarkup(
 
 FINANCE_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📥 Tannarx Excel")],
+        [KeyboardButton(text="🔄 Uzum tannarxi"), KeyboardButton(text="🧾 Uzum xarajatlari")],
         [KeyboardButton(text="🧮 Xarajat va soliq"), KeyboardButton(text="💰 Foyda")],
         [KeyboardButton(text="🧾 Unit iqtisodiyot")],
         [KeyboardButton(text="⬅️ Sozlamalar"), KeyboardButton(text="🏠 Asosiy")],
@@ -5261,6 +5387,16 @@ def _normalize_current_stock_row(source: dict[str, Any]) -> dict[str, Any]:
         0.0,
         float(_official_stock_number(raw, "avgdquantity", "avgDailyQuantity") or 0.0),
     )
+    # Keep documented financial/catalog values distinct from sale price.
+    if row.get("purchase_price") is None:
+        row["purchase_price"] = _official_stock_number(raw, "purchasePrice")
+    if not row.get("ikpu"):
+        row["ikpu"] = raw.get("ikpu")
+    if row.get("paid_storage_price_item") is None:
+        row["paid_storage_price_item"] = _official_stock_number(raw, "paidStoragePriceItem")
+    if row.get("paid_storage_amount") is None:
+        row["paid_storage_amount"] = _official_stock_number(raw, "paidStorageAmount")
+    row["paid_storage"] = bool(row.get("paid_storage") or raw.get("pstorage"))
     row["duplicate_count"] = max(1, int(row.get("duplicate_count") or 1))
     return row
 
@@ -5294,6 +5430,11 @@ def _normalize_current_stock_rows(rows: list[dict[str, Any]]) -> list[dict[str, 
         "category",
         "price",
         "market_price",
+        "purchase_price",
+        "ikpu",
+        "paid_storage_price_item",
+        "paid_storage_amount",
+        "paid_storage",
         "status",
     )
 
@@ -5347,6 +5488,155 @@ async def load_sku_rows(
         client, shop_id, search_query=search_query, max_pages=max_pages, page_size=100
     )
     return _normalize_current_stock_rows(flatten_sku_rows(products))
+
+
+UZUM_SKU_FINANCE_CACHE_SECONDS = max(
+    60,
+    min(3600, int(os.getenv("UZUM_SKU_FINANCE_CACHE_SECONDS", "600") or "600")),
+)
+_UZUM_SKU_FINANCE_SYNCED_AT: dict[tuple[int, int], float] = {}
+_UZUM_SKU_FINANCE_LOCKS: dict[tuple[int, int], tuple[Any, asyncio.Lock]] = {}
+
+
+def _uzum_sku_finance_lock(key: tuple[int, int]) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    stored = _UZUM_SKU_FINANCE_LOCKS.get(key)
+    if stored is None or stored[0] is not loop:
+        lock = asyncio.Lock()
+        _UZUM_SKU_FINANCE_LOCKS[key] = (loop, lock)
+        return lock
+    return stored[1]
+
+
+def _uzum_sku_finance_status(
+    telegram_id: int,
+    shop_id: int,
+    *,
+    stale: bool = False,
+) -> dict[str, Any]:
+    rows = list_uzum_sku_financials(telegram_id, shop_id)
+    with_cost = sum(1 for row in rows if float(row.get("purchase_price") or 0) > 0)
+    with_ikpu = sum(1 for row in rows if str(row.get("ikpu") or "").strip())
+    paid_storage = sum(1 for row in rows if int(row.get("paid_storage") or 0))
+    fetched_values = [str(row.get("fetched_at") or "") for row in rows if row.get("fetched_at")]
+    return {
+        "total": len(rows),
+        "with_cost": with_cost,
+        "missing_cost": max(0, len(rows) - with_cost),
+        "with_ikpu": with_ikpu,
+        "missing_ikpu": max(0, len(rows) - with_ikpu),
+        "paid_storage": paid_storage,
+        "fetched_at": max(fetched_values) if fetched_values else None,
+        "stale": bool(stale),
+    }
+
+
+def _replace_uzum_sku_financials(
+    telegram_id: int,
+    shop_id: int,
+    stock_rows: list[dict[str, Any]],
+) -> dict[str, Any]:
+    records = build_stock_records(stock_rows)
+    now_text = _dt_to_db(_utc_now()) or ""
+    values = [
+        (
+            int(telegram_id),
+            int(shop_id),
+            str(record.get("sku_key") or ""),
+            json.dumps(record.get("aliases") or [], ensure_ascii=False),
+            str(record.get("sku_id") or ""),
+            str(record.get("barcode") or ""),
+            str(record.get("seller_item_code") or ""),
+            str(record.get("sku_title") or ""),
+            str(record.get("product_title") or ""),
+            record.get("purchase_price"),
+            str(record.get("ikpu") or ""),
+            record.get("paid_storage_price_item"),
+            record.get("paid_storage_amount"),
+            1 if record.get("paid_storage") else 0,
+            now_text,
+        )
+        for record in records
+        if str(record.get("sku_key") or "")
+    ]
+    init_unit_economy_tables()
+    with db.connect() as conn:
+        conn.execute(
+            "DELETE FROM uzum_sku_financials WHERE telegram_id = ? AND shop_id = ?",
+            (int(telegram_id), int(shop_id)),
+        )
+        if values:
+            conn.executemany(
+                """
+                INSERT INTO uzum_sku_financials (
+                    telegram_id, shop_id, sku_key, aliases_json, sku_id,
+                    barcode, seller_item_code, sku_title, product_title,
+                    purchase_price, ikpu, paid_storage_price_item,
+                    paid_storage_amount, paid_storage, fetched_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                values,
+            )
+        conn.commit()
+    return _uzum_sku_finance_status(telegram_id, shop_id)
+
+
+async def sync_uzum_sku_financials(
+    client: UzumClient,
+    telegram_id: int,
+    shop_id: int,
+    *,
+    stock_rows: list[dict[str, Any]] | None = None,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Refresh purchase prices/catalog fields exclusively from Uzum.
+
+    A temporary blank/error response never overwrites a non-empty cache.  This
+    keeps reports stable during an Uzum outage while the UI marks cached data.
+    """
+    key = (int(telegram_id), int(shop_id))
+    cached_rows = list_uzum_sku_financials(*key)
+    last_sync = _UZUM_SKU_FINANCE_SYNCED_AT.get(key, 0.0)
+    if not force and cached_rows and time.monotonic() - last_sync < UZUM_SKU_FINANCE_CACHE_SECONDS:
+        return _uzum_sku_finance_status(*key)
+
+    async with _uzum_sku_finance_lock(key):
+        cached_rows = list_uzum_sku_financials(*key)
+        last_sync = _UZUM_SKU_FINANCE_SYNCED_AT.get(key, 0.0)
+        if not force and cached_rows and time.monotonic() - last_sync < UZUM_SKU_FINANCE_CACHE_SECONDS:
+            return _uzum_sku_finance_status(*key)
+        try:
+            rows = stock_rows
+            if rows is None:
+                rows = await load_sku_rows(client, int(shop_id), max_pages=100)
+            if not rows and cached_rows:
+                logging.warning(
+                    "Uzum SKU finance sync returned empty rows; keeping cache user=%s shop=%s",
+                    telegram_id,
+                    shop_id,
+                )
+                return _uzum_sku_finance_status(*key, stale=True)
+            status = _replace_uzum_sku_financials(*key, list(rows or []))
+            _UZUM_SKU_FINANCE_SYNCED_AT[key] = time.monotonic()
+            logging.info(
+                "Uzum SKU finance sync user=%s shop=%s sku=%s with_cost=%s missing=%s ikpu=%s",
+                telegram_id,
+                shop_id,
+                status["total"],
+                status["with_cost"],
+                status["missing_cost"],
+                status["with_ikpu"],
+            )
+            return status
+        except Exception:
+            if cached_rows:
+                logging.exception(
+                    "Uzum SKU finance sync failed; using cached data user=%s shop=%s",
+                    telegram_id,
+                    shop_id,
+                )
+                return _uzum_sku_finance_status(*key, stale=True)
+            raise
 
 
 async def connect_token(
@@ -6931,6 +7221,148 @@ async def _load_finance_range_flexible(
     return all_rows, first_response, "; ".join(used_attempts)
 
 
+UZUM_EXPENSE_MAX_PAGES = max(
+    1,
+    min(200, int(os.getenv("UZUM_EXPENSE_MAX_PAGES", "100") or "100")),
+)
+UZUM_EXPENSE_CACHE_SECONDS = max(
+    30,
+    min(1800, int(os.getenv("UZUM_EXPENSE_CACHE_SECONDS", "300") or "300")),
+)
+_UZUM_EXPENSE_CACHE: dict[tuple[str, int, int, int], tuple[float, dict[str, Any]]] = {}
+_UZUM_EXPENSE_LOCKS: dict[tuple[str, int, int, int], tuple[Any, asyncio.Lock]] = {}
+
+
+def _uzum_expense_cache_key(
+    client: UzumClient,
+    shop_id: int,
+    date_from_ms: int,
+    date_to_ms: int,
+) -> tuple[str, int, int, int]:
+    token = str((getattr(client, "headers", {}) or {}).get("Authorization") or "")
+    fingerprint = hashlib.sha256(token.encode("utf-8")).hexdigest()[:20]
+    return fingerprint, int(shop_id), int(date_from_ms), int(date_to_ms)
+
+
+def _uzum_expense_lock(key: tuple[str, int, int, int]) -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    stored = _UZUM_EXPENSE_LOCKS.get(key)
+    if stored is None or stored[0] is not loop:
+        lock = asyncio.Lock()
+        _UZUM_EXPENSE_LOCKS[key] = (loop, lock)
+        return lock
+    return stored[1]
+
+
+async def _load_uzum_expense_rows_attempt(
+    client: UzumClient,
+    shop_id: int,
+    *,
+    date_from: int,
+    date_to: int,
+) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for page in range(UZUM_EXPENSE_MAX_PAGES):
+        data = await client.get_expenses(
+            shop_id=int(shop_id),
+            date_from=int(date_from),
+            date_to=int(date_to),
+            page=page,
+            size=100,
+        )
+        rows = expense_items(data)
+        if not rows:
+            break
+        for row in rows:
+            raw = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
+            signature = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+            if signature not in seen:
+                seen.add(signature)
+                result.append(row)
+        if len(rows) < 100:
+            break
+        await asyncio.sleep(0.04)
+    if len(result) >= UZUM_EXPENSE_MAX_PAGES * 100:
+        logging.warning(
+            "Uzum expenses reached safety limit shop=%s rows=%s",
+            shop_id,
+            len(result),
+        )
+    return result
+
+
+async def load_uzum_expense_summary(
+    client: UzumClient,
+    shop_id: int,
+    date_from_ms: int,
+    date_to_ms: int,
+    *,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Load booked Uzum expenses with timestamp compatibility and caching."""
+    key = _uzum_expense_cache_key(client, shop_id, date_from_ms, date_to_ms)
+    cached = _UZUM_EXPENSE_CACHE.get(key)
+    if not force and cached and time.monotonic() - cached[0] < UZUM_EXPENSE_CACHE_SECONDS:
+        return dict(cached[1])
+
+    async with _uzum_expense_lock(key):
+        cached = _UZUM_EXPENSE_CACHE.get(key)
+        if not force and cached and time.monotonic() - cached[0] < UZUM_EXPENSE_CACHE_SECONDS:
+            return dict(cached[1])
+        errors: list[str] = []
+        rows: list[dict[str, Any]] = []
+        date_mode = "milliseconds"
+        # Swagger declares int64 but deployments have historically differed on
+        # dateFrom units. Try the documented millisecond range first, then the
+        # compatibility form already required by Finance orders.
+        attempts = (
+            (int(date_from_ms), int(date_to_ms), "milliseconds"),
+            (int(date_from_ms / 1000), int(date_to_ms), "seconds/milliseconds"),
+        )
+        for attempt_from, attempt_to, label in attempts:
+            try:
+                rows = await _load_uzum_expense_rows_attempt(
+                    client,
+                    shop_id,
+                    date_from=attempt_from,
+                    date_to=attempt_to,
+                )
+                date_mode = label
+                if rows:
+                    break
+            except Exception as error:
+                errors.append(f"{label}: {error}")
+                logging.info(
+                    "Uzum expenses attempt failed shop=%s mode=%s: %s",
+                    shop_id,
+                    label,
+                    error,
+                )
+        if not rows and len(errors) == len(attempts):
+            summary = {
+                **summarize_expenses([]),
+                "available": False,
+                "date_mode": date_mode,
+                "error": errors[-1] if errors else "Uzum expenses unavailable",
+            }
+            return summary
+        summary = {
+            **summarize_expenses(rows),
+            "available": True,
+            "date_mode": date_mode,
+            "error": None,
+        }
+        _UZUM_EXPENSE_CACHE[key] = (time.monotonic(), dict(summary))
+        if len(_UZUM_EXPENSE_CACHE) > 200:
+            stale_before = time.monotonic() - UZUM_EXPENSE_CACHE_SECONDS * 3
+            for cache_key, (saved_at, _) in list(_UZUM_EXPENSE_CACHE.items()):
+                if saved_at < stale_before:
+                    _UZUM_EXPENSE_CACHE.pop(cache_key, None)
+                    _UZUM_EXPENSE_LOCKS.pop(cache_key, None)
+        return summary
+
+
 def _is_returned_status(status: str) -> bool:
     value = str(status or "").upper()
     return "RETURN" in value or "ВОЗВРАТ" in value or "QAYTAR" in value
@@ -7171,9 +7603,9 @@ def _format_premium_period_report(
                 f"📌 Tannarx bilan qamrov: <b>{coverage * 100:.1f}%</b>",
             ])
             if coverage < 0.999:
-                lines.append("<i>Foyda faqat tannarxi kiritilgan savdolar bo‘yicha hisoblangan.</i>")
+                lines.append("<i>Foyda faqat Uzum purchasePrice bergan savdolar bo‘yicha hisoblangan.</i>")
         else:
-            lines.extend(["", "🧾 Foydani hisoblash uchun tannarxni Excel orqali yuklang."])
+            lines.extend(["", "🧾 Uzum bu savdolar uchun purchasePrice bermadi. Bot tannarxni taxmin qilmaydi."])
         if top_products:
             lines.extend(["", "🏆 <b>Tushum bo‘yicha top-3:</b>"])
             for index, product in enumerate(top_products, start=1):
@@ -7205,9 +7637,9 @@ def _format_premium_period_report(
                 f"📌 Покрытие себестоимостью: <b>{coverage * 100:.1f}%</b>",
             ])
             if coverage < 0.999:
-                lines.append("<i>Прибыль рассчитана только по продажам с заполненной себестоимостью.</i>")
+                lines.append("<i>Прибыль рассчитана только по продажам, для которых Uzum передал purchasePrice.</i>")
         else:
-            lines.extend(["", "🧾 Загрузите себестоимость через Excel, чтобы увидеть расчётную прибыль."])
+            lines.extend(["", "🧾 Uzum не передал purchasePrice для этих продаж. Бот не подставляет себестоимость приблизительно."])
         if top_products:
             lines.extend(["", "🏆 <b>Топ-3 по выручке:</b>"])
             for index, product in enumerate(top_products, start=1):
@@ -7271,6 +7703,7 @@ async def _send_premium_period_report(
             date_to - shift_ms,
         )
         previous_stats = _build_noorza_today_stats(previous_rows)
+        await sync_uzum_sku_financials(client, telegram_id, shop_id)
         costs = get_unit_cost_map(telegram_id, shop_id)
         unit_rows = _build_unit_rows_from_finance(rows, costs)
         profit_summary = _profit_summary_from_unit_rows(unit_rows, stats)
@@ -7618,8 +8051,8 @@ def _extract_list_any(data: Any) -> list[Any]:
         pass
     if isinstance(data, dict):
         for key in (
-            "content", "items", "data", "result", "results", "list", "records",
-            "invoices", "invoiceList", "productList", "products",
+            "payload", "content", "items", "data", "result", "results", "list", "records",
+            "invoices", "invoiceList", "productList", "products", "returns", "returnList",
         ):
             value = data.get(key)
             if isinstance(value, list):
@@ -7825,7 +8258,9 @@ def _format_invoice_product_line(item: dict[str, Any], idx: int) -> str:
     item_id = _value_by_path(item, "id", "skuId", "productId")
     to_stock = _value_by_path(item, "quantityToStock", "toStock", "quantity")
     accepted = _value_by_path(item, "quantityAccepted", "accepted", "acceptedQuantity")
-    purchase_price = _value_by_path(item, "purchasePrice", "price", "buyPrice")
+    # Only the documented Uzum purchasePrice is a cost. ``price`` can be the
+    # sale price and must never be used as a profitability fallback.
+    purchase_price = _value_by_path(item, "purchasePrice")
     diff = _num_any(to_stock) - _num_any(accepted)
 
     lines = [f"{idx}. <b>{title}</b>"]
@@ -7894,7 +8329,7 @@ async def fbo_invoice_products(message: Message) -> None:
         total_accepted = sum(_num_any(_value_by_path(x, "quantityAccepted", "accepted", "acceptedQuantity")) for x in products)
         diff = total_to_stock - total_accepted
         total_purchase = sum(
-            _num_any(_value_by_path(x, "purchasePrice", "price", "buyPrice"))
+            _num_any(_value_by_path(x, "purchasePrice"))
             * _num_any(_value_by_path(x, "quantityToStock", "toStock", "quantity"))
             for x in products
         )
@@ -10086,7 +10521,12 @@ async def export_products(message: Message) -> None:
             "Category",
             "Product title",
             "SKU title",
-            "Price",
+            "Цена продажи",
+            "Себестоимость Uzum",
+            "ИКПУ / МХИК",
+            "Платное хранение",
+            "Тариф хранения / SKU",
+            "Начислено хранения",
             "FBO / склад Uzum",
             "FBS/DBS / склад продавца",
             "Итого доступно",
@@ -10109,6 +10549,11 @@ async def export_products(message: Message) -> None:
                 excel_value(r.get("product_title")),
                 excel_value(r.get("sku_full_title") or r.get("sku_title")),
                 excel_value(r.get("price")),
+                excel_value(r.get("purchase_price")),
+                excel_value(r.get("ikpu")),
+                "Да" if r.get("paid_storage") else "Нет",
+                excel_value(r.get("paid_storage_price_item")),
+                excel_value(r.get("paid_storage_amount")),
                 excel_value(r.get("fbo")),
                 excel_value(r.get("fbs")),
                 excel_value(r.get("total")),
@@ -10305,6 +10750,11 @@ def _build_stock_report_rows(
             "title": row.get("product_title") or row.get("sku_full_title") or row.get("sku_title") or "Без названия",
             "sku": row.get("sku_full_title") or row.get("sku_title") or row.get("sku_id") or row.get("barcode"),
             "price": price,
+            "purchase_price": row.get("purchase_price"),
+            "ikpu": row.get("ikpu"),
+            "paid_storage": bool(row.get("paid_storage")),
+            "paid_storage_price_item": row.get("paid_storage_price_item"),
+            "paid_storage_amount": row.get("paid_storage_amount"),
             "fbo": fbo,
             "fbs": fbs,
             "total": total,
@@ -10429,8 +10879,8 @@ def _build_premium_actions(
             add(
                 "warning", "Нет себестоимости", "Tannarx yo‘q", title, sku,
                 "Прибыль по товару нельзя рассчитать.", "Tovar foydasini hisoblab bo‘lmaydi.",
-                "Добавить себестоимость через шаблон Excel.", "Excel shabloni orqali tannarx kiriting.",
-                revenue, "Себестоимость",
+                "Проверить purchasePrice в карточке или накладной Uzum.", "Uzum kartasi yoki yuk xatidagi purchasePrice ni tekshiring.",
+                revenue, "Себестоимость Uzum",
             )
         else:
             profit = float(item.get("profit") or 0)
@@ -10497,6 +10947,13 @@ async def _build_full_excel_report(
             source_notes.append(f"{key}: {source_info}")
         await asyncio.sleep(0.1)
 
+    stock_raw = await load_sku_rows(client, shop_id, max_pages=50)
+    await sync_uzum_sku_financials(
+        client,
+        telegram_id,
+        shop_id,
+        stock_rows=stock_raw,
+    )
     costs = get_unit_cost_map(telegram_id, shop_id)
     period_payloads = [
         _period_payload(key, finance_by_period.get(key, []), costs)
@@ -10507,14 +10964,20 @@ async def _build_full_excel_report(
     product_rows = _build_unit_rows_from_finance(rows_30, costs)
     profit_30 = _profit_summary_from_unit_rows(product_rows, stats_30)
     finance_settings = ensure_finance_settings(telegram_id, shop_id)
+    uzum_expenses = await load_uzum_expense_summary(
+        client,
+        shop_id,
+        current_30_from,
+        current_30_to,
+    )
     business_profit = calculate_business_profit(
         profit_30,
         stats_30,
         finance_settings,
         days=30,
+        uzum_expenses=uzum_expenses,
     )
 
-    stock_raw = await load_sku_rows(client, shop_id, max_pages=50)
     stock_rows, _ = _build_stock_report_rows(stock_raw, finance_by_period.get("7d", []))
     product_settings = ensure_product_settings(telegram_id)
     replenishment = build_replenishment_plan(stock_raw, rows_30, product_settings)
@@ -10756,10 +11219,10 @@ def _pdf_management_actions(
     if missing_costs:
         actions.append({
             "priority": "warning",
-            "title_ru": "Заполнить себестоимость",
-            "title_uz": "Tannarxni to‘ldirish",
-            "body_ru": f"Без себестоимости осталось {missing_costs} SKU. До заполнения прибыль показана только по известной части продаж.",
-            "body_uz": f"{missing_costs} SKU tannarxsiz. To‘ldirilguncha foyda faqat ma’lum savdo qismi bo‘yicha ko‘rsatiladi.",
+            "title_ru": "Проверить себестоимость в Uzum",
+            "title_uz": "Uzum tannarxini tekshirish",
+            "body_ru": f"Uzum не передал purchasePrice для {missing_costs} SKU. Прибыль показана только по известной части продаж.",
+            "body_uz": f"Uzum {missing_costs} SKU uchun purchasePrice bermadi. Foyda faqat ma’lum savdo qismi bo‘yicha ko‘rsatiladi.",
         })
 
     no_sales_count = sum(
@@ -10835,26 +11298,52 @@ async def _collect_seller_pdf_payload(
 
     stats = _build_noorza_today_stats(rows)
     previous_stats = _build_noorza_today_stats(previous_rows)
-    costs = get_unit_cost_map(telegram_id, shop_id)
-    products = _build_unit_rows_from_finance(rows, costs)
-    profit = _profit_summary_from_unit_rows(products, stats)
     product_settings = ensure_product_settings(telegram_id)
 
     stock_rows: list[dict[str, Any]] = []
     stock_data_available = True
+    cost_data_stale = False
     try:
         stock_raw = await load_sku_rows(client, shop_id, max_pages=50)
+        cost_status = await sync_uzum_sku_financials(
+            client,
+            telegram_id,
+            shop_id,
+            stock_rows=stock_raw,
+        )
+        cost_data_stale = bool(cost_status.get("stale"))
         stock_rows, _ = _build_stock_report_rows(stock_raw, sales_7)
         threshold = int(product_settings.get("low_stock_threshold") or 5)
         for row in stock_rows:
             row["low_stock_threshold"] = threshold
     except Exception:
         stock_data_available = False
+        cost_data_stale = True
         logging.exception(
             "PDF report: stock section unavailable user=%s shop=%s",
             telegram_id,
             shop_id,
         )
+
+    costs = get_unit_cost_map(telegram_id, shop_id)
+    products = _build_unit_rows_from_finance(rows, costs)
+    profit = _profit_summary_from_unit_rows(products, stats)
+    finance_settings = ensure_finance_settings(telegram_id, shop_id)
+    uzum_expenses = await load_uzum_expense_summary(
+        client,
+        shop_id,
+        date_from,
+        date_to,
+    )
+    business_profit = calculate_business_profit(
+        profit,
+        stats,
+        finance_settings,
+        days=period_days,
+        uzum_expenses=uzum_expenses,
+    )
+    if cost_data_stale:
+        business_profit["complete"] = False
 
     cumulative_defects: list[dict[str, Any]] = []
     loss_data_available = True
@@ -10903,6 +11392,10 @@ async def _collect_seller_pdf_payload(
         data_notes.append("stock_unavailable")
     if not loss_data_available:
         data_notes.append("loss_data_unavailable")
+    if cost_data_stale:
+        data_notes.append("cost_data_stale")
+    if not bool(business_profit.get("uzum_expenses_available")):
+        data_notes.append("expenses_unavailable")
 
     return {
         "shop_id": shop_id,
@@ -10914,6 +11407,8 @@ async def _collect_seller_pdf_payload(
         "previous_stats": previous_stats,
         "comparison_available": comparison_available,
         "profit": profit,
+        "business_profit": business_profit,
+        "finance_settings": finance_settings,
         "daily": daily,
         "products": products,
         "stock": stock_rows,
@@ -11962,7 +12457,7 @@ def _attention_recommendation_ru(low_count: int, zero_count: int, dead_count: in
     if low_count > 0:
         return "Сначала проверьте товары, которые скоро закончатся, особенно если они хорошо продаются."
     if missing_cost > 0:
-        return "Загрузите себестоимость через Excel, чтобы бот точнее считал прибыль и маржу."
+        return "Проверьте purchasePrice в карточках Uzum: бот берёт себестоимость только из Uzum и не подставляет её вручную."
     if low_margin > 0:
         return "Проверьте товары с низкой маржой: возможно, цена или себестоимость указаны невыгодно."
     if dead_count > 0:
@@ -11978,7 +12473,7 @@ def _attention_recommendation_uz(low_count: int, zero_count: int, dead_count: in
     if low_count > 0:
         return "Avval tez tugayotgan tovarlarni tekshiring, ayniqsa ular yaxshi sotilayotgan bo‘lsa."
     if missing_cost > 0:
-        return "Foyda va marjani aniq hisoblash uchun tannarxni Excel orqali yuklang."
+        return "Uzum kartalaridagi purchasePrice qiymatini tekshiring: bot tannarxni faqat Uzumdan oladi va qo‘lda almashtirmaydi."
     if low_margin > 0:
         return "Past marjali tovarlarni tekshiring: narx yoki tannarx foydasiz bo‘lishi mumkin."
     if dead_count > 0:
@@ -12265,6 +12760,77 @@ async def button_attention_missing_cost(message: Message) -> None:
 @dp.message(F.text == "📉 Низкая прибыль")
 async def button_attention_low_margin(message: Message) -> None:
     await profit_report(message)
+
+
+@dp.message(Command("ikpu", "mxik", "catalog_codes"))
+@dp.message(F.text.in_({"🧾 ИКПУ / МХИК", "🧾 IKPU / MXIK"}))
+async def ikpu_catalog_report(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    telegram_id, client, shop_id = req
+    if not await require_premium_subscription(message, telegram_id):
+        return
+    lang = get_user_language(telegram_id)
+    await message.answer(
+        "⌛ IKPU / MXIK kodlarini Uzumdan tekshiryapman..."
+        if lang == "uz"
+        else "⌛ Проверяю ИКПУ / МХИК по данным Uzum...",
+        reply_markup=stock_menu_for_message(message),
+    )
+    try:
+        status = await sync_uzum_sku_financials(
+            client,
+            telegram_id,
+            shop_id,
+            force=True,
+        )
+        rows = list_uzum_sku_financials(telegram_id, shop_id)
+        missing_rows = [row for row in rows if not str(row.get("ikpu") or "").strip()]
+        total = int(status.get("total") or 0)
+        with_ikpu = int(status.get("with_ikpu") or 0)
+        coverage = with_ikpu / total * 100.0 if total else 0.0
+        title = "🧾 <b>IKPU / MXIK tekshiruvi</b>" if lang == "uz" else "🧾 <b>Проверка ИКПУ / МХИК</b>"
+        summary = [
+            f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
+            f"📦 SKU jami: <b>{total}</b>" if lang == "uz" else f"📦 Всего SKU: <b>{total}</b>",
+            f"✅ Kod bor: <b>{with_ikpu}</b> | ⚠️ Kod yo‘q: <b>{len(missing_rows)}</b>" if lang == "uz" else f"✅ Код заполнен: <b>{with_ikpu}</b> | ⚠️ Нет кода: <b>{len(missing_rows)}</b>",
+            f"📊 To‘ldirilgan: <b>{coverage:.1f}%</b>" if lang == "uz" else f"📊 Заполнено: <b>{coverage:.1f}%</b>",
+            "Manba: Uzum Product API dagi <code>ikpu</code> maydoni." if lang == "uz" else "Источник: поле <code>ikpu</code> в Uzum Product API.",
+        ]
+        if not missing_rows:
+            await message.answer(
+                title + "\n\n" + "\n".join(summary) + (
+                    "\n\n✅ Barcha SKUlarda IKPU / MXIK kodi bor."
+                    if lang == "uz"
+                    else "\n\n✅ У всех SKU заполнен код ИКПУ / МХИК."
+                ),
+                reply_markup=stock_menu_for_message(message),
+            )
+            return
+        items: list[str] = []
+        for index, row in enumerate(missing_rows, start=1):
+            product = escape(_short_text(str(row.get("product_title") or row.get("sku_title") or "—"), 80))
+            sku = escape(_short_text(str(row.get("sku_title") or row.get("sku_id") or "—"), 65))
+            article = escape(_short_text(str(row.get("seller_item_code") or "—"), 45))
+            items.append(
+                (
+                    f"{index}. <b>{product}</b>\n🔖 SKU: <code>{sku}</code> | Artikul: <code>{article}</code>\n⚠️ IKPU / MXIK yo‘q"
+                    if lang == "uz"
+                    else f"{index}. <b>{product}</b>\n🔖 SKU: <code>{sku}</code> | Артикул: <code>{article}</code>\n⚠️ ИКПУ / МХИК не заполнен"
+                )
+            )
+        await send_paginated_list(
+            message,
+            kind="ikpu_missing",
+            title=title,
+            summary=summary,
+            items=items,
+            section="stock",
+            reply_markup=stock_menu_for_message(message),
+        )
+    except Exception as error:
+        await send_api_error(message, error)
 
 
 @dp.message(F.text == "❌ Bekor qilishlar")
@@ -13243,6 +13809,254 @@ async def _all_shops_finance_stats(telegram_id: int, client: UzumClient, date_fr
     return _merge_noorza_stats(stats_list), per_shop, len(shops_list)
 
 
+async def _all_shops_business_stats(
+    telegram_id: int,
+    client: UzumClient,
+    date_from: int,
+    date_to: int,
+    *,
+    days: int,
+) -> tuple[dict[str, Any], list[dict[str, Any]], int]:
+    """Build one honest profit view for every connected shop.
+
+    Finance, product costs and marketplace expenses are isolated per shop.
+    A failed shop remains visible in the result instead of silently lowering
+    the aggregate.  Cost is read only from Uzum ``purchasePrice`` cache.
+    """
+    shops_list = await _user_shop_list(telegram_id, client)
+    if not shops_list:
+        default_shop = db.get_default_shop_id(telegram_id)
+        if default_shop:
+            shops_list = [{"shop_id": int(default_shop), "name": "", "raw": {}}]
+
+    stats_list: list[dict[str, Any]] = []
+    per_shop: list[dict[str, Any]] = []
+    for shop in shops_list:
+        sid = int(shop["shop_id"])
+        result: dict[str, Any] = {
+            "shop_id": sid,
+            "name": str(shop.get("name") or ""),
+            "error": None,
+        }
+        try:
+            rows, _, _ = await _load_finance_range_flexible(
+                client,
+                sid,
+                date_from,
+                date_to,
+            )
+            stats = _build_noorza_today_stats(rows)
+            stats_list.append(stats)
+
+            cost_cache_stale = False
+            try:
+                cost_status = await sync_uzum_sku_financials(
+                    client,
+                    telegram_id,
+                    sid,
+                )
+                cost_cache_stale = bool(cost_status.get("stale"))
+            except Exception:
+                cost_cache_stale = True
+                logging.exception(
+                    "All shops business: Uzum purchasePrice sync failed shop=%s",
+                    sid,
+                )
+
+            costs = get_unit_cost_map(telegram_id, sid)
+            products = _build_unit_rows_from_finance(rows, costs)
+            cost_summary = _profit_summary_from_unit_rows(products, stats)
+            expense_summary = await load_uzum_expense_summary(
+                client,
+                sid,
+                date_from,
+                date_to,
+            )
+            settings = ensure_finance_settings(telegram_id, sid)
+            business = calculate_business_profit(
+                cost_summary,
+                stats,
+                settings,
+                days=days,
+                uzum_expenses=expense_summary,
+            )
+            if cost_cache_stale:
+                business["complete"] = False
+            result.update(
+                {
+                    "stats": stats,
+                    "cost_summary": cost_summary,
+                    "business": business,
+                    "cost_cache_stale": cost_cache_stale,
+                }
+            )
+        except Exception as error:
+            result["error"] = str(error)
+            logging.exception("All shops business: failed for shop=%s", sid)
+        per_shop.append(result)
+        await asyncio.sleep(0.15)
+
+    totals = _merge_noorza_stats(stats_list)
+    successful = [row for row in per_shop if not row.get("error")]
+    businesses = [dict(row.get("business") or {}) for row in successful]
+    cost_summaries = [dict(row.get("cost_summary") or {}) for row in successful]
+    total_revenue = float(totals.get("revenue") or 0)
+    known_revenue = sum(float(row.get("known_revenue") or 0) for row in cost_summaries)
+    coverage = known_revenue / total_revenue if total_revenue > 0 else 0.0
+    totals.update(
+        {
+            "cost_total": sum(float(row.get("cost_total") or 0) for row in businesses),
+            "known_profit": sum(float(row.get("known_profit") or 0) for row in businesses),
+            "tax_expense": sum(float(row.get("tax_expense") or 0) for row in businesses),
+            "uzum_expense_total": sum(
+                float(row.get("uzum_expense_total") or 0) for row in businesses
+            ),
+            "external_expense_total": sum(
+                float(row.get("advertising_expense") or 0)
+                + float(row.get("storage_expense") or 0)
+                + float(row.get("other_expense") or 0)
+                for row in businesses
+            ),
+            "net_profit": sum(float(row.get("net_profit") or 0) for row in businesses),
+            "coverage": max(0.0, min(1.0, coverage)),
+            "missing_count": sum(
+                int(row.get("missing_count") or 0) for row in businesses
+            ),
+            "expenses_available": bool(successful)
+            and all(bool(row.get("uzum_expenses_available")) for row in businesses),
+            "complete": len(successful) == len(shops_list)
+            and bool(successful)
+            and all(bool(row.get("complete")) for row in businesses),
+            "successful_shops": len(successful),
+            "failed_shops": max(0, len(shops_list) - len(successful)),
+        }
+    )
+    return totals, per_shop, len(shops_list)
+
+
+def _format_all_shops_business(
+    telegram_id: int,
+    *,
+    days: int,
+    shops_count: int,
+    totals: dict[str, Any],
+    per_shop: list[dict[str, Any]],
+) -> str:
+    lang = get_user_language(telegram_id)
+    uz = normalize_lang(lang) == "uz"
+    complete = bool(totals.get("complete"))
+    coverage = float(totals.get("coverage") or 0)
+    result_label = (
+        "Sof foyda"
+        if uz and complete
+        else "Ma’lum ma’lumotlar bo‘yicha natija"
+        if uz
+        else "Чистая прибыль"
+        if complete
+        else "Результат по известным данным"
+    )
+    if uz:
+        lines = [
+            f"🌐 <b>Barcha do‘konlar — {days} kun</b>",
+            f"🏪 Do‘konlar: <b>{shops_count}</b>",
+            "",
+            f"🛒 Buyurtma: <b>{int(totals.get('orders') or 0)}</b> | 📦 Sotildi: <b>{float(totals.get('units') or 0):.0f}</b>",
+            f"❌ Bekor: <b>{int(totals.get('cancelled') or 0)}</b> | ↩️ Qaytarish: <b>{float(totals.get('returns') or 0):.0f}</b>",
+            f"💵 Tushum: <b>{_format_money(float(totals.get('revenue') or 0))}</b>",
+            f"✅ To‘lovga: <b>{_format_money(float(totals.get('payout_total') or 0))}</b>",
+            "",
+            f"📦 Uzum tannarxi: <b>{_format_money(float(totals.get('cost_total') or 0))}</b>",
+            f"🧾 Uzum xarajatlari: <b>{_format_money(float(totals.get('uzum_expense_total') or 0))}</b>",
+            f"🏛 Soliq: <b>{_format_money(float(totals.get('tax_expense') or 0))}</b>",
+            f"🏢 Tashqi xarajatlar: <b>{_format_money(float(totals.get('external_expense_total') or 0))}</b>",
+            f"💰 {result_label}: <b>{_format_money(float(totals.get('net_profit') or 0))}</b>",
+            f"📌 Tannarx qamrovi: <b>{coverage * 100:.1f}%</b>",
+        ]
+    else:
+        lines = [
+            f"🌐 <b>Все магазины — {days} дней</b>",
+            f"🏪 Магазинов: <b>{shops_count}</b>",
+            "",
+            f"🛒 Заказов: <b>{int(totals.get('orders') or 0)}</b> | 📦 Продано: <b>{float(totals.get('units') or 0):.0f}</b>",
+            f"❌ Отмен: <b>{int(totals.get('cancelled') or 0)}</b> | ↩️ Возвратов: <b>{float(totals.get('returns') or 0):.0f}</b>",
+            f"💵 Выручка: <b>{_format_money(float(totals.get('revenue') or 0))}</b>",
+            f"✅ К выплате: <b>{_format_money(float(totals.get('payout_total') or 0))}</b>",
+            "",
+            f"📦 Себестоимость Uzum: <b>{_format_money(float(totals.get('cost_total') or 0))}</b>",
+            f"🧾 Расходы Uzum: <b>{_format_money(float(totals.get('uzum_expense_total') or 0))}</b>",
+            f"🏛 Налог: <b>{_format_money(float(totals.get('tax_expense') or 0))}</b>",
+            f"🏢 Внешние расходы: <b>{_format_money(float(totals.get('external_expense_total') or 0))}</b>",
+            f"💰 {result_label}: <b>{_format_money(float(totals.get('net_profit') or 0))}</b>",
+            f"📌 Покрытие себестоимостью: <b>{coverage * 100:.1f}%</b>",
+        ]
+
+    if not complete:
+        warning_parts: list[str] = []
+        missing = int(totals.get("missing_count") or 0)
+        if missing:
+            warning_parts.append(
+                f"Uzum purchasePrice bermagan SKU: {missing}"
+                if uz
+                else f"SKU без purchasePrice от Uzum: {missing}"
+            )
+        if not bool(totals.get("expenses_available")):
+            warning_parts.append(
+                "Uzum xarajatlari to‘liq olinmadi"
+                if uz
+                else "расходы Uzum загружены не полностью"
+            )
+        if int(totals.get("failed_shops") or 0):
+            warning_parts.append(
+                f"API xatosi bo‘lgan do‘konlar: {int(totals['failed_shops'])}"
+                if uz
+                else f"магазинов с ошибкой API: {int(totals['failed_shops'])}"
+            )
+        if warning_parts:
+            lines.extend(["", "⚠️ " + "; ".join(warning_parts) + "."])
+
+    lines.extend(["", "<b>🏪 Do‘konlar bo‘yicha:</b>" if uz else "<b>🏪 По магазинам:</b>"])
+    for row in per_shop[:20]:
+        sid = int(row.get("shop_id") or 0)
+        name = escape(_short_text(str(row.get("name") or ""), 45))
+        name_part = f" — {name}" if name else ""
+        if row.get("error"):
+            lines.append(
+                f"• <code>{sid}</code>{name_part}: API xatosi"
+                if uz
+                else f"• <code>{sid}</code>{name_part}: ошибка API"
+            )
+            continue
+        stats = dict(row.get("stats") or {})
+        business = dict(row.get("business") or {})
+        shop_complete = bool(business.get("complete"))
+        shop_label = (
+            "sof foyda"
+            if uz and shop_complete
+            else "ma’lum natija"
+            if uz
+            else "чистая прибыль"
+            if shop_complete
+            else "известный результат"
+        )
+        lines.append(
+            f"• <code>{sid}</code>{name_part}: {_format_money(float(stats.get('revenue') or 0))}, "
+            f"{shop_label} <b>{_format_money(float(business.get('net_profit') or 0))}</b>, "
+            f"{float(business.get('coverage') or 0) * 100:.0f}%"
+        )
+
+    lines.extend(
+        [
+            "",
+            (
+                "ℹ️ Tannarx faqat Uzum purchasePrice’dan olinadi; yetishmagan qiymatlar taxmin qilinmaydi."
+                if uz
+                else "ℹ️ Себестоимость берётся только из Uzum purchasePrice; отсутствующие значения не подставляются."
+            ),
+        ]
+    )
+    return "\n".join(lines)
+
+
 @dp.message(Command("balance_all", "all_balance", "allshops", "all_shops"))
 async def balance_all_shops(message: Message) -> None:
     telegram_id = upsert_from_message(message)
@@ -13252,11 +14066,32 @@ async def balance_all_shops(message: Message) -> None:
     if client is None:
         await message.answer("Сначала подключите Uzum API-токен: <code>/connect</code>", reply_markup=menu_for_message(message))
         return
-    await message.answer("⌛ Считаю баланс по всем магазинам за 30 дней...", reply_markup=menu_for_message(message))
+    lang = get_user_language(telegram_id)
+    await message.answer(
+        "⌛ Barcha do‘konlar bo‘yicha savdo, tannarx va xarajatlar hisoblanmoqda..."
+        if normalize_lang(lang) == "uz"
+        else "⌛ Считаю продажи, себестоимость и расходы по всем магазинам...",
+        reply_markup=menu_for_message(message),
+    )
     try:
         date_from, date_to = _days_range_ms(30)
-        stats, per_shop, shops_count = await _all_shops_finance_stats(telegram_id, client, date_from, date_to)
-        await message.answer(_format_all_shops_balance("за 30 дней", shops_count, stats, per_shop), reply_markup=menu_for_message(message))
+        totals, per_shop, shops_count = await _all_shops_business_stats(
+            telegram_id,
+            client,
+            date_from,
+            date_to,
+            days=30,
+        )
+        await message.answer(
+            _format_all_shops_business(
+                telegram_id,
+                days=30,
+                shops_count=shops_count,
+                totals=totals,
+                per_shop=per_shop,
+            ),
+            reply_markup=menu_for_message(message),
+        )
     except Exception as e:
         await send_api_error(message, e)
 
@@ -13941,9 +14776,10 @@ async def _unit_economy_for_shop(client: UzumClient, telegram_id: int, shop_id: 
         date_from,
         date_to,
     )
+    cost_status = await sync_uzum_sku_financials(client, telegram_id, shop_id)
     costs = get_unit_cost_map(telegram_id, shop_id)
     top = _build_unit_rows_from_finance(rows, costs)
-    return top, _build_noorza_today_stats(rows), len(costs)
+    return top, _build_noorza_today_stats(rows), int(cost_status.get("with_cost") or 0)
 
 
 def _format_unit_economy(shop_id: int, days: int, rows: list[dict[str, Any]], stats: dict[str, Any], saved_costs: int, lang: str = "ru") -> str:
@@ -13962,7 +14798,7 @@ def _format_unit_economy(shop_id: int, days: int, rows: list[dict[str, Any]], st
             f"📦 Sotilgan: <b>{float(stats.get('units') or 0):.0f} dona</b>",
             f"💵 Tushum: <b>{_format_money(float(stats.get('revenue') or 0))}</b>",
             f"✅ To‘lovga: <b>{_format_money(float(stats.get('payout_total') or 0))}</b>",
-            f"💾 Kiritilgan tannarxlar: <b>{saved_costs}</b>",
+            f"🔄 Uzum bergan tannarxlar: <b>{saved_costs}</b>",
         ]
         if known_items:
             lines.append(f"💰 Taxminiy sof foyda: <b>{_format_money(total_known_profit)}</b>")
@@ -13972,7 +14808,7 @@ def _format_unit_economy(shop_id: int, days: int, rows: list[dict[str, Any]], st
             title = escape(_short_text(item.get("title"), 70))
             cost = item.get("cost_per_unit")
             if cost is None:
-                hint = f"\n   ⚠️ Tannarx kiritilmagan: <code>/cost {sku} 60000</code>"
+                hint = "\n   ⚠️ Uzum bu SKU uchun tannarx bermagan"
             else:
                 profit = float(item.get("profit") or 0)
                 margin = float(item.get("margin") or 0)
@@ -13984,7 +14820,7 @@ def _format_unit_economy(shop_id: int, days: int, rows: list[dict[str, Any]], st
                 f"💵 Tushum: <b>{_format_money(float(item.get('revenue') or 0))}</b> | "
                 f"✅ To‘lovga: <b>{_format_money(float(item.get('payout') or 0))}</b>" + hint
             )
-        lines.append("\nTannarx qo‘shish: <code>/cost SKU 60000</code>")
+        lines.append("\nTannarx faqat Uzum ma’lumotidan olinadi.")
         return "\n\n".join(lines)
 
     if not rows:
@@ -14000,7 +14836,7 @@ def _format_unit_economy(shop_id: int, days: int, rows: list[dict[str, Any]], st
         f"📦 Продано: <b>{float(stats.get('units') or 0):.0f} шт.</b>",
         f"💵 Выручка: <b>{_format_money(float(stats.get('revenue') or 0))}</b>",
         f"✅ К выплате: <b>{_format_money(float(stats.get('payout_total') or 0))}</b>",
-        f"💾 Себестоимостей сохранено: <b>{saved_costs}</b>",
+        f"🔄 Себестоимостей получено от Uzum: <b>{saved_costs}</b>",
     ]
     if known_items:
         lines.append(f"💰 Примерная чистая прибыль: <b>{_format_money(total_known_profit)}</b>")
@@ -14010,7 +14846,7 @@ def _format_unit_economy(shop_id: int, days: int, rows: list[dict[str, Any]], st
         title = escape(_short_text(item.get("title"), 70))
         cost = item.get("cost_per_unit")
         if cost is None:
-            hint = f"\n   ⚠️ Себестоимость не указана: <code>/cost {sku} 60000</code>"
+            hint = "\n   ⚠️ Uzum не передал себестоимость для этого SKU"
         else:
             profit = float(item.get("profit") or 0)
             margin = float(item.get("margin") or 0)
@@ -14022,7 +14858,7 @@ def _format_unit_economy(shop_id: int, days: int, rows: list[dict[str, Any]], st
             f"💵 Выручка: <b>{_format_money(float(item.get('revenue') or 0))}</b> | "
             f"✅ К выплате: <b>{_format_money(float(item.get('payout') or 0))}</b>" + hint
         )
-    lines.append("\nДобавить себестоимость: <code>/cost SKU 60000</code>")
+    lines.append("\nСебестоимость берётся только из данных Uzum.")
     return "\n\n".join(lines)
 
 
@@ -14047,7 +14883,7 @@ async def unit_economy(message: Message) -> None:
         summary = [
             f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
             f"📦 Sotilgan: <b>{float(stats.get('units') or 0):.0f} dona</b> | 💵 Tushum: <b>{_format_money(float(stats.get('revenue') or 0))}</b>" if lang == "uz" else f"📦 Продано: <b>{float(stats.get('units') or 0):.0f} шт.</b> | 💵 Выручка: <b>{_format_money(float(stats.get('revenue') or 0))}</b>",
-            f"💾 Tannarxlar: <b>{saved_costs}</b>" if lang == "uz" else f"💾 Себестоимостей: <b>{saved_costs}</b>",
+            f"🔄 Uzum tannarxlari: <b>{saved_costs}</b>" if lang == "uz" else f"🔄 Себестоимостей из Uzum: <b>{saved_costs}</b>",
         ]
         if known_items:
             summary.append(f"💰 Taxminiy sof foyda: <b>{_format_money(total_known_profit)}</b>" if lang == "uz" else f"💰 Примерная чистая прибыль: <b>{_format_money(total_known_profit)}</b>")
@@ -14057,7 +14893,7 @@ async def unit_economy(message: Message) -> None:
             title_item = escape(_short_text(item.get("title"), 70))
             cost = item.get("cost_per_unit")
             if cost is None:
-                hint = f"\n⚠️ Tannarx kiritilmagan: <code>/cost {sku} 60000</code>" if lang == "uz" else f"\n⚠️ Себестоимость не указана: <code>/cost {sku} 60000</code>"
+                hint = "\n⚠️ Uzum bu SKU uchun tannarx bermagan" if lang == "uz" else "\n⚠️ Uzum не передал себестоимость для этого SKU"
             else:
                 profit = float(item.get("profit") or 0)
                 margin = float(item.get("margin") or 0)
@@ -14071,8 +14907,72 @@ async def unit_economy(message: Message) -> None:
         await send_api_error(message, e)
 
 
+async def show_uzum_cost_status(message: Message, *, force: bool = True) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    telegram_id, client, shop_id = req
+    lang = get_user_language(telegram_id)
+    await message.answer(
+        "⌛ Uzum tannarxlarini yangilayapman..."
+        if lang == "uz"
+        else "⌛ Обновляю себестоимость из Uzum...",
+        reply_markup=finance_menu_for_message(message),
+    )
+    try:
+        status = await sync_uzum_sku_financials(
+            client,
+            telegram_id,
+            shop_id,
+            force=force,
+        )
+        total = int(status.get("total") or 0)
+        with_cost = int(status.get("with_cost") or 0)
+        missing = int(status.get("missing_cost") or 0)
+        coverage = with_cost / total * 100.0 if total else 0.0
+        updated = _fmt_dt(status.get("fetched_at"))
+        stale_note = (
+            "\n⚠️ Uzum vaqtincha javob bermadi; oxirgi saqlangan ma’lumot ko‘rsatildi."
+            if lang == "uz" and status.get("stale")
+            else "\n⚠️ Uzum временно не ответил; показаны последние сохранённые данные."
+            if status.get("stale")
+            else ""
+        )
+        if lang == "uz":
+            text_value = (
+                "🔄 <b>Uzum tannarxi</b>\n\n"
+                f"🏪 Do‘kon: <code>{shop_id}</code>\n"
+                f"📦 SKU jami: <b>{total}</b>\n"
+                f"✅ Tannarx bor: <b>{with_cost}</b>\n"
+                f"⚠️ Uzum tannarx bermagan: <b>{missing}</b>\n"
+                f"📊 Qamrov: <b>{coverage:.1f}%</b>\n"
+                f"🕒 Yangilandi: <b>{updated}</b>\n\n"
+                "Tannarx faqat Uzum API dagi <code>purchasePrice</code> maydonidan olinadi. "
+                "Excel va qo‘lda kiritilgan narxlar foyda hisobida ishlatilmaydi."
+                f"{stale_note}"
+            )
+        else:
+            text_value = (
+                "🔄 <b>Себестоимость из Uzum</b>\n\n"
+                f"🏪 Магазин: <code>{shop_id}</code>\n"
+                f"📦 Всего SKU: <b>{total}</b>\n"
+                f"✅ С себестоимостью: <b>{with_cost}</b>\n"
+                f"⚠️ Uzum не передал цену: <b>{missing}</b>\n"
+                f"📊 Покрытие: <b>{coverage:.1f}%</b>\n"
+                f"🕒 Обновлено: <b>{updated}</b>\n\n"
+                "Источник — только документированное поле Uzum <code>purchasePrice</code>. "
+                "Excel и ручные значения в расчёте прибыли не используются."
+                f"{stale_note}"
+            )
+        await message.answer(text_value, reply_markup=finance_menu_for_message(message))
+    except Exception as error:
+        await send_api_error(message, error)
+
+
 @dp.message(Command("cost", "setcost", "set_cost"))
 async def set_cost_command(message: Message) -> None:
+    await show_uzum_cost_status(message)
+    return
     telegram_id = upsert_from_message(message)
     req = await require_connection(message)
     if req is None:
@@ -14098,6 +14998,8 @@ async def set_cost_command(message: Message) -> None:
 
 @dp.message(Command("costs"))
 async def costs_command(message: Message) -> None:
+    await show_uzum_cost_status(message)
+    return
     telegram_id = upsert_from_message(message)
     req = await require_connection(message)
     if req is None:
@@ -14118,6 +15020,8 @@ async def costs_command(message: Message) -> None:
 
 @dp.message(Command("delcost", "delete_cost"))
 async def delete_cost_command(message: Message) -> None:
+    await show_uzum_cost_status(message)
+    return
     telegram_id = upsert_from_message(message)
     req = await require_connection(message)
     if req is None:
@@ -14296,6 +15200,10 @@ def _save_unit_costs_bulk(
 
 @dp.message(Command("cost_template", "costs_template", "template_costs"))
 async def cost_template_command(message: Message, state: FSMContext | None = None) -> None:
+    if state is not None:
+        await state.clear()
+    await show_uzum_cost_status(message)
+    return
     telegram_id = upsert_from_message(message)
     lang = get_user_language(telegram_id)
     if state is not None:
@@ -14327,6 +15235,9 @@ async def cost_template_command(message: Message, state: FSMContext | None = Non
 
 @dp.message(Command("import_costs", "upload_costs"))
 async def import_costs_command(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await show_uzum_cost_status(message)
+    return
     telegram_id = upsert_from_message(message)
     lang = get_user_language(telegram_id)
     await state.set_state(CostImportStates.waiting_for_file)
@@ -14340,6 +15251,9 @@ async def import_costs_command(message: Message, state: FSMContext) -> None:
 
 @dp.message(CostImportStates.waiting_for_file, F.document)
 async def receive_costs_excel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await show_uzum_cost_status(message)
+    return
     telegram_id = upsert_from_message(message)
     lang = get_user_language(telegram_id)
     req = await require_connection(message)
@@ -14425,12 +15339,7 @@ async def receive_costs_excel(message: Message, state: FSMContext) -> None:
 
 @dp.message(CostImportStates.waiting_for_file)
 async def receive_costs_excel_wrong(message: Message) -> None:
-    telegram_id = upsert_from_message(message)
-    lang = get_user_language(telegram_id)
-    await message.answer(
-        "Excel faylni yuboring yoki <code>/cancel</code> bosing." if lang == "uz" else "Отправьте Excel-файл или нажмите <code>/cancel</code>.",
-        reply_markup=menu_for_message(message),
-    )
+    await show_uzum_cost_status(message)
 
 
 def _profit_summary_from_unit_rows(rows: list[dict[str, Any]], stats: dict[str, Any]) -> dict[str, Any]:
@@ -14461,8 +15370,9 @@ def calculate_business_profit(
     settings: dict[str, Any],
     *,
     days: int = 30,
+    uzum_expenses: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Apply seller-entered tax and operating expenses to the known SKU profit.
+    """Apply tax, actual Uzum expenses and external seller expenses.
 
     The result deliberately keeps cost coverage visible: if some SKUs have no
     cost, net profit is an incomplete estimate and must not be presented as an
@@ -14475,9 +15385,21 @@ def calculate_business_profit(
     advertising = max(0.0, float(settings.get("advertising_monthly") or 0)) * period_ratio
     storage = max(0.0, float(settings.get("storage_monthly") or 0)) * period_ratio
     other = max(0.0, float(settings.get("other_monthly") or 0)) * period_ratio
+    expense_summary = dict(uzum_expenses or {})
+    uzum_expenses_available = bool(expense_summary.get("available", uzum_expenses is None))
+    uzum_expense_total = float(expense_summary.get("total") or 0)
     known_profit = float(cost_summary.get("profit") or 0)
-    net_profit = known_profit - tax_expense - advertising - storage - other
+    net_profit = (
+        known_profit
+        - tax_expense
+        - uzum_expense_total
+        - advertising
+        - storage
+        - other
+    )
     coverage = max(0.0, min(1.0, float(cost_summary.get("coverage") or 0)))
+    missing_count = int(cost_summary.get("missing_count") or 0)
+    cost_data_complete = coverage >= 0.999 or (revenue <= 0 and missing_count == 0)
     return {
         "days": int(days),
         "revenue": revenue,
@@ -14487,15 +15409,26 @@ def calculate_business_profit(
         "cost_total": float(cost_summary.get("cost_total") or 0),
         "known_profit": known_profit,
         "tax_expense": tax_expense,
+        "uzum_expense_total": uzum_expense_total,
+        "uzum_storage_expense": float(expense_summary.get("storage") or 0),
+        "uzum_advertising_expense": float(expense_summary.get("advertising") or 0),
+        "uzum_penalty_expense": float(expense_summary.get("penalty") or 0),
+        "uzum_other_expense": float(expense_summary.get("other") or 0),
+        "uzum_order_charge_already_in_payout": float(
+            expense_summary.get("order_charge") or 0
+        ),
+        "uzum_expenses_available": uzum_expenses_available,
         "advertising_expense": advertising,
         "storage_expense": storage,
         "other_expense": other,
-        "operating_expenses": tax_expense + advertising + storage + other,
+        "operating_expenses": (
+            tax_expense + uzum_expense_total + advertising + storage + other
+        ),
         "net_profit": net_profit,
         "net_margin": (net_profit / revenue * 100.0) if revenue > 0 else 0.0,
         "coverage": coverage,
-        "complete": coverage >= 0.999,
-        "missing_count": int(cost_summary.get("missing_count") or 0),
+        "complete": cost_data_complete and uzum_expenses_available,
+        "missing_count": missing_count,
     }
 
 
@@ -14518,8 +15451,8 @@ def _format_profit_report(shop_id: int, rows: list[dict[str, Any]], stats: dict[
             f"📌 Tannarx bilan qamrov: <b>{float(summary['coverage']) * 100:.1f}%</b>",
         ]
         if summary["missing_count"]:
-            lines.append(f"\n⚠️ Tannarx kiritilmagan SKU: <b>{summary['missing_count']}</b>")
-            lines.append("Tannarx yuklash: <code>/cost_template</code>")
+            lines.append(f"\n⚠️ Uzum tannarx bermagan SKU: <b>{summary['missing_count']}</b>")
+            lines.append("Tannarx manbasi: faqat Uzum purchasePrice.")
         if top_profit:
             lines.append("\n🏆 <b>Foyda bo‘yicha top tovarlar:</b>")
             for idx, r in enumerate(top_profit, start=1):
@@ -14540,8 +15473,8 @@ def _format_profit_report(shop_id: int, rows: list[dict[str, Any]], stats: dict[
         f"📌 Покрытие себестоимостью: <b>{float(summary['coverage']) * 100:.1f}%</b>",
     ]
     if summary["missing_count"]:
-        lines.append(f"\n⚠️ Без себестоимости: <b>{summary['missing_count']}</b> SKU")
-        lines.append("Загрузить себестоимость: <code>/cost_template</code>")
+        lines.append(f"\n⚠️ Uzum не передал себестоимость: <b>{summary['missing_count']}</b> SKU")
+        lines.append("Источник себестоимости: только Uzum purchasePrice.")
     if top_profit:
         lines.append("\n🏆 <b>Топ товаров по прибыли:</b>")
         for idx, r in enumerate(top_profit, start=1):
@@ -14561,11 +15494,19 @@ async def profit_report(message: Message) -> None:
         rows, stats, _ = await _unit_economy_for_shop(client, telegram_id, shop_id, days=30)
         summary_stats = _profit_summary_from_unit_rows(rows, stats)
         finance_settings = ensure_finance_settings(telegram_id, shop_id)
+        expense_from, expense_to = _days_range_ms(30)
+        uzum_expenses = await load_uzum_expense_summary(
+            client,
+            shop_id,
+            expense_from,
+            expense_to,
+        )
         business_profit = calculate_business_profit(
             summary_stats,
             stats,
             finance_settings,
             days=30,
+            uzum_expenses=uzum_expenses,
         )
         known = sorted([r for r in rows if r.get("cost_per_unit") is not None], key=lambda r: float(r.get("profit") or 0), reverse=True)
         complete_profit = bool(business_profit.get("complete"))
@@ -14578,16 +15519,23 @@ async def profit_report(message: Message) -> None:
             f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
             f"💵 Tushum: <b>{_format_money(float(stats.get('revenue') or 0))}</b> | 📦 Tannarx: <b>{_format_money(float(summary_stats['cost_total']))}</b>" if lang == "uz" else f"💵 Выручка: <b>{_format_money(float(stats.get('revenue') or 0))}</b> | 📦 Себестоимость: <b>{_format_money(float(summary_stats['cost_total']))}</b>",
             f"🏛 Soliq: <b>{_format_money(float(business_profit['tax_expense']))}</b> | 📣 Reklama: <b>{_format_money(float(business_profit['advertising_expense']))}</b>" if lang == "uz" else f"🏛 Налог: <b>{_format_money(float(business_profit['tax_expense']))}</b> | 📣 Реклама: <b>{_format_money(float(business_profit['advertising_expense']))}</b>",
-            f"🏬 Saqlash: <b>{_format_money(float(business_profit['storage_expense']))}</b> | 🧾 Boshqa: <b>{_format_money(float(business_profit['other_expense']))}</b>" if lang == "uz" else f"🏬 Хранение: <b>{_format_money(float(business_profit['storage_expense']))}</b> | 🧾 Прочие: <b>{_format_money(float(business_profit['other_expense']))}</b>",
+            f"🏦 Uzum xarajatlari: <b>{_format_money(float(business_profit['uzum_expense_total']))}</b>" if lang == "uz" else f"🏦 Расходы Uzum: <b>{_format_money(float(business_profit['uzum_expense_total']))}</b>",
+            f"🏬 Tashqi saqlash: <b>{_format_money(float(business_profit['storage_expense']))}</b> | 🧾 Boshqa tashqi: <b>{_format_money(float(business_profit['other_expense']))}</b>" if lang == "uz" else f"🏬 Внешнее хранение: <b>{_format_money(float(business_profit['storage_expense']))}</b> | 🧾 Другие внешние: <b>{_format_money(float(business_profit['other_expense']))}</b>",
             (f"💰 Sof foyda: <b>{_format_money(float(business_profit['net_profit']))}</b> | 📈 Marja: <b>{float(business_profit['net_margin']):.1f}%</b>" if complete_profit else f"💰 Ma’lum tannarx bo‘yicha natija: <b>{_format_money(float(business_profit['net_profit']))}</b>") if lang == "uz" else (f"💰 Чистая прибыль: <b>{_format_money(float(business_profit['net_profit']))}</b> | 📈 Маржа: <b>{float(business_profit['net_margin']):.1f}%</b>" if complete_profit else f"💰 Результат по известной себестоимости: <b>{_format_money(float(business_profit['net_profit']))}</b>"),
             f"📌 Tannarx bilan qamrov: <b>{float(summary_stats['coverage']) * 100:.1f}%</b>" if lang == "uz" else f"📌 Покрытие себестоимостью: <b>{float(summary_stats['coverage']) * 100:.1f}%</b>",
         ]
         if summary_stats["missing_count"]:
-            summary.append(f"⚠️ Tannarx kiritilmagan SKU: <b>{summary_stats['missing_count']}</b>" if lang == "uz" else f"⚠️ Без себестоимости: <b>{summary_stats['missing_count']}</b> SKU")
+            summary.append(f"⚠️ Uzum tannarx bermagan SKU: <b>{summary_stats['missing_count']}</b>" if lang == "uz" else f"⚠️ Uzum не передал себестоимость: <b>{summary_stats['missing_count']}</b> SKU")
             summary.append(
-                "ℹ️ Natija yakuniy sof foyda emas: barcha SKU tannarxi kiritilmagan."
+                "ℹ️ Natija yakuniy sof foyda emas: Uzum barcha SKU tannarxini bermagan."
                 if lang == "uz"
-                else "ℹ️ Это не окончательная чистая прибыль: себестоимость заполнена не для всех SKU."
+                else "ℹ️ Это не окончательная чистая прибыль: Uzum передал себестоимость не для всех SKU."
+            )
+        if not business_profit.get("uzum_expenses_available"):
+            summary.append(
+                "⚠️ Uzum xarajatlari vaqtincha olinmadi; sof foyda to‘liq emas."
+                if lang == "uz"
+                else "⚠️ Расходы Uzum временно недоступны; чистая прибыль неполная."
             )
         summary.append(
             "⚙️ Xarajatlarni o‘zgartirish: <code>/finance_settings</code>"
@@ -14602,7 +15550,7 @@ async def profit_report(message: Message) -> None:
             margin = float(r.get("margin") or 0)
             items.append((f"{idx}. <b>{title_item}</b>\n🔖 SKU: <code>{sku}</code>\n💰 Foyda: <b>{_format_money(profit)}</b> | 📈 Marja: <b>{margin:.1f}%</b>" if lang == "uz" else f"{idx}. <b>{title_item}</b>\n🔖 SKU: <code>{sku}</code>\n💰 Прибыль: <b>{_format_money(profit)}</b> | 📈 Маржа: <b>{margin:.1f}%</b>"))
         if not items:
-            items = ["Tannarx kiritilgan savdolar hali yo‘q. Tannarx yuklash: /cost_template" if lang == "uz" else "Пока нет продаж с указанной себестоимостью. Загрузите себестоимость: /cost_template"]
+            items = ["Uzum tannarx bergan savdolar hali yo‘q." if lang == "uz" else "Пока нет продаж, для которых Uzum передал себестоимость."]
         await send_paginated_list(message, kind="profit", title=title, summary=summary, items=items, section="sales", reply_markup=sales_menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
@@ -14616,8 +15564,11 @@ async def button_profit_report_near_unit(message: Message) -> None:
 
 @dp.message(F.text == "📥 Tannarx Excel")
 @dp.message(F.text == "📥 Себестоимость Excel")
+@dp.message(F.text == "🔄 Uzum tannarxi")
+@dp.message(F.text == "🔄 Себестоимость Uzum")
 async def button_costs_excel_near_unit(message: Message, state: FSMContext) -> None:
-    await cost_template_command(message, state)
+    await state.clear()
+    await show_uzum_cost_status(message)
 
 
 @dp.message(F.text == "🧾 Unit iqtisodiyot")
@@ -15494,6 +16445,8 @@ AUTOMATION_BOOL_FIELDS = {
     "notify_losses",
     "notify_defects",
     "notify_fbo_acceptance",
+    "notify_supply_reminders",
+    "notify_return_pickup",
     "daily_enabled",
     "weekly_enabled",
     "monthly_enabled",
@@ -15554,6 +16507,8 @@ NOTIFICATION_SECTION_FIELDS: dict[str, tuple[str, ...]] = {
         "notify_losses",
         "notify_defects",
         "notify_fbo_acceptance",
+        "notify_supply_reminders",
+        "notify_return_pickup",
     ),
     "reports": ("daily_enabled", "weekly_enabled", "monthly_enabled"),
 }
@@ -15646,7 +16601,9 @@ def notification_section_text(telegram_id: int, section: str) -> str:
                 f"Qoldiq o‘zgarishi: {_toggle_icon(row.get('notify_stock_change'))}\n"
                 f"Yo‘qotish: {_toggle_icon(row.get('notify_losses'))}\n"
                 f"Yaroqsiz tovar: {_toggle_icon(row.get('notify_defects'))}\n"
-                f"FBO qabuli va farqlar PDF: {_toggle_icon(row.get('notify_fbo_acceptance'))}"
+                f"FBO qabuli va farqlar PDF: {_toggle_icon(row.get('notify_fbo_acceptance'))}\n"
+                f"Yetkazish vaqti eslatmasi: {_toggle_icon(row.get('notify_supply_reminders'))}\n"
+                f"Qaytarmani olib ketish eslatmasi: {_toggle_icon(row.get('notify_return_pickup'))}"
             )
         return (
             "📦 <b>Склад и поставки</b>\n\n"
@@ -15655,7 +16612,9 @@ def notification_section_text(telegram_id: int, section: str) -> str:
             f"Изменение остатка: {_toggle_icon(row.get('notify_stock_change'))}\n"
             f"Потери: {_toggle_icon(row.get('notify_losses'))}\n"
             f"Брак: {_toggle_icon(row.get('notify_defects'))}\n"
-            f"Приёмка FBO и PDF с расхождениями: {_toggle_icon(row.get('notify_fbo_acceptance'))}"
+            f"Приёмка FBO и PDF с расхождениями: {_toggle_icon(row.get('notify_fbo_acceptance'))}\n"
+            f"Срок поставки: {_toggle_icon(row.get('notify_supply_reminders'))}\n"
+            f"Забрать возврат: {_toggle_icon(row.get('notify_return_pickup'))}"
         )
     if uz:
         return (
@@ -15710,6 +16669,10 @@ def notification_section_markup(telegram_id: int, section: str) -> InlineKeyboar
             [toggle("notify_stock_change", "Изменение остатка", "Qoldiq o‘zgarishi")],
             [toggle("notify_losses", "Потери", "Yo‘qotish"), toggle("notify_defects", "Брак", "Yaroqsiz")],
             [toggle("notify_fbo_acceptance", "Приёмка FBO", "FBO qabuli")],
+            [
+                toggle("notify_supply_reminders", "Срок поставки", "Yetkazish vaqti"),
+                toggle("notify_return_pickup", "Забрать возврат", "Qaytarma"),
+            ],
             [InlineKeyboardButton(
                 text=("📉 Qoldiq chegarasi" if uz else "📉 Порог низкого остатка"),
                 callback_data="notifyedit:stock:low_stock_threshold",
@@ -15747,6 +16710,8 @@ def automation_settings_text(telegram_id: int) -> str:
             f"🧭 Yangi yo‘qotish: {_toggle_icon(row.get('notify_losses'))}\n"
             f"🧪 Yangi yaroqsiz: {_toggle_icon(row.get('notify_defects'))}\n"
             f"🚚 FBO qabuli: {_toggle_icon(row.get('notify_fbo_acceptance'))}\n"
+            f"⏰ Yetkazish vaqti: {_toggle_icon(row.get('notify_supply_reminders'))}\n"
+            f"↩️ Qaytarmani olish: {_toggle_icon(row.get('notify_return_pickup'))}\n"
             f"📉 Kam qoldiq: {_toggle_icon(row.get('notify_low_stock'))} (≤ {int(row.get('low_stock_threshold') or 0)})\n"
             f"❌ Qoldiq tugashi: {_toggle_icon(row.get('notify_out_of_stock'))}\n"
             f"⭐ Sharhlar: {_toggle_icon(row.get('notify_reviews'))}\n"
@@ -15765,6 +16730,8 @@ def automation_settings_text(telegram_id: int) -> str:
         f"🧭 Новые потери: {_toggle_icon(row.get('notify_losses'))}\n"
         f"🧪 Новый брак: {_toggle_icon(row.get('notify_defects'))}\n"
         f"🚚 Приёмка FBO: {_toggle_icon(row.get('notify_fbo_acceptance'))}\n"
+        f"⏰ Срок поставки: {_toggle_icon(row.get('notify_supply_reminders'))}\n"
+        f"↩️ Забрать возврат: {_toggle_icon(row.get('notify_return_pickup'))}\n"
         f"📉 Низкие остатки: {_toggle_icon(row.get('notify_low_stock'))} (≤ {int(row.get('low_stock_threshold') or 0)})\n"
         f"❌ Товар закончился: {_toggle_icon(row.get('notify_out_of_stock'))}\n"
         f"⭐ Отзывы: {_toggle_icon(row.get('notify_reviews'))}\n"
@@ -15795,6 +16762,8 @@ def automation_settings_markup(telegram_id: int) -> InlineKeyboardMarkup:
         ), toggle("notify_cancellations", "Отмены", "Bekor")],
         [toggle("notify_losses", "Потери", "Yo‘qotish"), toggle("notify_defects", "Брак", "Yaroqsiz")],
         [toggle("notify_fbo_acceptance", "Приёмка FBO", "FBO qabuli")],
+        [toggle("notify_supply_reminders", "Срок поставки", "Yetkazish vaqti"),
+         toggle("notify_return_pickup", "Забрать возврат", "Qaytarma")],
         [toggle("notify_low_stock", "Низкий остаток", "Kam qoldiq"), toggle("notify_out_of_stock", "Закончился", "Tugadi")],
         [toggle("notify_reviews", "Отзывы", "Sharh"), toggle("notify_orders", "FBS-заказы", "FBS buyurtma")],
         [toggle("notify_stock_change", "Движение склада", "Ombor harakati")],
@@ -15906,19 +16875,19 @@ def finance_settings_text(telegram_id: int, shop_id: int) -> str:
             "🧮 <b>Sof foyda sozlamalari</b>\n\n"
             f"🏪 Do‘kon: <code>{shop_id}</code>\n"
             f"🏛 Soliq: <b>{float(row.get('tax_percent') or 0):.2f}%</b>\n"
-            f"📣 Reklama / oy: <b>{_format_money(float(row.get('advertising_monthly') or 0))}</b>\n"
-            f"🏬 Saqlash / oy: <b>{_format_money(float(row.get('storage_monthly') or 0))}</b>\n"
-            f"🧾 Boshqa / oy: <b>{_format_money(float(row.get('other_monthly') or 0))}</b>\n\n"
-            "Bu xarajatlar foyda hisobotiga va Excel fayliga qo‘shiladi."
+            f"📣 Tashqi reklama / oy: <b>{_format_money(float(row.get('advertising_monthly') or 0))}</b>\n"
+            f"🏬 Tashqi saqlash / oy: <b>{_format_money(float(row.get('storage_monthly') or 0))}</b>\n"
+            f"🧾 Boshqa tashqi / oy: <b>{_format_money(float(row.get('other_monthly') or 0))}</b>\n\n"
+            "Uzum xarajatlari API orqali avtomatik olinadi. Bu yerga faqat Uzumdan tashqaridagi xarajatlarni kiriting."
         )
     return (
         "🧮 <b>Настройки чистой прибыли</b>\n\n"
         f"🏪 Магазин: <code>{shop_id}</code>\n"
         f"🏛 Налог: <b>{float(row.get('tax_percent') or 0):.2f}%</b>\n"
-        f"📣 Реклама в месяц: <b>{_format_money(float(row.get('advertising_monthly') or 0))}</b>\n"
-        f"🏬 Хранение в месяц: <b>{_format_money(float(row.get('storage_monthly') or 0))}</b>\n"
-        f"🧾 Другие расходы в месяц: <b>{_format_money(float(row.get('other_monthly') or 0))}</b>\n\n"
-        "Эти расходы учитываются в отчёте прибыли и управленческом Excel."
+        f"📣 Внешняя реклама в месяц: <b>{_format_money(float(row.get('advertising_monthly') or 0))}</b>\n"
+        f"🏬 Внешнее хранение в месяц: <b>{_format_money(float(row.get('storage_monthly') or 0))}</b>\n"
+        f"🧾 Другие внешние расходы: <b>{_format_money(float(row.get('other_monthly') or 0))}</b>\n\n"
+        "Расходы внутри Uzum загружаются автоматически. Здесь указывайте только расходы вне Uzum."
     )
 
 
@@ -15927,9 +16896,9 @@ def finance_settings_markup(telegram_id: int) -> InlineKeyboardMarkup:
     uz = lang == "uz"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=("🏛 Soliq %" if uz else "🏛 Налог %"), callback_data="autoedit:tax_percent")],
-        [InlineKeyboardButton(text=("📣 Reklama" if uz else "📣 Реклама"), callback_data="autoedit:advertising_monthly")],
-        [InlineKeyboardButton(text=("🏬 Saqlash" if uz else "🏬 Хранение"), callback_data="autoedit:storage_monthly")],
-        [InlineKeyboardButton(text=("🧾 Boshqa xarajat" if uz else "🧾 Другие расходы"), callback_data="autoedit:other_monthly")],
+        [InlineKeyboardButton(text=("📣 Tashqi reklama" if uz else "📣 Внешняя реклама"), callback_data="autoedit:advertising_monthly")],
+        [InlineKeyboardButton(text=("🏬 Tashqi saqlash" if uz else "🏬 Внешнее хранение"), callback_data="autoedit:storage_monthly")],
+        [InlineKeyboardButton(text=("🧾 Boshqa tashqi" if uz else "🧾 Другие внешние"), callback_data="autoedit:other_monthly")],
     ])
 
 
@@ -16202,6 +17171,115 @@ async def finance_settings_screen(message: Message) -> None:
     )
 
 
+@dp.message(Command("uzum_expenses", "expenses_uzum"))
+@dp.message(F.text.in_({"🧾 Расходы Uzum", "🧾 Uzum xarajatlari"}))
+async def uzum_expenses_report(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    telegram_id, client, shop_id = req
+    if not await require_premium_subscription(message, telegram_id):
+        return
+    lang = get_user_language(telegram_id)
+    await message.answer(
+        "⌛ Uzum xarajatlarini 30 kun uchun yuklayapman..."
+        if lang == "uz"
+        else "⌛ Загружаю расходы Uzum за 30 дней...",
+        reply_markup=finance_menu_for_message(message),
+    )
+    date_from, date_to = _days_range_ms(30)
+    summary = await load_uzum_expense_summary(
+        client,
+        shop_id,
+        date_from,
+        date_to,
+        force=True,
+    )
+    if not summary.get("available"):
+        await message.answer(
+            (
+                "⚠️ <b>Uzum xarajatlari vaqtincha olinmadi</b>\n\n"
+                "Foyda hisobida bu ma’lumot yetishmayotgani ko‘rsatiladi. Keyinroq qayta urinib ko‘ring."
+                if lang == "uz"
+                else "⚠️ <b>Расходы Uzum временно недоступны</b>\n\n"
+                "В расчёте прибыли это будет отмечено как неполные данные. Попробуйте обновить позже."
+            ),
+            reply_markup=finance_menu_for_message(message),
+        )
+        return
+
+    total = float(summary.get("total") or 0)
+    title = "🧾 <b>Uzum xarajatlari — 30 kun</b>" if lang == "uz" else "🧾 <b>Расходы Uzum за 30 дней</b>"
+    header = [
+        f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
+        f"💳 Foydadan ayriladigan qo‘shimcha xarajatlar: <b>{_format_money(total)}</b>" if lang == "uz" else f"💳 Дополнительные расходы для расчёта прибыли: <b>{_format_money(total)}</b>",
+        (
+            f"🏬 Saqlash: <b>{_format_money(float(summary.get('storage') or 0))}</b> | "
+            f"📣 Reklama: <b>{_format_money(float(summary.get('advertising') or 0))}</b>"
+            if lang == "uz"
+            else f"🏬 Хранение: <b>{_format_money(float(summary.get('storage') or 0))}</b> | "
+            f"📣 Реклама: <b>{_format_money(float(summary.get('advertising') or 0))}</b>"
+        ),
+        (
+            f"⚠️ Jarima: <b>{_format_money(float(summary.get('penalty') or 0))}</b> | "
+            f"🧾 Boshqa: <b>{_format_money(float(summary.get('other') or 0))}</b>"
+            if lang == "uz"
+            else f"⚠️ Штрафы: <b>{_format_money(float(summary.get('penalty') or 0))}</b> | "
+            f"🧾 Прочие: <b>{_format_money(float(summary.get('other') or 0))}</b>"
+        ),
+    ]
+    if int(summary.get("pending_count") or 0):
+        header.append(
+            f"⏳ Hali tasdiqlanmagan: <b>{int(summary['pending_count'])}</b>"
+            if lang == "uz"
+            else f"⏳ Ещё не подтверждено: <b>{int(summary['pending_count'])}</b>"
+        )
+    if abs(float(summary.get("order_charge") or 0)) > 0.001:
+        header.append(
+            f"ℹ️ Komissiya/logistika: <b>{_format_money(float(summary['order_charge']))}</b> — to‘lovda hisobga olingan"
+            if lang == "uz"
+            else f"ℹ️ Комиссия/логистика: <b>{_format_money(float(summary['order_charge']))}</b> — уже учтены в выплате"
+        )
+    items: list[str] = []
+    for index, row in enumerate(list(summary.get("rows") or []), start=1):
+        date_text = _fmt_dt(row.get("date"))
+        name = escape(_short_text(str(row.get("name") or "Uzum"), 85))
+        source = escape(_short_text(str(row.get("source") or "—"), 45))
+        amount = float(row.get("signed_amount") or 0)
+        included = bool(row.get("included_in_profit", True))
+        accounting_note = (
+            "\nℹ️ To‘lovda hisobga olingan, qayta ayrilmaydi."
+            if lang == "uz" and not included
+            else "\nℹ️ Уже учтено в выплате, повторно не вычитается."
+            if not included
+            else ""
+        )
+        items.append(
+            (
+                f"{index}. <b>{name}</b>\n🕒 {date_text} | Manba: <code>{source}</code>\n"
+                f"💳 <b>{_format_money(amount)}</b>{accounting_note}"
+                if lang == "uz"
+                else f"{index}. <b>{name}</b>\n🕒 {date_text} | Источник: <code>{source}</code>\n"
+                f"💳 <b>{_format_money(amount)}</b>{accounting_note}"
+            )
+        )
+    if not items:
+        items = [
+            "Tanlangan davrda tasdiqlangan Uzum xarajatlari topilmadi."
+            if lang == "uz"
+            else "За выбранный период подтверждённых расходов Uzum не найдено."
+        ]
+    await send_paginated_list(
+        message,
+        kind="uzum_expenses",
+        title=title,
+        summary=header,
+        items=items,
+        section="sales",
+        reply_markup=finance_menu_for_message(message),
+    )
+
+
 @dp.callback_query(F.data.startswith("autotoggle:"))
 async def automation_toggle_callback(callback: CallbackQuery) -> None:
     if not callback.from_user:
@@ -16393,9 +17471,15 @@ async def _collect_business_control_data(
         for item in finance_rows
         if _is_cancelled_status(_finance_status(item))
     )
+    stock_raw = await load_sku_rows(client, shop_id, max_pages=50)
+    await sync_uzum_sku_financials(
+        client,
+        telegram_id,
+        shop_id,
+        stock_rows=stock_raw,
+    )
     costs = get_unit_cost_map(telegram_id, shop_id)
     product_rows = _build_unit_rows_from_finance(finance_rows, costs)
-    stock_raw = await load_sku_rows(client, shop_id, max_pages=50)
     sales_7 = _finance_rows_for_last_days(finance_rows, 7)
     stock_rows, _ = _build_stock_report_rows(stock_raw, sales_7)
     settings = ensure_product_settings(telegram_id)
@@ -17017,7 +18101,7 @@ def translate_runtime_text_to_uz(text: str) -> str:
         ("остаток изменился", "qoldiq o‘zgardi"),
         ("Показать товары с низким остатком", "Kam qoldiqdagi tovarlarni ko‘rsatish"),
         ("Готовлю подробный Excel-отчёт", "Batafsil Excel hisobot tayyorlanmoqda"),
-        ("Это может занять 20–60 soniyaунд", "Bu 20–60 soniya vaqt olishi mumkin"),
+        ("Это может занять 20–60 секунд", "Bu 20–60 soniya vaqt olishi mumkin"),
         ("собираю продажи, остатки и FBO-накладные", "savdolar, qoldiqlar va FBO yuk xatlari yig‘ilmoqda"),
 
         # Уведомления / отмены
@@ -17029,7 +18113,7 @@ def translate_runtime_text_to_uz(text: str) -> str:
         ("Критичных проблем не видно. Можно посмотреть продажи и прибыль 30 kun uchun.", "Jiddiy muammo ko‘rinmayapti. 30 kunlik savdo va foydani ko‘rishingiz mumkin."),
         ("Начните с товаров, которые закончились: они не смогут продаваться, пока не пополнятся остатки.", "Avval tugagan tovarlardan boshlang: qoldiq to‘ldirilmaguncha ular sotilmaydi."),
         ("Сначала проверьте товары, которые скоро закончатся, особенно если они хорошо продаются.", "Avval tez tugaydigan tovarlarni tekshiring, ayniqsa ular yaxshi sotilayotgan bo‘lsa."),
-        ("Загрузите себестоимость через Excel, чтобы бот точнее считал прибыль и маржу.", "Bot foyda va marjani aniqroq hisoblashi uchun tannarxni Excel orqali yuklang."),
+        ("Проверьте purchasePrice в карточках Uzum: бот берёт себестоимость только из Uzum и не подставляет её вручную.", "Uzum kartalaridagi purchasePrice qiymatini tekshiring: bot tannarxni faqat Uzumdan oladi va qo‘lda almashtirmaydi."),
         ("Проверьте товары с низкой маржой: возможно, цена или себестоимость указаны невыгодно.", "Past marjali tovarlarni tekshiring: narx yoki tannarx foydasiz bo‘lishi mumkin."),
         ("Посмотрите товары без продаж: возможно, стоит изменить цену, фото или вывести товар из оборота.", "Sotilmayotgan tovarlarni ko‘ring: narxni, rasmlarni o‘zgartirish yoki tovarni chiqarish kerak bo‘lishi mumkin."),
         ("Проверьте сегодняшние отмены и товары, по которым они произошли.", "Bugungi bekor qilishlar va ular bo‘lgan tovarlarni tekshiring."),
@@ -19026,6 +20110,371 @@ async def fbo_acceptance_watch_loop() -> None:
             logging.exception("FBO acceptance watcher loop error")
         await asyncio.sleep(max(300, FBO_ACCEPTANCE_CHECK_INTERVAL_SECONDS))
 
+
+# --- Deadline reminders for FBO supplies and marketplace returns ---
+def _logistics_status_code(value: Any) -> str:
+    return "_".join(
+        _status_text_any(value).strip().upper().replace("-", " ").split()
+    )
+
+
+def _logistics_is_terminal(value: Any) -> bool:
+    status = _logistics_status_code(value)
+    return any(
+        marker in status
+        for marker in (
+            "CANCEL",
+            "CLOSED",
+            "COMPLETED",
+            "FINISHED",
+            "REJECTED",
+            "DECLINED",
+            "ACCEPTED",
+        )
+    )
+
+
+def _logistics_location(item: dict[str, Any]) -> str:
+    value = _value_by_path(
+        item,
+        "warehouse.name",
+        "warehouseName",
+        "logisticWarehouse.name",
+        "logisticWarehouseName",
+        "stock.name",
+        "stockName",
+    )
+    return str(value or "—")
+
+
+def _invoice_slot(item: dict[str, Any]) -> tuple[datetime | None, datetime | None]:
+    return (
+        parse_api_datetime(
+            _value_by_path(item, "timeSlotReservation.timeFrom", "timeFrom")
+        ),
+        parse_api_datetime(
+            _value_by_path(item, "timeSlotReservation.timeTo", "timeTo")
+        ),
+    )
+
+
+def _return_id(item: dict[str, Any]) -> str:
+    return str(_value_by_path(item, "id", "returnId", "return.id") or "").strip()
+
+
+def _return_number(item: dict[str, Any]) -> str:
+    return str(
+        _value_by_path(
+            item,
+            "returnNumber",
+            "number",
+            "return.number",
+            "deliveryCertificate",
+        )
+        or _return_id(item)
+        or "—"
+    )
+
+
+def _return_status(item: dict[str, Any]) -> str:
+    return _status_text_any(
+        _value_by_path(item, "returnStatus", "status", "state", "returnStatus.value")
+    )
+
+
+def _return_paid_storage(item: dict[str, Any]) -> tuple[datetime | None, str]:
+    start_at = parse_api_datetime(
+        _value_by_path(
+            item,
+            "paidStorage.startDate",
+            "paidStorage.dateFrom",
+            "paidStorageStartDate",
+            "storageStartDate",
+        )
+    )
+    status = _status_text_any(
+        _value_by_path(
+            item,
+            "paidStorage.status",
+            "paidStorageStatus",
+            "storageStatus",
+        )
+    )
+    return start_at, status
+
+
+def _return_pickup_slot(item: dict[str, Any]) -> tuple[datetime | None, datetime | None]:
+    return (
+        parse_api_datetime(
+            _value_by_path(item, "timeSlotReservation.timeFrom", "timeFrom")
+        ),
+        parse_api_datetime(
+            _value_by_path(item, "timeSlotReservation.timeTo", "timeTo")
+        ),
+    )
+
+
+def _logistics_interval_text(start_at: datetime | None, end_at: datetime | None) -> str:
+    if start_at is None:
+        return "—"
+    start_text = _fmt_dt(start_at)
+    if end_at is None:
+        return start_text
+    if start_at.date() == end_at.date():
+        return f"{start_text}–{end_at.astimezone(UZT).strftime('%H:%M')}"
+    return f"{start_text}–{_fmt_dt(end_at)}"
+
+
+def build_supply_reminder_message(
+    invoice: dict[str, Any],
+    *,
+    shop_id: int,
+    bucket: str,
+    lang: str,
+) -> str:
+    start_at, end_at = _invoice_slot(invoice)
+    number = escape(_short_text(_invoice_number(invoice), 80))
+    location = escape(_short_text(_logistics_location(invoice), 90))
+    slot = escape(_logistics_interval_text(start_at, end_at))
+    status = escape(_short_text(_invoice_status(invoice), 60))
+    if normalize_lang(lang) == "uz":
+        urgency = "3 soatdan kam qoldi" if bucket == "3h" else "24 soatdan kam qoldi"
+        return (
+            f"⏰ <b>Yetkazish vaqti — {urgency}</b>\n\n"
+            f"🏪 Do‘kon: <code>{shop_id}</code>\n"
+            f"📄 Yuk xati: <b>{number}</b>\n"
+            f"🏬 Ombor: {location}\n"
+            f"🕒 Vaqt: <b>{slot}</b>\n"
+            f"📌 Holat: {status}\n\n"
+            "Uzum Seller’da yuk tayyorligini va belgilangan vaqtni tekshiring."
+        )
+    urgency = "осталось не более 3 часов" if bucket == "3h" else "осталось не более 24 часов"
+    return (
+        f"⏰ <b>Срок поставки — {urgency}</b>\n\n"
+        f"🏪 Магазин: <code>{shop_id}</code>\n"
+        f"📄 Накладная: <b>{number}</b>\n"
+        f"🏬 Склад: {location}\n"
+        f"🕒 Слот: <b>{slot}</b>\n"
+        f"📌 Статус: {status}\n\n"
+        "Проверьте готовность груза и назначенный слот в Uzum Seller."
+    )
+
+
+def build_return_pickup_reminder_message(
+    item: dict[str, Any],
+    *,
+    shop_id: int,
+    bucket: str,
+    lang: str,
+) -> str:
+    start_at, storage_status = _return_paid_storage(item)
+    pickup_from, pickup_to = _return_pickup_slot(item)
+    number = escape(_short_text(_return_number(item), 80))
+    location = escape(_short_text(_logistics_location(item), 90))
+    start_text = escape(_fmt_dt(start_at))
+    pickup_text = escape(_logistics_interval_text(pickup_from, pickup_to))
+    status = escape(_short_text(_return_status(item), 60))
+    storage_status_text = escape(_short_text(storage_status, 60))
+    if normalize_lang(lang) == "uz":
+        urgency = {
+            "3d": "3 kun qoldi",
+            "2d": "2 kun qoldi",
+            "1d": "1 kun qoldi",
+            "active": "pullik saqlash boshlandi",
+        }.get(bucket, "muddat yaqin")
+        lines = [
+            f"↩️ <b>Qaytarmani olib ketish — {urgency}</b>",
+            "",
+            f"🏪 Do‘kon: <code>{shop_id}</code>",
+            f"📄 Qaytarma: <b>{number}</b>",
+            f"🏬 Ombor: {location}",
+            f"💳 Pullik saqlash boshlanishi: <b>{start_text}</b>",
+            f"📌 Holat: {status} / {storage_status_text}",
+        ]
+        if pickup_from is not None:
+            lines.append(f"🕒 Olib ketish vaqti: <b>{pickup_text}</b>")
+        lines.extend(["", "Qo‘shimcha saqlash xarajati bo‘lmasligi uchun Uzum Seller’da qaytarmani tekshiring."])
+        return "\n".join(lines)
+    urgency = {
+        "3d": "осталось 3 дня",
+        "2d": "осталось 2 дня",
+        "1d": "остался 1 день",
+        "active": "платное хранение началось",
+    }.get(bucket, "срок приближается")
+    lines = [
+        f"↩️ <b>Заберите возврат — {urgency}</b>",
+        "",
+        f"🏪 Магазин: <code>{shop_id}</code>",
+        f"📄 Возврат: <b>{number}</b>",
+        f"🏬 Склад: {location}",
+        f"💳 Начало платного хранения: <b>{start_text}</b>",
+        f"📌 Статус: {status} / {storage_status_text}",
+    ]
+    if pickup_from is not None:
+        lines.append(f"🕒 Слот получения: <b>{pickup_text}</b>")
+    lines.extend(["", "Проверьте возврат в Uzum Seller, чтобы избежать лишних расходов на хранение."])
+    return "\n".join(lines)
+
+
+async def _load_return_invoices(
+    client: UzumClient,
+    shop_id: int,
+    *,
+    max_pages: int,
+    page_size: int = 20,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for page in range(max(1, int(max_pages))):
+        data = await client.get_returns(shop_id, page=page, size=page_size)
+        items = [row for row in _extract_list_any(data) if isinstance(row, dict)]
+        if not items:
+            break
+        for item in items:
+            identity = _return_id(item) or hashlib.sha256(
+                json.dumps(item, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()[:24]
+            if identity not in seen:
+                seen.add(identity)
+                rows.append(item)
+        if len(items) < page_size:
+            break
+    return rows
+
+
+async def check_logistics_reminders_once() -> None:
+    now = _utc_now()
+    for group in connected_watch_groups(
+        "notify_supply_reminders",
+        "notify_return_pickup",
+    ):
+        shop_id = int(group["shop_id"])
+        telegram_ids = [int(value) for value in group["telegram_ids"]]
+        supply_users = [
+            user_id
+            for user_id in telegram_ids
+            if product_setting_enabled(user_id, "notify_supply_reminders")
+        ]
+        return_users = [
+            user_id
+            for user_id in telegram_ids
+            if product_setting_enabled(user_id, "notify_return_pickup")
+        ]
+        try:
+            token = cipher.decrypt(group["uzum_token_encrypted"])
+            client = UzumClient(token, UZUM_API_BASE_URL)
+        except Exception as error:
+            _log_watcher_api_failure(
+                "Logistics reminder token",
+                error,
+                shop_id=shop_id,
+                telegram_ids=telegram_ids,
+            )
+            continue
+
+        invoices: list[dict[str, Any]] = []
+        returns: list[dict[str, Any]] = []
+        if supply_users:
+            try:
+                invoices, _ = await _load_fbo_invoices(
+                    client,
+                    shop_id,
+                    max_pages=LOGISTICS_REMINDER_INVOICE_PAGES,
+                    page_size=20,
+                )
+            except Exception as error:
+                _log_watcher_api_failure(
+                    "Supply deadline reminder",
+                    error,
+                    shop_id=shop_id,
+                    telegram_ids=supply_users,
+                )
+        if return_users:
+            try:
+                returns = await _load_return_invoices(
+                    client,
+                    shop_id,
+                    max_pages=LOGISTICS_REMINDER_RETURN_PAGES,
+                )
+            except Exception as error:
+                _log_watcher_api_failure(
+                    "Return pickup reminder",
+                    error,
+                    shop_id=shop_id,
+                    telegram_ids=return_users,
+                )
+
+        for invoice in invoices:
+            if _logistics_is_terminal(_invoice_status(invoice)):
+                continue
+            start_at, _ = _invoice_slot(invoice)
+            bucket = supply_reminder_bucket(start_at, now)
+            if bucket is None:
+                continue
+            invoice_id = str(_invoice_id(invoice) or _invoice_number(invoice)).strip()
+            slot_key = start_at.isoformat() if start_at else "unknown"
+            for telegram_id in supply_users:
+                _enqueue_notification(
+                    "supply_reminder",
+                    telegram_id,
+                    shop_id,
+                    f"invoice:{invoice_id}:slot:{slot_key}:{bucket}",
+                    {
+                        "text": build_supply_reminder_message(
+                            invoice,
+                            shop_id=shop_id,
+                            bucket=bucket,
+                            lang=get_user_language(telegram_id),
+                        )
+                    },
+                )
+
+        for item in returns:
+            if _logistics_is_terminal(_return_status(item)):
+                continue
+            start_at, storage_status = _return_paid_storage(item)
+            bucket = return_reminder_bucket(
+                start_at,
+                now,
+                storage_status=storage_status,
+            )
+            if bucket is None:
+                continue
+            return_id = _return_id(item) or _return_number(item)
+            storage_key = start_at.isoformat() if start_at else "unknown"
+            for telegram_id in return_users:
+                _enqueue_notification(
+                    "return_pickup_reminder",
+                    telegram_id,
+                    shop_id,
+                    f"return:{return_id}:storage:{storage_key}:{bucket}",
+                    {
+                        "text": build_return_pickup_reminder_message(
+                            item,
+                            shop_id=shop_id,
+                            bucket=bucket,
+                            lang=get_user_language(telegram_id),
+                        )
+                    },
+                )
+        await asyncio.sleep(0.2)
+
+    await _deliver_pending_notifications()
+
+
+async def logistics_reminder_watch_loop() -> None:
+    await asyncio.sleep(135)
+    logging.info(
+        "Logistics reminder watcher started. Interval: %s seconds",
+        LOGISTICS_REMINDER_CHECK_INTERVAL_SECONDS,
+    )
+    while True:
+        try:
+            await check_logistics_reminders_once()
+        except Exception:
+            logging.exception("Logistics reminder watcher loop error")
+        await asyncio.sleep(LOGISTICS_REMINDER_CHECK_INTERVAL_SECONDS)
+
 # =============================================================================
 # RELEASE HARDENING 2026-07
 # Correct Finance math, partial cancellations, SKU isolation, persistent watcher
@@ -20157,6 +21606,12 @@ async def _deliver_pending_notifications() -> None:
                     shop_id=shop_id,
                     lang=get_user_language(telegram_id),
                 )
+            elif event_type in {"supply_reminder", "return_pickup_reminder"}:
+                text = str(payload.get("text") or "").strip()
+                if not text:
+                    raise ValueError("Outbox reminder payload has no text")
+                if len(text) > 4000:
+                    raise ValueError("Outbox reminder text is too long")
             else:
                 item = payload.get("item")
                 if not isinstance(item, dict):
@@ -21012,7 +22467,7 @@ _cleanup_release_state()
 # Preserves per-user instant/hourly modes while using the durable outbox and
 # adaptive Finance pagination from RELEASE_HARDENING.
 # =============================================================================
-PREMIUM_RELEASE_VERSION = "2026.07.19-premium-r11-stability-security"
+PREMIUM_RELEASE_VERSION = "2026.07.20-premium-r12-uzum-finance-reminders"
 
 
 async def check_new_sales_once() -> None:
@@ -21238,6 +22693,8 @@ async def main() -> None:
     logging.info("TRIAL_FEATURE_GATING_LOADED: sales today + sale alerts + morning report")
     logging.info("MANAGEMENT_PDF_LOADED: sales + profit + stock + cancellations + returns + defects")
     logging.info("STABILITY_SECURITY_LOADED: stock routes + watcher settings + safe backup + bounded Excel import")
+    logging.info("UZUM_FINANCE_LOADED: purchasePrice-only cost + expense ledger + IKPU audit")
+    logging.info("LOGISTICS_REMINDERS_LOADED: FBO slots + return paid-storage deadlines")
     try:
         pdf_regular_font, pdf_bold_font = _fbo_pdf_font_paths()
         logging.info(
@@ -21264,6 +22721,7 @@ async def main() -> None:
         asyncio.create_task(stock_change_watch_loop())
     asyncio.create_task(loss_defect_watch_loop())
     asyncio.create_task(fbo_acceptance_watch_loop())
+    asyncio.create_task(logistics_reminder_watch_loop())
     asyncio.create_task(daily_report_loop())
     if SUBSCRIPTION_REMINDERS:
         asyncio.create_task(subscription_reminder_loop())

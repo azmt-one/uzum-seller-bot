@@ -203,6 +203,15 @@ def flatten_sku_rows(products: list[Any]) -> list[dict[str, Any]]:
                 "category": category,
                 "price": sku.get("price") or sku.get("marketPrice"),
                 "market_price": sku.get("marketPrice"),
+                # Financial/catalog fields documented by Uzum Seller OpenAPI.
+                # Keep purchasePrice separate from the sale price: silently
+                # substituting ``price`` here would overstate seller profit.
+                "purchase_price": to_number(sku.get("purchasePrice")),
+                "ikpu": sku.get("ikpu"),
+                "paid_storage_price_item": to_number(sku.get("paidStoragePriceItem")),
+                "paid_storage_amount": to_number(sku.get("paidStorageAmount")),
+                "paid_storage": bool(sku.get("pstorage")),
+                "paid_storage_dimensional_group": sku.get("paidStorageDimensionalGroup"),
                 "total": total,
                 "active": active,
                 "fbo": fbo,
