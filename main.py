@@ -2525,7 +2525,8 @@ def init_product_value_tables() -> None:
                 telegram_id INTEGER PRIMARY KEY,
                 notify_orders INTEGER NOT NULL DEFAULT 0,
                 notify_sales INTEGER NOT NULL DEFAULT 1,
-                sales_notification_mode TEXT NOT NULL DEFAULT 'instant',
+                sales_notification_mode TEXT NOT NULL DEFAULT 'hourly',
+                sales_mode_explicit INTEGER NOT NULL DEFAULT 0,
                 notify_low_stock INTEGER NOT NULL DEFAULT 1,
                 notify_out_of_stock INTEGER NOT NULL DEFAULT 1,
                 notify_cancellations INTEGER NOT NULL DEFAULT 1,
@@ -2569,7 +2570,27 @@ def init_product_value_tables() -> None:
         if "sales_notification_mode" not in existing_product_columns:
             conn.execute(
                 "ALTER TABLE product_settings "
-                "ADD COLUMN sales_notification_mode TEXT NOT NULL DEFAULT 'instant'"
+                "ADD COLUMN sales_notification_mode TEXT NOT NULL DEFAULT 'hourly'"
+            )
+        if "sales_mode_explicit" not in existing_product_columns:
+            conn.execute(
+                "ALTER TABLE product_settings "
+                "ADD COLUMN sales_mode_explicit INTEGER NOT NULL DEFAULT 0"
+            )
+        migrated_hourly = conn.execute(
+            """
+            UPDATE product_settings
+            SET sales_notification_mode = 'hourly', updated_at = ?
+            WHERE notify_sales = 1
+              AND sales_mode_explicit = 0
+              AND LOWER(COALESCE(sales_notification_mode, '')) IN ('', 'instant')
+            """,
+            (_dt_to_db(_utc_now()) or "",),
+        ).rowcount
+        if migrated_hourly:
+            logging.info(
+                "Sales notification default migrated to hourly users=%s",
+                migrated_hourly,
             )
         conn.execute(
             """
@@ -2747,6 +2768,15 @@ def init_product_value_tables() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS sales_digest_user_state (
+                telegram_id INTEGER PRIMARY KEY,
+                last_sent_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
 
 
@@ -2757,16 +2787,18 @@ def ensure_product_settings(telegram_id: int) -> dict[str, Any]:
         conn.execute(
             """
             INSERT OR IGNORE INTO product_settings (
-                telegram_id, notify_orders, notify_sales, notify_low_stock,
+                telegram_id, notify_orders, notify_sales,
+                sales_notification_mode, sales_mode_explicit, notify_low_stock,
                 notify_out_of_stock, notify_cancellations, notify_reviews,
                 notify_stock_change, daily_enabled, daily_hour,
                 low_stock_threshold, updated_at
-            ) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, 0, ?, ?, 1, ?, ?, ?, ?, ?, ?)
             """,
             (
                 int(telegram_id),
                 1 if NEW_ORDER_NOTIFICATIONS else 0,
                 1 if SALE_NOTIFICATIONS else 0,
+                "hourly",
                 1 if LOW_STOCK_NOTIFICATIONS else 0,
                 1 if OUT_OF_STOCK_NOTIFICATIONS else 0,
                 1 if REVIEW_NOTIFICATIONS else 0,
@@ -2789,9 +2821,14 @@ def update_product_setting(telegram_id: int, field: str, value: Any) -> dict[str
     if field not in PRODUCT_SETTING_FIELDS:
         raise ValueError(f"Unsupported product setting: {field}")
     ensure_product_settings(telegram_id)
+    explicit_clause = (
+        ", sales_mode_explicit = 1"
+        if field == "sales_notification_mode"
+        else ""
+    )
     with db.connect() as conn:
         conn.execute(
-            f"UPDATE product_settings SET {field} = ?, updated_at = ? WHERE telegram_id = ?",
+            f"UPDATE product_settings SET {field} = ?{explicit_clause}, updated_at = ? WHERE telegram_id = ?",
             (value, _dt_to_db(_utc_now()) or "", int(telegram_id)),
         )
         conn.commit()
@@ -2808,8 +2845,8 @@ SALES_NOTIFICATION_MODES = {"instant", "hourly", "off"}
 def _sales_notification_mode_from_settings(settings: dict[str, Any]) -> str:
     if not bool(int(settings.get("notify_sales") or 0)):
         return "off"
-    mode = str(settings.get("sales_notification_mode") or "instant").strip().lower()
-    return mode if mode in {"instant", "hourly"} else "instant"
+    mode = str(settings.get("sales_notification_mode") or "hourly").strip().lower()
+    return mode if mode in {"instant", "hourly"} else "hourly"
 
 
 def get_sales_notification_mode(telegram_id: int) -> str:
@@ -2822,12 +2859,13 @@ def set_sales_notification_mode(telegram_id: int, mode: str) -> dict[str, Any]:
         raise ValueError(f"Unsupported sales notification mode: {mode}")
     ensure_product_settings(telegram_id)
     enabled = 0 if normalized == "off" else 1
-    stored_mode = "instant" if normalized == "off" else normalized
+    stored_mode = "hourly" if normalized == "off" else normalized
     with db.connect() as conn:
         conn.execute(
             """
             UPDATE product_settings
-            SET notify_sales = ?, sales_notification_mode = ?, updated_at = ?
+            SET notify_sales = ?, sales_notification_mode = ?,
+                sales_mode_explicit = 1, updated_at = ?
             WHERE telegram_id = ?
             """,
             (
@@ -9104,8 +9142,8 @@ def build_review_notification(review: Any, shop_id: int, lang: str = "ru") -> st
     )
 
 
-_seen_review_keys_by_user: dict[int, set[str]] = {}
-_reviews_watch_initialized: set[int] = set()
+_seen_review_keys_by_scope: dict[tuple[int, int], set[str]] = {}
+_reviews_watch_initialized_scopes: set[tuple[int, int]] = set()
 
 
 async def check_new_reviews_once() -> None:
@@ -9132,17 +9170,18 @@ async def check_new_reviews_once() -> None:
 
         keys_now = [_review_seen_key(item) for item in items]
         for telegram_id in telegram_ids:
-            known = _seen_review_keys_by_user.setdefault(telegram_id, set())
-            if telegram_id not in _reviews_watch_initialized:
+            scope = (telegram_id, shop_id)
+            known = _seen_review_keys_by_scope.setdefault(scope, set())
+            if scope not in _reviews_watch_initialized_scopes:
                 known.update(keys_now)
-                _reviews_watch_initialized.add(telegram_id)
+                _reviews_watch_initialized_scopes.add(scope)
                 logging.info("Reviews watcher initialized for user=%s shop=%s reviews=%s", telegram_id, shop_id, len(keys_now))
                 continue
 
             new_items = [item for item, key in zip(items, keys_now) if key not in known]
             known.update(keys_now)
             if len(known) > 2000:
-                _seen_review_keys_by_user[telegram_id] = set(keys_now)
+                _seen_review_keys_by_scope[scope] = set(keys_now)
             for item in new_items[:10]:
                 try:
                     await bot.send_message(
@@ -11643,8 +11682,8 @@ async def seller_pdf_report_callback(callback: CallbackQuery) -> None:
 # 1) при первом запуске бот запоминает текущие CREATED-заказы и не спамит ими;
 # 2) дальше каждые ORDER_CHECK_INTERVAL_SECONDS секунд проверяет новые CREATED-заказы;
 # 3) если появился новый заказ, пишет продавцу в Telegram.
-_seen_order_keys_by_user: dict[int, set[str]] = {}
-_orders_watch_initialized: set[int] = set()
+_seen_order_keys_by_scope: dict[tuple[int, int], set[str]] = {}
+_orders_watch_initialized_scopes: set[tuple[int, int]] = set()
 
 
 def order_key(order: Any) -> str:
@@ -11677,21 +11716,79 @@ def order_key(order: Any) -> str:
 
 
 def connected_users_for_order_watch(access_feature: str = "premium") -> list[dict[str, Any]]:
-    """Return connected users whose subscription permits this watcher."""
+    """Return one watcher row for every connected shop available to a user.
+
+    ``users.default_shop_id`` is only the shop selected for interactive menu
+    commands.  Background notifications must not silently inherit that UI
+    choice: a seller who connected several shops expects every one of them to
+    be monitored.  The LEFT JOIN keeps older installations working when a
+    connection exists but the ``shops`` table has not been populated yet.
+    """
     with db.connect() as conn:
         rows = conn.execute(
             """
-            SELECT telegram_id, default_shop_id, uzum_token_encrypted
-            FROM users
-            WHERE uzum_token_encrypted IS NOT NULL
-              AND default_shop_id IS NOT NULL
+            SELECT
+                u.telegram_id,
+                COALESCE(s.shop_id, u.default_shop_id) AS shop_id,
+                COALESCE(s.shop_id, u.default_shop_id) AS default_shop_id,
+                u.default_shop_id AS selected_shop_id,
+                COALESCE(s.title, '') AS shop_title,
+                u.uzum_token_encrypted
+            FROM users AS u
+            LEFT JOIN shops AS s
+              ON s.telegram_id = u.telegram_id
+            WHERE u.uzum_token_encrypted IS NOT NULL
+              AND COALESCE(s.shop_id, u.default_shop_id) IS NOT NULL
+            ORDER BY
+                u.telegram_id,
+                CASE WHEN s.shop_id = u.default_shop_id THEN 0 ELSE 1 END,
+                COALESCE(s.shop_id, u.default_shop_id)
             """
         ).fetchall()
-    return [
-        dict(row)
-        for row in rows
-        if feature_access_allowed(int(row["telegram_id"]), access_feature)
-    ]
+    allowed_by_user: dict[int, bool] = {}
+    result: list[dict[str, Any]] = []
+    seen_scopes: set[tuple[int, int]] = set()
+    for raw_row in rows:
+        row = dict(raw_row)
+        telegram_id = int(row["telegram_id"])
+        shop_id = int(row["shop_id"])
+        scope = (telegram_id, shop_id)
+        if scope in seen_scopes:
+            continue
+        if telegram_id not in allowed_by_user:
+            allowed_by_user[telegram_id] = feature_access_allowed(
+                telegram_id,
+                access_feature,
+            )
+        if not allowed_by_user[telegram_id]:
+            continue
+        seen_scopes.add(scope)
+        result.append(row)
+    return result
+
+
+def connected_shop_ids_for_user(telegram_id: int) -> list[int]:
+    """Return every stored shop id, with a legacy default-shop fallback."""
+    shop_ids = {
+        int(row["shop_id"])
+        for row in db.list_shops(int(telegram_id))
+        if row["shop_id"] is not None
+    }
+    default_shop_id = db.get_default_shop_id(int(telegram_id))
+    if not shop_ids and default_shop_id is not None:
+        shop_ids.add(int(default_shop_id))
+    return sorted(shop_ids)
+
+
+def connected_shop_titles_for_user(telegram_id: int) -> dict[int, str]:
+    """Return safe shop labels for multi-shop digest sections."""
+    result: dict[int, str] = {}
+    for row in db.list_shops(int(telegram_id)):
+        shop_id = int(row["shop_id"])
+        title = str(row["title"] or "").strip()
+        if title and title != "—":
+            result[shop_id] = title
+    return result
 
 
 async def check_new_orders_once() -> None:
@@ -11711,12 +11808,13 @@ async def check_new_orders_once() -> None:
             continue
 
         keys_now = [order_key(item) for item in items]
-        known = _seen_order_keys_by_user.setdefault(telegram_id, set())
+        scope = (telegram_id, shop_id)
+        known = _seen_order_keys_by_scope.setdefault(scope, set())
 
         # Первый проход: просто запоминаем текущие заказы, чтобы не прислать старые как новые.
-        if telegram_id not in _orders_watch_initialized:
+        if scope not in _orders_watch_initialized_scopes:
             known.update(keys_now)
-            _orders_watch_initialized.add(telegram_id)
+            _orders_watch_initialized_scopes.add(scope)
             logging.info(
                 "Order watcher initialized for user=%s shop=%s orders=%s",
                 telegram_id,
@@ -11730,7 +11828,7 @@ async def check_new_orders_once() -> None:
 
         # Чтобы память не росла бесконечно.
         if len(known) > 1000:
-            _seen_order_keys_by_user[telegram_id] = set(keys_now)
+            _seen_order_keys_by_scope[scope] = set(keys_now)
 
         if not new_items:
             continue
@@ -11778,11 +11876,16 @@ async def notify_status(message: Message) -> None:
         return
     _, _, shop_id = req
     enabled = product_setting_enabled(telegram_id, "notify_orders")
-    initialized = telegram_id in _orders_watch_initialized
+    shop_ids = connected_shop_ids_for_user(telegram_id)
+    initialized = bool(shop_ids) and all(
+        (telegram_id, watched_shop_id) in _orders_watch_initialized_scopes
+        for watched_shop_id in shop_ids
+    )
     await message.answer(
         "🔔 <b>Уведомления о новых заказах</b>\n\n"
         f"Статус: {'✅ включены' if enabled else '❌ выключены'}\n"
-        f"Магазин: <code>{shop_id}</code>\n"
+        f"Магазинов под наблюдением: <b>{len(shop_ids) or 1}</b>\n"
+        f"Активный в меню: <code>{shop_id}</code>\n"
         f"Проверка каждые: <b>{max(60, ORDER_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
         f"Состояние: {'заказы уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
         "Бот уведомит, когда появится новый заказ со статусом <code>CREATED</code>.",
@@ -11900,11 +12003,16 @@ async def lowstock_notify_status(message: Message) -> None:
     settings = ensure_product_settings(telegram_id)
     enabled = bool(int(settings.get("notify_low_stock") or 0))
     threshold = int(settings.get("low_stock_threshold") or 0)
-    initialized = telegram_id in _low_stock_watch_initialized
+    shop_ids = connected_shop_ids_for_user(telegram_id)
+    initialized = bool(shop_ids) and all(
+        _load_stock_watch_snapshot(telegram_id, watched_shop_id, "low") is not None
+        for watched_shop_id in shop_ids
+    )
     await message.answer(
         "📉 <b>Уведомления о низких остатках</b>\n\n"
         f"Статус: {'✅ включены' if enabled else '❌ выключены'}\n"
-        f"Магазин: <code>{shop_id}</code>\n"
+        f"Магазинов под наблюдением: <b>{len(shop_ids) or 1}</b>\n"
+        f"Активный в меню: <code>{shop_id}</code>\n"
         f"Порог: ≤ <b>{threshold}</b> шт.\n"
         f"Проверка каждые: <b>{max(300, LOW_STOCK_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
         f"Состояние: {'остатки уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
@@ -12007,11 +12115,16 @@ async def outofstock_notify_status(message: Message) -> None:
         return
     _, _, shop_id = req
     enabled = product_setting_enabled(telegram_id, "notify_out_of_stock")
-    initialized = telegram_id in _out_of_stock_watch_initialized
+    shop_ids = connected_shop_ids_for_user(telegram_id)
+    initialized = bool(shop_ids) and all(
+        _load_stock_watch_snapshot(telegram_id, watched_shop_id, "zero") is not None
+        for watched_shop_id in shop_ids
+    )
     await message.answer(
         "❌ <b>Уведомления о нулевых остатках</b>\n\n"
         f"Статус: {'✅ включены' if enabled else '❌ выключены'}\n"
-        f"Магазин: <code>{shop_id}</code>\n"
+        f"Магазинов под наблюдением: <b>{len(shop_ids) or 1}</b>\n"
+        f"Активный в меню: <code>{shop_id}</code>\n"
         f"Проверка каждые: <b>{max(300, OUT_OF_STOCK_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
         f"Состояние: {'нулевые остатки уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
         "Бот уведомит, когда товар впервые опустится до остатка <b>0</b>.",
@@ -12269,13 +12382,18 @@ async def sales_notify_status(message: Message) -> None:
         return
     _, _, shop_id = req
     enabled = product_setting_enabled(telegram_id, "notify_sales")
-    initialized = telegram_id in _sales_watch_initialized
+    shop_ids = connected_shop_ids_for_user(telegram_id)
+    initialized = bool(shop_ids) and all(
+        _watch_is_initialized(telegram_id, watched_shop_id, "finance")
+        for watched_shop_id in shop_ids
+    )
     await message.answer(
         "💸 <b>Уведомления о новых продажах</b>\n\n"
         f"Статус: {'✅ включены' if enabled else '❌ выключены'}\n"
-        f"Магазин: <code>{shop_id}</code>\n"
+        f"Магазинов под наблюдением: <b>{len(shop_ids) or 1}</b>\n"
+        f"Активный в меню: <code>{shop_id}</code>\n"
         f"Проверка каждые: <b>{max(60, SALE_CHECK_INTERVAL_SECONDS)}</b> сек.\n"
-        f"Состояние: {'продажи уже запомнены' if initialized else 'инициализация при следующей проверке'}\n\n"
+        f"Состояние: {'все магазины инициализированы' if initialized else 'инициализация магазинов при следующей проверке'}\n\n"
         "Бот смотрит Finance API за сегодня. Если Finance API отдаёт продажу с задержкой, уведомление тоже придёт с задержкой.",
         reply_markup=menu_for_message(message),
     )
@@ -15855,7 +15973,8 @@ def connected_watch_groups(
             for field in setting_fields
         ):
             continue
-        shop_id = int(row["default_shop_id"])
+        shop_id = int(row.get("shop_id") or row["default_shop_id"])
+        shop_title = str(row.get("shop_title") or "").strip()
         encrypted_token = row["uzum_token_encrypted"]
         # Fernet шифрует один и тот же токен каждый раз по-разному, поэтому
         # группировка по зашифрованной строке не убирала дубли. Сравниваем только
@@ -15870,11 +15989,15 @@ def connected_watch_groups(
             groups[key] = {
                 "watch_key": key,
                 "shop_id": shop_id,
+                "shop_title": shop_title,
                 "uzum_token_encrypted": encrypted_token,
                 "telegram_ids": [],
+                "shop_titles_by_user": {},
             }
         if telegram_id not in groups[key]["telegram_ids"]:
             groups[key]["telegram_ids"].append(telegram_id)
+        if shop_title:
+            groups[key]["shop_titles_by_user"][telegram_id] = shop_title
     return list(groups.values())
 
 
@@ -15962,10 +16085,11 @@ async def check_new_orders_once() -> None:
 
         keys_now = [order_key(item) for item in items]
         for telegram_id in telegram_ids:
-            known = _seen_order_keys_by_user.setdefault(telegram_id, set())
-            if telegram_id not in _orders_watch_initialized:
+            scope = (telegram_id, shop_id)
+            known = _seen_order_keys_by_scope.setdefault(scope, set())
+            if scope not in _orders_watch_initialized_scopes:
                 known.update(keys_now)
-                _orders_watch_initialized.add(telegram_id)
+                _orders_watch_initialized_scopes.add(scope)
                 logging.info(
                     "Order watcher initialized for user=%s shop=%s orders=%s",
                     telegram_id, shop_id, len(keys_now),
@@ -15975,7 +16099,7 @@ async def check_new_orders_once() -> None:
             new_items = [item for item, key in zip(items, keys_now) if key not in known]
             known.update(keys_now)
             if len(known) > 1000:
-                _seen_order_keys_by_user[telegram_id] = set(keys_now)
+                _seen_order_keys_by_scope[scope] = set(keys_now)
             if not new_items:
                 continue
 
@@ -16523,6 +16647,7 @@ def _enabled_count(settings: dict[str, Any], fields: Iterable[str]) -> tuple[int
 def notification_hub_text(telegram_id: int) -> str:
     lang = get_user_language(telegram_id)
     row = ensure_product_settings(telegram_id)
+    shop_count = len(connected_shop_ids_for_user(telegram_id))
     stock_on, stock_total = _enabled_count(row, NOTIFICATION_SECTION_FIELDS["stock"])
     reports_on, reports_total = _enabled_count(row, NOTIFICATION_SECTION_FIELDS["reports"])
     if lang == "uz":
@@ -16532,6 +16657,7 @@ def notification_hub_text(telegram_id: int) -> str:
             f"📦 Ombor va yetkazish: <b>{stock_on}/{stock_total} yoqilgan</b>\n"
             f"📅 Avtohisobotlar: <b>{reports_on}/{reports_total} yoqilgan</b>\n"
             f"⭐ Sharhlar: {_toggle_icon(row.get('notify_reviews'))}\n\n"
+            f"🏪 Tezkor xabarnomalar barcha ulangan do‘konlarda ishlaydi: <b>{shop_count}</b>\n\n"
             "Sozlash uchun kerakli guruhni tanlang."
         )
     return (
@@ -16540,6 +16666,7 @@ def notification_hub_text(telegram_id: int) -> str:
         f"📦 Склад и поставки: <b>{stock_on}/{stock_total} включено</b>\n"
         f"📅 Автоотчёты: <b>{reports_on}/{reports_total} включено</b>\n"
         f"⭐ Отзывы: {_toggle_icon(row.get('notify_reviews'))}\n\n"
+        f"🏪 Оперативные уведомления работают для всех подключённых магазинов: <b>{shop_count}</b>\n\n"
         "Выберите группу — увидите только относящиеся к ней настройки."
     )
 
@@ -16781,18 +16908,18 @@ def automation_settings_markup(telegram_id: int) -> InlineKeyboardMarkup:
 def sales_mode_selection_text(telegram_id: int) -> str:
     lang = get_user_language(telegram_id)
     settings = ensure_product_settings(telegram_id)
-    shop_id = db.get_default_shop_id(telegram_id)
-    shop_text = str(shop_id) if shop_id is not None else "—"
+    shop_count = len(connected_shop_ids_for_user(telegram_id))
     trial = subscription_access_level(telegram_id) == "trial"
     if normalize_lang(lang) == "uz":
         return (
             "💸 <b>Savdo xabarlari rejimi</b>\n\n"
-            f"🏪 Faol do‘kon: <code>{shop_text}</code>\n"
+            f"🏪 Kuzatuvda: <b>barcha ulangan do‘konlar ({shop_count})</b>\n"
             f"Hozir: <b>{_sales_mode_label(settings, lang)}</b>\n\n"
             "⚡ <b>Darhol</b> — har bir yangi savdo alohida xabar bo‘lib keladi. "
             "Savdosi kam do‘konlar uchun qulay.\n\n"
-            "🕐 <b>Har soatda hisobot</b> — bot savdolarni yig‘adi va soatiga bitta xabar yuboradi: "
-            "buyurtmalar, dona, tushum, komissiya, logistika, to‘lov va top tovarlar."
+            "🕐 <b>Har soatda hisobot</b> — bot barcha do‘konlardagi savdolarni yig‘adi va "
+            "soatiga bitta umumiy xabar yuboradi: buyurtmalar, dona, tushum, komissiya, "
+            "logistika, to‘lov va do‘konlar kesimi."
             + (
                 "\n\n🚫 Bekor qilingan buyurtmalar tanlangan rejimdan qat’i nazar alohida tezkor xabar bo‘lib keladi."
                 if not trial
@@ -16801,12 +16928,12 @@ def sales_mode_selection_text(telegram_id: int) -> str:
         )
     return (
         "💸 <b>Режим уведомлений о продажах</b>\n\n"
-        f"🏪 Активный магазин: <code>{shop_text}</code>\n"
+        f"🏪 Под наблюдением: <b>все подключённые магазины ({shop_count})</b>\n"
         f"Сейчас: <b>{_sales_mode_label(settings, lang)}</b>\n\n"
         "⚡ <b>Сразу</b> — каждая новая продажа приходит отдельным сообщением. "
         "Удобно для небольших магазинов.\n\n"
-        "🕐 <b>Сводка раз в час</b> — бот собирает продажи и присылает одно сообщение: "
-        "заказы, количество товаров, выручка, комиссия, логистика, выплата и топ товаров."
+        "🕐 <b>Сводка раз в час</b> — бот объединяет продажи всех магазинов в одно сообщение: "
+        "заказы, количество товаров, выручка, комиссия, логистика, выплата и разбивка по магазинам."
         + (
             "\n\n🚫 Отмены остаются отдельными срочными уведомлениями независимо от выбранного режима."
             if not trial
@@ -17045,14 +17172,11 @@ async def sales_mode_callback(callback: CallbackQuery) -> None:
         return
 
     set_sales_notification_mode(telegram_id, action)
-    shop_id = db.get_default_shop_id(telegram_id)
-    if shop_id is not None:
-        reset_sales_digest_schedule(
-            telegram_id,
-            int(shop_id),
-            now=_utc_now(),
-            clear_queue=True,
-        )
+    reset_user_sales_digest_schedule(
+        telegram_id,
+        now=_utc_now(),
+        clear_queue=True,
+    )
     if callback.message:
         if back_to == "trial":
             await callback.message.edit_text(
@@ -18806,6 +18930,296 @@ async def maybe_send_hourly_sales_digest(
         summary.get("positions"),
         summary.get("units"),
         summary.get("revenue"),
+    )
+    return True
+
+
+def reset_user_sales_digest_schedule(
+    telegram_id: int,
+    *,
+    now: datetime | None = None,
+    clear_queue: bool = False,
+) -> None:
+    """Reset the single hourly schedule shared by all of a user's shops."""
+    init_product_value_tables()
+    now_text = _dt_to_db(now or _utc_now()) or ""
+    with db.connect() as conn:
+        if clear_queue:
+            conn.execute(
+                "DELETE FROM sales_digest_queue WHERE telegram_id = ?",
+                (int(telegram_id),),
+            )
+        conn.execute(
+            """
+            INSERT INTO sales_digest_user_state
+                (telegram_id, last_sent_at, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                last_sent_at = excluded.last_sent_at,
+                updated_at = excluded.updated_at
+            """,
+            (int(telegram_id), now_text, now_text),
+        )
+        conn.execute(
+            """
+            UPDATE sales_digest_state
+            SET last_sent_at = ?, updated_at = ?
+            WHERE telegram_id = ?
+            """,
+            (now_text, now_text, int(telegram_id)),
+        )
+        conn.commit()
+
+
+def get_user_sales_digest_last_sent(
+    telegram_id: int,
+    *,
+    now: datetime | None = None,
+) -> datetime:
+    """Get the shared multi-shop digest schedule without sending old events."""
+    init_product_value_tables()
+    current = now or _utc_now()
+    with db.connect() as conn:
+        row = conn.execute(
+            """
+            SELECT last_sent_at
+            FROM sales_digest_user_state
+            WHERE telegram_id = ?
+            """,
+            (int(telegram_id),),
+        ).fetchone()
+    parsed = _dt_from_db(row["last_sent_at"]) if row else None
+    if parsed is not None:
+        return parsed
+    # On the first r13 cycle start the clock now. Pending rows stay queued and
+    # will be included in the first normal hourly digest instead of flooding a
+    # seller immediately after a deployment.
+    reset_user_sales_digest_schedule(telegram_id, now=current)
+    return current
+
+
+def load_user_sales_digest_summaries(
+    telegram_id: int,
+    *,
+    period_start: datetime,
+    period_end: datetime,
+) -> list[dict[str, Any]]:
+    """Load pending hourly summaries grouped by shop for one Telegram user."""
+    init_product_value_tables()
+    with db.connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT shop_id
+            FROM sales_digest_queue
+            WHERE telegram_id = ?
+            ORDER BY shop_id
+            """,
+            (int(telegram_id),),
+        ).fetchall()
+    summaries = [
+        load_sales_digest_summary(
+            telegram_id,
+            int(row["shop_id"]),
+            period_start=period_start,
+            period_end=period_end,
+        )
+        for row in rows
+    ]
+    return [summary for summary in summaries if int(summary.get("positions") or 0) > 0]
+
+
+def build_multi_shop_sales_digest_message(
+    summaries: list[dict[str, Any]],
+    *,
+    lang: str = "ru",
+    watched_shop_count: int | None = None,
+    shop_titles: dict[int, str] | None = None,
+) -> str:
+    """Build one phone-friendly hourly message for every monitored shop."""
+    active = [summary for summary in summaries if int(summary.get("positions") or 0) > 0]
+    if not active:
+        return ""
+    if len(active) == 1:
+        return build_sales_digest_message(active[0], lang=lang)
+
+    uz = normalize_lang(lang) == "uz"
+    period_start = min(
+        summary.get("period_start") or _utc_now()
+        for summary in active
+    )
+    period_end = max(
+        summary.get("period_end") or _utc_now()
+        for summary in active
+    )
+    period = _sales_digest_period_text(period_start, period_end, lang)
+    positions = sum(int(summary.get("positions") or 0) for summary in active)
+    orders = sum(int(summary.get("orders") or 0) for summary in active)
+    units = sum(float(summary.get("units") or 0) for summary in active)
+    revenue = sum(float(summary.get("revenue") or 0) for summary in active)
+    commission = sum(float(summary.get("commission") or 0) for summary in active)
+    logistics = sum(float(summary.get("logistics") or 0) for summary in active)
+    payout = sum(float(summary.get("payout") or 0) for summary in active)
+    total_watched = max(len(active), int(watched_shop_count or 0))
+    titles = shop_titles or {}
+
+    if uz:
+        lines = [
+            "🕐 <b>Barcha do‘konlar bo‘yicha soatlik savdo</b>",
+            f"🏪 Savdo bo‘lgan do‘konlar: <b>{len(active)}</b> / kuzatuvda: <b>{total_watched}</b>",
+            f"🕒 Davr: <b>{period}</b>",
+            "",
+            f"🧾 Buyurtmalar: <b>{orders}</b> | Pozitsiyalar: <b>{positions}</b>",
+            f"📦 Sotildi: <b>{units:g} dona</b>",
+            f"💵 Jami tushum: <b>{_format_money(revenue)}</b>",
+            f"🧮 O‘rtacha chek: <b>{_format_money(revenue / max(1, orders))}</b>",
+            f"🏷 Komissiya: <b>{_format_money(commission)}</b>",
+            f"🚚 Logistika: <b>{_format_money(logistics)}</b>",
+            f"✅ Jami to‘lovga: <b>{_format_money(payout)}</b>",
+            "",
+            "🏪 <b>Do‘konlar bo‘yicha:</b>",
+        ]
+    else:
+        lines = [
+            "🕐 <b>Продажи за час по всем магазинам</b>",
+            f"🏪 Магазинов с продажами: <b>{len(active)}</b> / отслеживается: <b>{total_watched}</b>",
+            f"🕒 Период: <b>{period}</b>",
+            "",
+            f"🧾 Заказов: <b>{orders}</b> | Позиций: <b>{positions}</b>",
+            f"📦 Продано: <b>{units:g} шт.</b>",
+            f"💵 Общая выручка: <b>{_format_money(revenue)}</b>",
+            f"🧮 Средний чек: <b>{_format_money(revenue / max(1, orders))}</b>",
+            f"🏷 Комиссия: <b>{_format_money(commission)}</b>",
+            f"🚚 Логистика: <b>{_format_money(logistics)}</b>",
+            f"✅ Всего к выплате: <b>{_format_money(payout)}</b>",
+            "",
+            "🏪 <b>По магазинам:</b>",
+        ]
+
+    for summary in active[:20]:
+        shop_id = int(summary.get("shop_id") or 0)
+        title = _short_text(str(titles.get(shop_id) or "").strip(), 30)
+        label = (
+            f"<b>{escape(title)}</b> · <code>{shop_id}</code>"
+            if title
+            else f"<code>{shop_id}</code>"
+        )
+        if uz:
+            lines.append(
+                f"• {label} — <b>{int(summary.get('orders') or 0)}</b> buyurtma, "
+                f"<b>{float(summary.get('units') or 0):g}</b> dona, "
+                f"{_format_money(float(summary.get('revenue') or 0))}"
+            )
+        else:
+            lines.append(
+                f"• {label} — <b>{int(summary.get('orders') or 0)}</b> зак., "
+                f"<b>{float(summary.get('units') or 0):g}</b> шт., "
+                f"{_format_money(float(summary.get('revenue') or 0))}"
+            )
+    if len(active) > 20:
+        remaining = len(active) - 20
+        lines.append(
+            f"Yana do‘konlar: <b>{remaining}</b>"
+            if uz
+            else f"Ещё магазинов: <b>{remaining}</b>"
+        )
+    return "\n".join(lines)
+
+
+def mark_user_sales_digest_sent(
+    telegram_id: int,
+    *,
+    sent_at: datetime | None = None,
+    clear_queue: bool = True,
+) -> None:
+    """Atomically advance one user's digest and clear all included shops."""
+    init_product_value_tables()
+    current = sent_at or _utc_now()
+    now_text = _dt_to_db(current) or ""
+    shop_ids = connected_shop_ids_for_user(telegram_id)
+    with db.connect() as conn:
+        if clear_queue:
+            conn.execute(
+                "DELETE FROM sales_digest_queue WHERE telegram_id = ?",
+                (int(telegram_id),),
+            )
+        conn.execute(
+            """
+            INSERT INTO sales_digest_user_state
+                (telegram_id, last_sent_at, updated_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                last_sent_at = excluded.last_sent_at,
+                updated_at = excluded.updated_at
+            """,
+            (int(telegram_id), now_text, now_text),
+        )
+        conn.executemany(
+            """
+            INSERT INTO sales_digest_state
+                (telegram_id, shop_id, last_sent_at, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(telegram_id, shop_id) DO UPDATE SET
+                last_sent_at = excluded.last_sent_at,
+                updated_at = excluded.updated_at
+            """,
+            [
+                (int(telegram_id), int(shop_id), now_text, now_text)
+                for shop_id in shop_ids
+            ],
+        )
+        conn.commit()
+
+
+async def maybe_send_hourly_sales_digest_all_shops(
+    telegram_id: int,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Send at most one hourly sales message across all connected shops."""
+    current = now or _utc_now()
+    last_sent = get_user_sales_digest_last_sent(telegram_id, now=current)
+    if current - last_sent < timedelta(seconds=SALES_DIGEST_INTERVAL_SECONDS):
+        return False
+    summaries = load_user_sales_digest_summaries(
+        telegram_id,
+        period_start=last_sent,
+        period_end=current,
+    )
+    if not summaries:
+        mark_user_sales_digest_sent(
+            telegram_id,
+            sent_at=current,
+            clear_queue=False,
+        )
+        return False
+    message = build_multi_shop_sales_digest_message(
+        summaries,
+        lang=get_user_language(telegram_id),
+        watched_shop_count=len(connected_shop_ids_for_user(telegram_id)),
+        shop_titles=connected_shop_titles_for_user(telegram_id),
+    )
+    try:
+        await bot.send_message(
+            telegram_id,
+            message,
+            reply_markup=main_menu_for_user(telegram_id),
+        )
+    except Exception:
+        logging.exception(
+            "Hourly multi-shop digest: delivery failed user=%s shops=%s events=%s",
+            telegram_id,
+            len(summaries),
+            sum(int(summary.get("positions") or 0) for summary in summaries),
+        )
+        return False
+    mark_user_sales_digest_sent(telegram_id, sent_at=current)
+    logging.info(
+        "Hourly multi-shop digest sent user=%s shops=%s orders=%s positions=%s revenue=%s",
+        telegram_id,
+        len(summaries),
+        sum(int(summary.get("orders") or 0) for summary in summaries),
+        sum(int(summary.get("positions") or 0) for summary in summaries),
+        sum(float(summary.get("revenue") or 0) for summary in summaries),
     )
     return True
 
@@ -22467,10 +22881,11 @@ _cleanup_release_state()
 # Preserves per-user instant/hourly modes while using the durable outbox and
 # adaptive Finance pagination from RELEASE_HARDENING.
 # =============================================================================
-PREMIUM_RELEASE_VERSION = "2026.07.20-premium-r12-uzum-finance-reminders"
+PREMIUM_RELEASE_VERSION = "2026.07.20-premium-r14-hourly-default"
 
 
 async def check_new_sales_once() -> None:
+    hourly_users: set[int] = set()
     for group in connected_watch_groups(
         "notify_sales",
         "notify_cancellations",
@@ -22479,6 +22894,11 @@ async def check_new_sales_once() -> None:
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(value) for value in group["telegram_ids"]]
+        hourly_users.update(
+            telegram_id
+            for telegram_id in telegram_ids
+            if get_sales_notification_mode(telegram_id) == "hourly"
+        )
 
         try:
             token = cipher.decrypt(encrypted_token)
@@ -22656,14 +23076,15 @@ async def check_new_sales_once() -> None:
 
             # State is written only after notification data is durably stored.
             _save_finance_watch_rows(telegram_id, shop_id, rows)
-            if sales_mode == "hourly":
-                await maybe_send_hourly_sales_digest(
-                    telegram_id,
-                    shop_id,
-                    now=now,
-                )
 
         await asyncio.sleep(0.2)
+
+    digest_now = _utc_now()
+    for telegram_id in sorted(hourly_users):
+        await maybe_send_hourly_sales_digest_all_shops(
+            telegram_id,
+            now=digest_now,
+        )
 
     await _deliver_pending_notifications()
 
@@ -22695,6 +23116,8 @@ async def main() -> None:
     logging.info("STABILITY_SECURITY_LOADED: stock routes + watcher settings + safe backup + bounded Excel import")
     logging.info("UZUM_FINANCE_LOADED: purchasePrice-only cost + expense ledger + IKPU audit")
     logging.info("LOGISTICS_REMINDERS_LOADED: FBO slots + return paid-storage deadlines")
+    logging.info("MULTI_SHOP_NOTIFICATIONS_LOADED: all connected shops + one combined hourly sales digest")
+    logging.info("SALES_NOTIFICATION_DEFAULT_LOADED: hourly for all connected shops")
     try:
         pdf_regular_font, pdf_bold_font = _fbo_pdf_font_paths()
         logging.info(
