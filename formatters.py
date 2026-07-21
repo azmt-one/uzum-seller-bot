@@ -172,6 +172,16 @@ def flatten_sku_rows(products: list[Any]) -> list[dict[str, Any]]:
         product_title = pick(product, "productTitle", "title", "name", default="—")
         product_status = find_status(product)
         category = pick(product, "category", default="—")
+        product_commission = first_number(product, "commission")
+        if product_commission is None and isinstance(product.get("commissionDto"), dict):
+            commission_dto = product["commissionDto"]
+            minimum = first_number(commission_dto, "minCommission")
+            maximum = first_number(commission_dto, "maxCommission")
+            # A range is not an exact SKU rate.  It is safe only when both
+            # documented bounds are equal; otherwise the SKU value below must
+            # be present before compensation can be calculated.
+            if minimum is not None and maximum is not None and minimum == maximum:
+                product_commission = minimum
         sku_list = product.get("skuList")
         if not isinstance(sku_list, list):
             continue
@@ -203,6 +213,11 @@ def flatten_sku_rows(products: list[Any]) -> list[dict[str, Any]]:
                 "category": category,
                 "price": sku.get("price") or sku.get("marketPrice"),
                 "market_price": sku.get("marketPrice"),
+                "commission": (
+                    first_number(sku, "commission")
+                    if first_number(sku, "commission") is not None
+                    else product_commission
+                ),
                 # Financial/catalog fields documented by Uzum Seller OpenAPI.
                 # Keep purchasePrice separate from the sale price: silently
                 # substituting ``price`` here would overstate seller profit.

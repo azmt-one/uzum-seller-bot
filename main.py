@@ -37,6 +37,13 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from db import Database, TokenCipher
 from seller_pdf_report import build_seller_pdf_report
+from market_plus_reports import (
+    build_claim_docx,
+    build_compensation_workbook,
+    build_market_daily_pdf,
+    build_market_daily_workbook,
+    prepare_compensation_rows,
+)
 from subscription_automation import (
     build_reminder_draft,
     parse_reminder_days,
@@ -4154,6 +4161,7 @@ STOCK_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📦 Все остатки"), KeyboardButton(text="🚚 Что заказать")],
         [KeyboardButton(text="🧭 Потери и брак"), KeyboardButton(text="🏷 Этикетки SKU")],
+        [KeyboardButton(text="📑 Документы по потерям")],
         [KeyboardButton(text="🧾 ИКПУ / МХИК")],
         [KeyboardButton(text="⚙️ Срок поставки")],
         [KeyboardButton(text="🏠 Главное")],
@@ -4166,6 +4174,7 @@ STOCK_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📦 Barcha qoldiq"), KeyboardButton(text="🚚 Nima buyurtma qilish")],
         [KeyboardButton(text="🧭 Yo‘qotish va brak"), KeyboardButton(text="🏷 SKU etiketkalari")],
+        [KeyboardButton(text="📑 Yo‘qotish hujjatlari")],
         [KeyboardButton(text="🧾 IKPU / MXIK")],
         [KeyboardButton(text="⚙️ Yetkazish muddati")],
         [KeyboardButton(text="🏠 Asosiy")],
@@ -4194,6 +4203,7 @@ NOTIFY_MENU_UZ = ReplyKeyboardMarkup(
 
 REPORT_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="📋 Дневной отчёт")],
         [KeyboardButton(text="📄 PDF-отчёт"), KeyboardButton(text="📊 Excel-отчёт")],
         [KeyboardButton(text="🌙 Краткий отчёт"), KeyboardButton(text="💰 Прибыль")],
         [KeyboardButton(text="📈 Эффект рекомендаций"), KeyboardButton(text="📅 Автоотчёты")],
@@ -4205,6 +4215,7 @@ REPORT_MENU_RU = ReplyKeyboardMarkup(
 
 REPORT_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
+        [KeyboardButton(text="📋 Kunlik hisobot")],
         [KeyboardButton(text="📄 PDF hisobot"), KeyboardButton(text="📊 Excel hisobot")],
         [KeyboardButton(text="🌙 Qisqa hisobot"), KeyboardButton(text="💰 Foyda")],
         [KeyboardButton(text="📈 Tavsiyalar ta’siri"), KeyboardButton(text="📅 Avtohisobotlar")],
@@ -8051,7 +8062,19 @@ async def _load_all_time_loss_rows_legacy(
                 current["defected"] = max(_loss_qty(current, "defected"), row["defected"])
                 current["archived"] = bool(current.get("archived")) or bool(row.get("archived"))
                 current.setdefault("source_filters", set()).add(product_filter)
-                for field in ("price", "total", "active", "fbo", "fbs", "status"):
+                for field in (
+                    "price",
+                    "commission",
+                    "total",
+                    "active",
+                    "fbo",
+                    "fbs",
+                    "status",
+                    "product_id",
+                    "sku_id",
+                    "barcode",
+                    "seller_item_code",
+                ):
                     if current.get(field) in (None, "", "—") and row.get(field) not in (None, "", "—"):
                         current[field] = row.get(field)
 
@@ -8206,6 +8229,121 @@ async def lost_goods(message: Message) -> None:
         await send_paginated_list(message, kind="lost", title=title, summary=summary, items=items, section="stock", reply_markup=stock_menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
+
+
+@dp.message(Command("loss_documents", "claim_documents", "compensation_documents"))
+@dp.message(F.text.in_({"📑 Документы по потерям", "📑 Yo‘qotish hujjatlari"}))
+async def loss_claim_documents(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    telegram_id, client, shop_id = req
+    if not await require_premium_subscription(message, telegram_id):
+        return
+    lang = get_user_language(telegram_id)
+    await message.answer(
+        "⌛ Yo‘qotish va brak bo‘yicha Excel reyestrlari hamda pretenziyalar tayyorlanmoqda..."
+        if lang == "uz"
+        else "⌛ Готовлю Excel-реестры и претензии по потерям и браку...",
+        reply_markup=stock_menu_for_message(message),
+    )
+    paths: list[Path] = []
+    try:
+        stock_rows, unavailable_filters = await _load_all_time_loss_rows(
+            client,
+            shop_id,
+            force_refresh=True,
+        )
+        loss_rows, loss_summary = prepare_compensation_rows(stock_rows, kind="loss")
+        damage_rows, damage_summary = prepare_compensation_rows(stock_rows, kind="damage")
+        if not loss_rows and not damage_rows:
+            text = (
+                "Uzum API yo‘qolgan yoki yaroqsiz tovarlarni qaytarmadi."
+                if lang == "uz"
+                else "Uzum API не вернул потерянные или повреждённые товары."
+            )
+            if unavailable_filters:
+                text += (
+                    " Ayrim filtrlar ishlamadi, natija to‘liq bo‘lmasligi mumkin."
+                    if lang == "uz"
+                    else " Часть фильтров недоступна, поэтому результат может быть неполным."
+                )
+            await message.answer(text, reply_markup=stock_menu_for_message(message))
+            return
+
+        stamp = datetime.now(UZT).strftime("%Y%m%d_%H%M%S")
+        jobs: list[tuple[str, str, list[dict[str, Any]], Any]] = []
+        if loss_rows:
+            jobs.extend(
+                [
+                    ("loss", "xlsx", loss_rows, build_compensation_workbook),
+                    ("loss", "docx", loss_rows, build_claim_docx),
+                ]
+            )
+        if damage_rows:
+            jobs.extend(
+                [
+                    ("damage", "xlsx", damage_rows, build_compensation_workbook),
+                    ("damage", "docx", damage_rows, build_claim_docx),
+                ]
+            )
+
+        for kind, extension, rows, builder in jobs:
+            output = Path(tempfile.gettempdir()) / f"sellerpro_{kind}_{shop_id}_{stamp}.{extension}"
+            if extension == "xlsx":
+                path = await asyncio.to_thread(
+                    builder,
+                    rows,
+                    output,
+                    kind=kind,
+                    lang=lang,
+                )
+            else:
+                path = await asyncio.to_thread(
+                    builder,
+                    rows,
+                    output,
+                    kind=kind,
+                    shop_id=shop_id,
+                    lang=lang,
+                )
+            paths.append(Path(path))
+
+        summary_parts: list[str] = []
+        if loss_rows:
+            summary_parts.append(
+                (f"yo‘qolgan: {loss_summary['quantity']} dona" if lang == "uz" else f"потеряно: {loss_summary['quantity']} шт.")
+            )
+        if damage_rows:
+            summary_parts.append(
+                (f"brak: {damage_summary['quantity']} dona" if lang == "uz" else f"брак: {damage_summary['quantity']} шт.")
+            )
+        missing_values = int(loss_summary.get("missing_compensation") or 0) + int(damage_summary.get("missing_compensation") or 0)
+        caption = (
+            "📑 Hujjatlar tayyor · " + ", ".join(summary_parts)
+            if lang == "uz"
+            else "📑 Документы готовы · " + ", ".join(summary_parts)
+        )
+        if missing_values:
+            caption += (
+                f"\n⚠️ {missing_values} ta SKU bo‘yicha Uzum aniq komissiya yoki narx bermadi; summa bo‘sh qoldirildi."
+                if lang == "uz"
+                else f"\n⚠️ По {missing_values} SKU Uzum не передал точную комиссию или цену; сумма оставлена пустой."
+            )
+        await message.answer(caption, reply_markup=stock_menu_for_message(message))
+        for path in paths:
+            await message.answer_document(
+                FSInputFile(str(path), filename=path.name),
+                reply_markup=stock_menu_for_message(message),
+            )
+    except Exception as error:
+        await send_api_error(message, error)
+    finally:
+        for path in paths:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # --- FBO Invoice / накладные поставки ---
@@ -10796,13 +10934,19 @@ def _datetime_for_report(value: Any) -> datetime | None:
     return dt.astimezone(UZT).replace(tzinfo=None)
 
 
-def _finance_datetime_for_report(item: dict[str, Any]) -> datetime | None:
+def _finance_order_datetime(item: dict[str, Any]) -> datetime | None:
+    """Date when Uzum accepted/created the finance order line.
+
+    ``date`` is the documented Seller Finance API field.  Keeping it ahead of
+    generic creation/update timestamps prevents a later metadata update from
+    moving a sale to another reporting day.
+    """
     value = pick(
         item,
+        "date",
+        "orderDate",
         "createdAt",
         "dateCreated",
-        "orderDate",
-        "date",
         "created",
         "paymentDate",
         "updatedAt",
@@ -10810,6 +10954,27 @@ def _finance_datetime_for_report(item: dict[str, Any]) -> datetime | None:
     if isinstance(value, dict):
         value = pick(value, "date", "value", "createdAt")
     return _datetime_for_report(value)
+
+
+def _finance_issued_datetime(item: dict[str, Any]) -> datetime | None:
+    """Date when the order was issued/picked up by the customer."""
+    value = pick(
+        item,
+        "dateIssued",
+        "issuedDate",
+        "dateDelivered",
+        "completedDate",
+        default=None,
+    )
+    if isinstance(value, dict):
+        value = pick(value, "date", "value", "dateIssued", default=None)
+    return _datetime_for_report(value)
+
+
+def _finance_datetime_for_report(item: dict[str, Any]) -> datetime | None:
+    # Compatibility name used by existing reports: their primary period is the
+    # order/acceptance day.  Issued sales use `_finance_issued_datetime`.
+    return _finance_order_datetime(item)
 
 
 def _normalize_finance_row(item: dict[str, Any]) -> dict[str, Any]:
@@ -10822,6 +10987,7 @@ def _normalize_finance_row(item: dict[str, Any]) -> dict[str, Any]:
     kind = "cancel" if _is_cancelled_status(status) else "return" if _is_returned_status(status) else "sale"
     return {
         "date": _finance_datetime_for_report(item),
+        "date_issued": _finance_issued_datetime(item),
         "kind": kind,
         "status": status,
         "order_id": _finance_order_key_for_stats(item),
@@ -14800,101 +14966,483 @@ async def smart_lowstock(message: Message) -> None:
         await send_api_error(message, e)
 
 
-async def _build_morning_report_text(telegram_id: int, client: UzumClient) -> str:
-    lang = get_user_language(telegram_id)
-    now_uzt = datetime.now(UZT)
-    end = now_uzt.replace(hour=0, minute=0, second=0, microsecond=0)
-    start = end - timedelta(days=1)
-    date_from = int(start.timestamp() * 1000)
-    date_to = int(end.timestamp() * 1000)
-    stats, per_shop, shops_count = await _all_shops_finance_stats(telegram_id, client, date_from, date_to)
-    shift_ms = 24 * 60 * 60 * 1000
-    previous, _, _ = await _all_shops_finance_stats(
-        telegram_id,
-        client,
-        date_from - shift_ms,
-        date_to - shift_ms,
-    )
-    revenue_change = _format_change(
-        _percent_change(float(stats.get("revenue") or 0), float(previous.get("revenue") or 0)),
-        lang=lang,
-    )
-    payout_change = _format_change(
-        _percent_change(float(stats.get("payout_total") or 0), float(previous.get("payout_total") or 0)),
-        lang=lang,
-    )
-    top_products = list(stats.get("top_products") or [])[:3]
-    recommendations_ru: list[str] = []
-    recommendations_uz: list[str] = []
-    if int(stats.get("cancelled") or 0) > 0:
-        recommendations_ru.append("проверить отмены и причины по товарам")
-        recommendations_uz.append("bekor qilishlar va sabablarni tekshirish")
-    revenue_delta = _percent_change(float(stats.get("revenue") or 0), float(previous.get("revenue") or 0))
-    if revenue_delta is not None and revenue_delta < -0.10:
-        recommendations_ru.append("выручка снизилась более чем на 10% — проверить цены и остатки")
-        recommendations_uz.append("tushum 10% dan ko‘proq kamaydi — narx va qoldiqni tekshirish")
-    if float(stats.get("revenue") or 0) <= 0:
-        recommendations_ru.append("продаж не было — проверить доступность карточек")
-        recommendations_uz.append("savdo bo‘lmadi — kartalar mavjudligini tekshirish")
+def _finance_rows_in_window(
+    rows: list[dict[str, Any]],
+    start: datetime,
+    end: datetime,
+    *,
+    issued: bool = False,
+) -> list[dict[str, Any]]:
+    start_naive = start.astimezone(UZT).replace(tzinfo=None) if start.tzinfo else start
+    end_naive = end.astimezone(UZT).replace(tzinfo=None) if end.tzinfo else end
+    result: list[dict[str, Any]] = []
+    for item in rows:
+        value = _finance_issued_datetime(item) if issued else _finance_order_datetime(item)
+        if value is not None and start_naive <= value < end_naive:
+            result.append(item)
+    return result
 
-    if lang == "uz":
-        lines = [
-            "🌙 <b>Uzum ertalabki boshqaruv hisoboti</b>",
-            f"Kecha: <b>{start.strftime('%d.%m.%Y')}</b>",
-            f"🏪 Do‘konlar: <b>{shops_count}</b>",
-            "",
-            f"🛒 Buyurtmalar: <b>{int(stats.get('orders') or 0)}</b> | 📦 Sotildi: <b>{float(stats.get('units') or 0):.0f} dona</b>",
-            f"❌ Bekor qilish: <b>{int(stats.get('cancelled') or 0)}</b> | ↩️ Qaytarish: <b>{float(stats.get('returns') or 0):.0f} dona</b>",
-            "",
-            f"💵 Tushum: <b>{_format_money(float(stats.get('revenue') or 0))}</b>",
-            f"🏷 Komissiya: <b>{_format_money(float(stats.get('commission') or 0))}</b>",
-            f"🚚 Logistika: <b>{_format_money(float(stats.get('logistics') or 0))}</b>",
-            f"✅ To‘lovga: <b>{_format_money(float(stats.get('payout_total') or 0))}</b>",
-            f"🛍 O‘rtacha chek: <b>{_format_money(float(stats.get('average_order') or 0))}</b>",
-            "",
-            f"🔄 Avvalgi kunga nisbatan: tushum {revenue_change}, to‘lov {payout_change}",
-        ]
-        if per_shop:
-            lines.extend(["", "<b>🏪 Do‘konlar bo‘yicha:</b>", *per_shop[:20]])
-        if top_products:
-            lines.extend(["", "🏆 <b>Kecha top-3 tovar:</b>"])
-            for index, product in enumerate(top_products, start=1):
-                lines.append(f"{index}. {escape(_short_text(str(product.get('title') or '—'), 55))} — {_format_money(float(product.get('revenue') or 0))}")
-        if recommendations_uz:
-            lines.extend(["", "💡 <b>Bugun nima qilish kerak:</b>"])
-            lines.extend(f"• {escape(value)}" for value in recommendations_uz)
+
+def _expense_report_parts(summary: dict[str, Any]) -> dict[str, Any]:
+    additional = 0.0
+    refunds = 0.0
+    ledger_deductions = 0.0
+    ledger_refunds = 0.0
+    categories: dict[str, float] = {}
+    names: dict[str, float] = {}
+    for item in summary.get("rows") or []:
+        signed = float(item.get("signed_amount") or 0)
+        category = str(item.get("category") or "other")
+        categories[category] = categories.get(category, 0.0) + signed
+        name = " ".join(str(item.get("name") or category or "Uzum").split())
+        names[name] = names.get(name, 0.0) + signed
+        if signed >= 0:
+            ledger_deductions += signed
+            if bool(item.get("included_in_profit")):
+                additional += signed
         else:
-            lines.extend(["", "✅ Muhim muammo topilmadi."])
-        return "\n".join(lines)
+            ledger_refunds += abs(signed)
+            if bool(item.get("included_in_profit")):
+                refunds += abs(signed)
+    return {
+        "additional_expenses": additional,
+        "refunds": refunds,
+        "ledger_deductions": ledger_deductions,
+        "ledger_refunds": ledger_refunds,
+        "expense_categories": categories,
+        "expense_names": names,
+    }
 
-    lines = [
-        "🌙 <b>Утренний управленческий отчёт Uzum</b>",
-        f"За вчера: <b>{start.strftime('%d.%m.%Y')}</b>",
-        f"🏪 Магазинов: <b>{shops_count}</b>",
-        "",
-        f"🛒 Заказов: <b>{int(stats.get('orders') or 0)}</b> | 📦 Продано: <b>{float(stats.get('units') or 0):.0f} шт.</b>",
-        f"❌ Отмен: <b>{int(stats.get('cancelled') or 0)}</b> | ↩️ Возвратов: <b>{float(stats.get('returns') or 0):.0f} шт.</b>",
-        "",
-        f"💵 Выручка: <b>{_format_money(float(stats.get('revenue') or 0))}</b>",
-        f"🏷 Комиссия: <b>{_format_money(float(stats.get('commission') or 0))}</b>",
-        f"🚚 Логистика: <b>{_format_money(float(stats.get('logistics') or 0))}</b>",
-        f"✅ К выплате: <b>{_format_money(float(stats.get('payout_total') or 0))}</b>",
-        f"🛍 Средний чек: <b>{_format_money(float(stats.get('average_order') or 0))}</b>",
-        "",
-        f"🔄 К предыдущему дню: выручка {revenue_change}, выплата {payout_change}",
-    ]
-    if per_shop:
-        lines.extend(["", "<b>🏪 По магазинам:</b>", *per_shop[:20]])
-    if top_products:
-        lines.extend(["", "🏆 <b>Топ-3 товара за вчера:</b>"])
-        for index, product in enumerate(top_products, start=1):
-            lines.append(f"{index}. {escape(_short_text(str(product.get('title') or '—'), 55))} — {_format_money(float(product.get('revenue') or 0))}")
-    if recommendations_ru:
-        lines.extend(["", "💡 <b>Что сделать сегодня:</b>"])
-        lines.extend(f"• {escape(value)}" for value in recommendations_ru)
+
+async def _daily_fbs_scheme_index(
+    client: UzumClient,
+    shop_id: int,
+    start: datetime,
+    end: datetime,
+) -> dict[str, dict[str, Any]]:
+    """Best-effort exact FBS/DBS mapping without per-order API spam."""
+    result: dict[str, dict[str, Any]] = {}
+    max_pages = max(1, min(20, int(os.getenv("DAILY_FBS_SCHEME_MAX_PAGES", "6") or "6")))
+    for status in ("COMPLETED", "CANCELED", "RETURNED"):
+        try:
+            for page in range(max_pages):
+                data = await client.get_fbs_orders(
+                    shop_id,
+                    status=status,
+                    page=page,
+                    size=50,
+                    date_from=int(start.timestamp() * 1000),
+                    date_to=int(end.timestamp() * 1000),
+                )
+                items = [item for item in _extract_list_any(data) if isinstance(item, dict)]
+                for item in items:
+                    order_id = str(
+                        _deep_pick_value(item, ("orderId", "id", "orderNumber")) or ""
+                    ).strip()
+                    if order_id:
+                        result[order_id] = item
+                if len(items) < 50:
+                    break
+                await asyncio.sleep(0.04)
+        except Exception as error:
+            logging.info(
+                "Daily FBS/DBS scheme mapping unavailable shop=%s status=%s: %s",
+                shop_id,
+                status,
+                str(error)[:160],
+            )
+    return result
+
+
+def _market_daily_shop_payload(
+    rows: list[dict[str, Any]],
+    *,
+    start: datetime,
+    end: datetime,
+    costs: dict[str, dict[str, Any]],
+    settings: dict[str, Any],
+    expense_summary: dict[str, Any],
+    shop_id: int,
+    shop_name: str = "",
+) -> dict[str, Any]:
+    accepted_rows = _finance_rows_in_window(rows, start, end)
+    issued_rows = _finance_rows_in_window(rows, start, end, issued=True)
+    previous_issued_rows = _finance_rows_in_window(
+        rows,
+        start - timedelta(days=1),
+        start,
+        issued=True,
+    )
+    tax_percent = float(settings.get("tax_percent") or 0)
+    accepted_stats = _build_noorza_today_stats(accepted_rows)
+    issued_stats = _build_noorza_today_stats(issued_rows)
+    previous_issued_stats = _build_noorza_today_stats(previous_issued_rows)
+    products = _build_unit_rows_from_finance(
+        accepted_rows,
+        costs,
+        tax_percent=tax_percent,
+    )
+    for product in products:
+        product["shop_id"] = int(shop_id)
+        product["shop_name"] = str(shop_name or "")
+    profit = _profit_summary_from_unit_rows(products, accepted_stats)
+
+    cancellation_orders: set[str] = set()
+    cancellation_units = 0.0
+    cancellation_value = 0.0
+    cancellation_reasons: dict[str, int] = {}
+    for item in accepted_rows:
+        cancelled_qty = _finance_cancelled_qty(item)
+        if cancelled_qty <= 0 and not _has_cancel_event_status(_finance_status(item)):
+            continue
+        cancellation_orders.add(_finance_order_key_for_stats(item))
+        cancellation_units += cancelled_qty
+        cancellation_value += _finance_cancelled_revenue(item, cancelled_qty)
+        reason = _finance_cancel_reason(item) or "UZUM_REASON_NOT_PROVIDED"
+        cancellation_reasons[reason] = cancellation_reasons.get(reason, 0) + 1
+
+    order_schemes: dict[str, str] = {}
+    for item in accepted_rows:
+        if _finance_qty(item) <= 0:
+            continue
+        order_id = _finance_order_key_for_stats(item)
+        scheme = _finance_scheme(item)
+        current = order_schemes.get(order_id, "—")
+        if current == "—" or scheme != "—":
+            order_schemes[order_id] = scheme
+    schemes = {"FBO": 0, "FBS": 0, "DBS": 0, "UNKNOWN": 0}
+    for scheme in order_schemes.values():
+        key = scheme if scheme in {"FBO", "FBS", "DBS"} else "UNKNOWN"
+        schemes[key] += 1
+
+    expense_parts = _expense_report_parts(expense_summary)
+    external = (
+        max(0.0, float(settings.get("advertising_monthly") or 0))
+        + max(0.0, float(settings.get("storage_monthly") or 0))
+        + max(0.0, float(settings.get("other_monthly") or 0))
+    ) / 30.0
+    known_net = sum(
+        float(item.get("net_profit") or 0)
+        for item in products
+        if item.get("net_profit") is not None
+    )
+    result = (
+        known_net
+        - float(expense_parts["additional_expenses"])
+        + float(expense_parts["refunds"])
+        - external
+    )
+    revenue = float(accepted_stats.get("revenue") or 0)
+    coverage = float(profit.get("coverage") or 0)
+    complete = bool(
+        (coverage >= 0.999 or revenue <= 0)
+        and expense_summary.get("available")
+    )
+    return {
+        "shop_id": int(shop_id),
+        "shop_name": str(shop_name or ""),
+        "accepted": accepted_stats,
+        "issued": issued_stats,
+        "previous_issued": previous_issued_stats,
+        "products": products,
+        "profit": profit,
+        "tax_percent": tax_percent,
+        "known_net_product_profit": known_net,
+        "result": result,
+        "cost_coverage": coverage,
+        "complete": complete,
+        "cancellations": len({value for value in cancellation_orders if value not in {"", "-", "—"}}),
+        "cancellation_units": cancellation_units,
+        "cancellation_value": cancellation_value,
+        "cancellation_reasons": cancellation_reasons,
+        "schemes": schemes,
+        "external_expenses": external,
+        "expenses_available": bool(expense_summary.get("available")),
+        **expense_parts,
+    }
+
+
+async def _collect_market_daily_report(
+    telegram_id: int,
+    client: UzumClient,
+    report_date: date,
+) -> dict[str, Any]:
+    start = datetime(report_date.year, report_date.month, report_date.day, tzinfo=UZT)
+    end = start + timedelta(days=1)
+    # Issued orders can have been accepted earlier.  The lookback keeps those
+    # rows available before the exact `dateIssued` filter is applied locally.
+    query_start = start - timedelta(days=60)
+    shops = await _user_shop_list(telegram_id, client)
+    if not shops:
+        default_shop = db.get_default_shop_id(telegram_id)
+        if default_shop:
+            shops = [{"shop_id": int(default_shop), "name": "", "raw": {}}]
+    per_shop: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for shop in shops:
+        shop_id = int(shop["shop_id"])
+        try:
+            rows, _, _ = await _load_finance_range_flexible(
+                client,
+                shop_id,
+                int(query_start.timestamp() * 1000),
+                int(end.timestamp() * 1000),
+            )
+            scheme_index = await _daily_fbs_scheme_index(client, shop_id, start, end)
+            if scheme_index:
+                rows = [
+                    {
+                        **item,
+                        "_fbs_order_detail": scheme_index.get(_finance_order_id(item)),
+                    }
+                    if _finance_order_id(item) in scheme_index
+                    else item
+                    for item in rows
+                ]
+            try:
+                await sync_uzum_sku_financials(client, telegram_id, shop_id)
+            except Exception:
+                # Historical Finance purchasePrice remains usable.  The exact
+                # coverage below will reveal any SKU that still lacks a cost.
+                logging.exception("Daily report cost fallback sync failed shop=%s", shop_id)
+            costs = get_unit_cost_map(telegram_id, shop_id)
+            settings = ensure_finance_settings(telegram_id, shop_id)
+            expenses = await load_uzum_expense_summary(
+                client,
+                shop_id,
+                int(start.timestamp() * 1000),
+                int(end.timestamp() * 1000),
+            )
+            per_shop.append(
+                _market_daily_shop_payload(
+                    rows,
+                    start=start,
+                    end=end,
+                    costs=costs,
+                    settings=settings,
+                    expense_summary=expenses,
+                    shop_id=shop_id,
+                    shop_name=str(shop.get("name") or ""),
+                )
+            )
+        except Exception as error:
+            errors.append(f"{shop_id}: {str(error)[:160]}")
+            logging.exception("Market-style daily report failed shop=%s", shop_id)
+        await asyncio.sleep(0.15)
+
+    accepted = _merge_noorza_stats([dict(item.get("accepted") or {}) for item in per_shop])
+    issued = _merge_noorza_stats([dict(item.get("issued") or {}) for item in per_shop])
+    previous_issued = _merge_noorza_stats(
+        [dict(item.get("previous_issued") or {}) for item in per_shop]
+    )
+    products = [product for item in per_shop for product in item.get("products") or []]
+    products.sort(key=lambda item: float(item.get("revenue") or 0), reverse=True)
+    total_revenue = float(accepted.get("revenue") or 0)
+    known_revenue = sum(float((item.get("profit") or {}).get("known_revenue") or 0) for item in per_shop)
+    coverage = known_revenue / total_revenue if total_revenue > 0 else 0.0
+    schemes = {"FBO": 0, "FBS": 0, "DBS": 0, "UNKNOWN": 0}
+    reasons: dict[str, int] = {}
+    categories: dict[str, float] = {}
+    expense_names: dict[str, float] = {}
+    for item in per_shop:
+        for key in schemes:
+            schemes[key] += int((item.get("schemes") or {}).get(key) or 0)
+        for key, count in (item.get("cancellation_reasons") or {}).items():
+            reasons[str(key)] = reasons.get(str(key), 0) + int(count or 0)
+        for key, amount in (item.get("expense_categories") or {}).items():
+            categories[str(key)] = categories.get(str(key), 0.0) + float(amount or 0)
+        for key, amount in (item.get("expense_names") or {}).items():
+            expense_names[str(key)] = expense_names.get(str(key), 0.0) + float(amount or 0)
+    complete = bool(per_shop) and not errors and all(bool(item.get("complete")) for item in per_shop)
+    return {
+        "date": report_date,
+        "shop_id": per_shop[0]["shop_id"] if len(per_shop) == 1 else None,
+        "shop_label": (
+            str(per_shop[0].get("shop_name") or per_shop[0]["shop_id"])
+            if len(per_shop) == 1
+            else f"{len(per_shop)} shops"
+        ),
+        "shops_count": len(shops),
+        "successful_shops": len(per_shop),
+        "accepted": accepted,
+        "issued": issued,
+        "previous_issued": previous_issued,
+        "products": products,
+        "per_shop": per_shop,
+        "cost_coverage": max(0.0, min(1.0, coverage)),
+        "complete": complete,
+        "result": sum(float(item.get("result") or 0) for item in per_shop),
+        "known_net_product_profit": sum(float(item.get("known_net_product_profit") or 0) for item in per_shop),
+        "additional_expenses": sum(float(item.get("additional_expenses") or 0) for item in per_shop),
+        "refunds": sum(float(item.get("refunds") or 0) for item in per_shop),
+        "external_expenses": sum(float(item.get("external_expenses") or 0) for item in per_shop),
+        "ledger_deductions": sum(float(item.get("ledger_deductions") or 0) for item in per_shop),
+        "ledger_refunds": sum(float(item.get("ledger_refunds") or 0) for item in per_shop),
+        "cancellations": sum(int(item.get("cancellations") or 0) for item in per_shop),
+        "cancellation_units": sum(float(item.get("cancellation_units") or 0) for item in per_shop),
+        "cancellation_value": sum(float(item.get("cancellation_value") or 0) for item in per_shop),
+        "cancellation_reasons": reasons,
+        "schemes": schemes,
+        "expense_categories": categories,
+        "expense_names": expense_names,
+        "errors": errors,
+    }
+
+
+def _format_market_daily_report(payload: dict[str, Any], *, lang: str) -> str:
+    uz = normalize_lang(lang) == "uz"
+    accepted = dict(payload.get("accepted") or {})
+    issued = dict(payload.get("issued") or {})
+    previous_issued = dict(payload.get("previous_issued") or {})
+    complete = bool(payload.get("complete"))
+    result_label = (
+        "Sof foyda" if uz and complete else
+        "Ma’lum ma’lumotlar bo‘yicha natija" if uz else
+        "Чистая прибыль" if complete else
+        "Результат по известным данным"
+    )
+    if uz:
+        lines = [
+            "🟣 <b>Seller.pro.uz · kunlik hisobot</b>",
+            f"📅 <b>{payload.get('date').strftime('%d.%m.%Y')}</b> · 🏪 {int(payload.get('shops_count') or 0)} ta do‘kon",
+            "",
+            f"📥 <b>Qabul qilingan buyurtmalar: {int(accepted.get('orders') or 0)}</b>",
+            f"🛍 Sotilgan tovarlar: <b>{float(accepted.get('units') or 0):.0f} dona</b>",
+            f"💰 Daromad: <b>{_format_money(float(accepted.get('revenue') or 0))}</b>",
+            f"💳 Chiqarishga: <b>{_format_money(float(accepted.get('payout_total') or 0))}</b>",
+            f"💵 {result_label}: <b>{_format_money(float(payload.get('result') or 0))}</b>",
+            "",
+            f"📤 <b>Olib ketilgan buyurtmalar: {int(issued.get('orders') or 0)}</b>",
+            f"🛍 Sotilgan tovarlar: <b>{float(issued.get('units') or 0):.0f} dona</b>",
+            f"💰 Daromad: <b>{_format_money(float(issued.get('revenue') or 0))}</b>",
+            f"💳 Chiqarishga: <b>{_format_money(float(issued.get('payout_total') or 0))}</b>",
+            "",
+            f"❌ Bekor qilingan buyurtmalar: <b>{int(payload.get('cancellations') or 0)}</b>",
+            f"💸 Bekor qilingan summa: <b>{_format_money(float(payload.get('cancellation_value') or 0))}</b>",
+        ]
     else:
-        lines.extend(["", "✅ Критичных проблем по вчерашним продажам не найдено."])
+        lines = [
+            "🟣 <b>Seller.pro.uz · дневной отчёт</b>",
+            f"📅 <b>{payload.get('date').strftime('%d.%m.%Y')}</b> · 🏪 магазинов: {int(payload.get('shops_count') or 0)}",
+            "",
+            f"📥 <b>Принято заказов: {int(accepted.get('orders') or 0)}</b>",
+            f"🛍 Продано товаров: <b>{float(accepted.get('units') or 0):.0f} шт.</b>",
+            f"💰 Выручка: <b>{_format_money(float(accepted.get('revenue') or 0))}</b>",
+            f"💳 К выплате: <b>{_format_money(float(accepted.get('payout_total') or 0))}</b>",
+            f"💵 {result_label}: <b>{_format_money(float(payload.get('result') or 0))}</b>",
+            "",
+            f"📤 <b>Выдано заказов: {int(issued.get('orders') or 0)}</b>",
+            f"🛍 Выдано товаров: <b>{float(issued.get('units') or 0):.0f} шт.</b>",
+            f"💰 Выручка: <b>{_format_money(float(issued.get('revenue') or 0))}</b>",
+            f"💳 К выплате: <b>{_format_money(float(issued.get('payout_total') or 0))}</b>",
+            "",
+            f"❌ Отменено заказов: <b>{int(payload.get('cancellations') or 0)}</b>",
+            f"💸 Сумма отмен: <b>{_format_money(float(payload.get('cancellation_value') or 0))}</b>",
+        ]
+
+    report_date = payload.get("date")
+    previous_date = report_date - timedelta(days=1)
+    today = datetime.now(UZT).date()
+    current_payout = float(issued.get("payout_total") or 0)
+    previous_payout = float(previous_issued.get("payout_total") or 0)
+    if report_date == today:
+        if uz:
+            lines.extend([
+                "",
+                f"💵 Kecha chiqarilgan buyurtmalar bo‘yicha taxminiy to‘lov: <b>{_format_money(previous_payout)}</b> · {int(previous_issued.get('orders') or 0)} ta buyurtma",
+                f"💵 Bugun chiqarilgan buyurtmalar bo‘yicha taxminiy to‘lov: <b>{_format_money(current_payout)}</b> · {int(issued.get('orders') or 0)} ta buyurtma",
+            ])
+        else:
+            lines.extend([
+                "",
+                f"💵 Вчера ориентировочно к выплате по выданным заказам: <b>{_format_money(previous_payout)}</b> · заказов: {int(previous_issued.get('orders') or 0)}",
+                f"💵 Сегодня ориентировочно к выплате по выданным заказам: <b>{_format_money(current_payout)}</b> · заказов: {int(issued.get('orders') or 0)}",
+            ])
+    else:
+        if uz:
+            lines.extend([
+                "",
+                f"💵 {previous_date.strftime('%d.%m.%Y')} uchun taxminiy to‘lov: <b>{_format_money(previous_payout)}</b> · {int(previous_issued.get('orders') or 0)} ta buyurtma",
+                f"💵 {report_date.strftime('%d.%m.%Y')} uchun taxminiy to‘lov: <b>{_format_money(current_payout)}</b> · {int(issued.get('orders') or 0)} ta buyurtma",
+            ])
+        else:
+            lines.extend([
+                "",
+                f"💵 Ориентировочно к выплате за {previous_date.strftime('%d.%m.%Y')}: <b>{_format_money(previous_payout)}</b> · заказов: {int(previous_issued.get('orders') or 0)}",
+                f"💵 Ориентировочно к выплате за {report_date.strftime('%d.%m.%Y')}: <b>{_format_money(current_payout)}</b> · заказов: {int(issued.get('orders') or 0)}",
+            ])
+
+    reasons = sorted(
+        (payload.get("cancellation_reasons") or {}).items(),
+        key=lambda pair: int(pair[1] or 0),
+        reverse=True,
+    )
+    if reasons:
+        lines.append("💬 <b>Sabablar:</b>" if uz else "💬 <b>Причины:</b>")
+        for raw, count in reasons[:5]:
+            reason_item = {"cancelReason": "" if raw == "UZUM_REASON_NOT_PROVIDED" else raw}
+            label = _format_cancel_reason(reason_item, lang=lang)
+            lines.append(f"• {escape(label)}: <b>{int(count or 0)}</b>")
+
+    schemes = dict(payload.get("schemes") or {})
+    lines.extend([
+        "",
+        "🚚 <b>FBO / FBS bo‘yicha:</b>" if uz else "🚚 <b>По схемам FBO / FBS:</b>",
+        f"• FBO: <b>{int(schemes.get('FBO') or 0)}</b> · FBS: <b>{int(schemes.get('FBS') or 0)}</b> · DBS: <b>{int(schemes.get('DBS') or 0)}</b>",
+    ])
+    if int(schemes.get("UNKNOWN") or 0):
+        lines.append(
+            f"• Uzum sxemani bermadi: <b>{int(schemes['UNKNOWN'])}</b>"
+            if uz
+            else f"• Uzum не передал схему: <b>{int(schemes['UNKNOWN'])}</b>"
+        )
+
+    lines.extend([
+        "",
+        f"➖ Kecha yechib olindi: <b>{_format_money(float(payload.get('ledger_deductions') or 0))}</b>" if uz else f"➖ Списано за день: <b>{_format_money(float(payload.get('ledger_deductions') or 0))}</b>",
+    ])
+    expense_names = sorted(
+        (payload.get("expense_names") or {}).items(),
+        key=lambda pair: abs(float(pair[1] or 0)),
+        reverse=True,
+    )
+    for name, amount in expense_names[:8]:
+        amount_value = float(amount or 0)
+        if amount_value > 0:
+            lines.append(f"  ➤ {escape(_short_text(name, 55))}: {_format_money(amount_value)}")
+    lines.append(
+        f"➕ Kecha qaytarildi: <b>{_format_money(float(payload.get('ledger_refunds') or 0))}</b>"
+        if uz
+        else f"➕ Возвращено за день: <b>{_format_money(float(payload.get('ledger_refunds') or 0))}</b>"
+    )
+    for name, amount in expense_names[:8]:
+        amount_value = float(amount or 0)
+        if amount_value < 0:
+            lines.append(f"  ➤ {escape(_short_text(name, 55))}: {_format_money(abs(amount_value))}")
+    lines.append(
+        f"📌 Tannarx qamrovi: <b>{float(payload.get('cost_coverage') or 0) * 100:.1f}%</b>"
+        if uz
+        else f"📌 Покрытие себестоимостью: <b>{float(payload.get('cost_coverage') or 0) * 100:.1f}%</b>"
+    )
+    if not complete:
+        lines.append(
+            "⚠️ Bu yakuniy sof foyda emas: ayrim purchasePrice/xarajat ma’lumotlari yetishmaydi."
+            if uz
+            else "⚠️ Это не окончательная чистая прибыль: не хватает части purchasePrice/расходов."
+        )
+    if payload.get("errors"):
+        lines.append(
+            f"⚠️ API xatosi bo‘lgan do‘konlar: {len(payload['errors'])}."
+            if uz
+            else f"⚠️ Магазинов с ошибкой API: {len(payload['errors'])}."
+        )
     return "\n".join(lines)
+
+
+async def _build_morning_report_text(telegram_id: int, client: UzumClient) -> str:
+    report_date = (datetime.now(UZT) - timedelta(days=1)).date()
+    payload = await _collect_market_daily_report(telegram_id, client, report_date)
+    return _format_market_daily_report(payload, lang=get_user_language(telegram_id))
 
 
 @dp.message(Command("morning_report", "daily_report"))
@@ -14911,6 +15459,98 @@ async def morning_report(message: Message) -> None:
         await message.answer(await _build_morning_report_text(telegram_id, client), reply_markup=menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
+
+
+def _requested_daily_report_date(text: str, *, now: datetime | None = None) -> date:
+    today = (now or datetime.now(UZT)).astimezone(UZT).date()
+    argument = parse_args(text or "").strip().lower()
+    if not argument or argument in {"today", "bugun", "сегодня"}:
+        return today
+    if argument in {"yesterday", "kecha", "вчера"}:
+        return today - timedelta(days=1)
+    try:
+        selected = datetime.strptime(argument, "%Y-%m-%d").date()
+    except ValueError as error:
+        raise ValueError("Используйте дату в формате YYYY-MM-DD, today или yesterday.") from error
+    if selected > today:
+        raise ValueError("Нельзя сформировать отчёт за будущую дату.")
+    if selected < today - timedelta(days=60):
+        raise ValueError("Доступен период не старше 60 дней.")
+    return selected
+
+
+@dp.message(Command("market_report", "daily_finance_report", "seller_daily"))
+@dp.message(F.text.in_({"📋 Дневной отчёт", "📋 Kunlik hisobot"}))
+async def market_style_daily_report(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    if not await require_active_subscription(message, telegram_id):
+        return
+    client = get_uzum_for_user(telegram_id)
+    if client is None:
+        await message.answer(
+            "Avval Uzum API tokenini ulang: <code>/connect</code>"
+            if get_user_language(telegram_id) == "uz"
+            else "Сначала подключите Uzum API-токен: <code>/connect</code>",
+            reply_markup=report_menu_for_message(message),
+        )
+        return
+    lang = get_user_language(telegram_id)
+    try:
+        report_date = _requested_daily_report_date(str(message.text or ""))
+    except ValueError as error:
+        await message.answer(
+            "Sana: <code>/market_report 2026-07-21</code>, <code>today</code> yoki <code>yesterday</code>."
+            if lang == "uz"
+            else f"{escape(str(error))}\nПример: <code>/market_report 2026-07-21</code>.",
+            reply_markup=report_menu_for_message(message),
+        )
+        return
+
+    await message.answer(
+        f"⌛ {report_date.strftime('%d.%m.%Y')} uchun kunlik hisobot, PDF va Excel tayyorlanmoqda..."
+        if lang == "uz"
+        else f"⌛ Готовлю дневной отчёт, PDF и Excel за {report_date.strftime('%d.%m.%Y')}...",
+        reply_markup=report_menu_for_message(message),
+    )
+    files: list[Path] = []
+    try:
+        payload = await _collect_market_daily_report(telegram_id, client, report_date)
+        await message.answer(
+            _format_market_daily_report(payload, lang=lang),
+            reply_markup=report_menu_for_message(message),
+        )
+        stamp = report_date.strftime("%Y-%m-%d")
+        xlsx = await asyncio.to_thread(
+            build_market_daily_workbook,
+            payload,
+            Path(tempfile.gettempdir()) / f"sellerpro_daily_{stamp}.xlsx",
+            lang=lang,
+        )
+        pdf = await asyncio.to_thread(
+            build_market_daily_pdf,
+            payload,
+            Path(tempfile.gettempdir()) / f"sellerpro_daily_{stamp}.pdf",
+            lang=lang,
+        )
+        files.extend([Path(pdf), Path(xlsx)])
+        await message.answer_document(
+            FSInputFile(str(pdf), filename=f"sellerpro_daily_{stamp}.pdf"),
+            caption=("📄 Tovarlar bo‘yicha foyda va ROI" if lang == "uz" else "📄 Прибыль и ROI по товарам"),
+            reply_markup=report_menu_for_message(message),
+        )
+        await message.answer_document(
+            FSInputFile(str(xlsx), filename=f"sellerpro_daily_{stamp}.xlsx"),
+            caption=("📊 Tekshiriladigan Excel hisoboti" if lang == "uz" else "📊 Проверяемый Excel-отчёт"),
+            reply_markup=report_menu_for_message(message),
+        )
+    except Exception as error:
+        await send_api_error(message, error)
+    finally:
+        for path in files:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 @dp.message(Command("extend1", "extend_month"))
@@ -15602,20 +16242,27 @@ async def receive_costs_excel_wrong(message: Message) -> None:
 
 
 def _profit_summary_from_unit_rows(rows: list[dict[str, Any]], stats: dict[str, Any]) -> dict[str, Any]:
-    cost_total = sum(float(r.get("cost_total") or 0) for r in rows if r.get("cost_per_unit") is not None)
-    known_profit = sum(float(r.get("profit") or 0) for r in rows if r.get("cost_per_unit") is not None)
-    known_revenue = sum(float(r.get("revenue") or 0) for r in rows if r.get("cost_per_unit") is not None)
-    missing = [r for r in rows if r.get("cost_per_unit") is None]
+    known_rows = [r for r in rows if float(r.get("known_cost_qty") or (r.get("qty") if r.get("cost_per_unit") is not None else 0) or 0) > 0]
+    complete_rows = [r for r in rows if bool(r.get("cost_complete", r.get("cost_per_unit") is not None))]
+    cost_total = sum(float(r.get("cost_total") or 0) for r in known_rows)
+    known_profit = sum(float(r.get("profit") or 0) for r in known_rows)
+    known_net_profit = sum(float(r.get("net_profit") if r.get("net_profit") is not None else r.get("profit") or 0) for r in known_rows)
+    known_revenue = sum(
+        float(r.get("known_revenue") if r.get("known_revenue") is not None else r.get("revenue") or 0)
+        for r in known_rows
+    )
+    missing = [r for r in rows if not bool(r.get("cost_complete", r.get("cost_per_unit") is not None))]
     total_revenue = float(stats.get("revenue") or 0)
     margin = (known_profit / known_revenue * 100.0) if known_revenue > 0 else 0.0
     coverage = known_revenue / total_revenue if total_revenue > 0 else 0.0
     return {
         "cost_total": cost_total,
         "profit": known_profit,
+        "net_profit_after_tax": known_net_profit,
         "margin": margin,
         "coverage": max(0.0, min(1.0, coverage)),
         "missing_count": len(missing),
-        "known_count": len(rows) - len(missing),
+        "known_count": len(complete_rows),
         "total_count": len(rows),
         "total_revenue": total_revenue,
         "known_revenue": known_revenue,
@@ -15640,7 +16287,17 @@ def calculate_business_profit(
     period_ratio = max(0.0, float(days)) / 30.0
     revenue = float(stats.get("revenue") or 0)
     tax_percent = max(0.0, min(100.0, float(settings.get("tax_percent") or 0)))
-    tax_expense = revenue * tax_percent / 100.0
+    coverage = max(0.0, min(1.0, float(cost_summary.get("coverage") or 0)))
+    missing_count = int(cost_summary.get("missing_count") or 0)
+    cost_data_complete = coverage >= 0.999 or (revenue <= 0 and missing_count == 0)
+    # When purchasePrice is incomplete, presenting tax for all revenue against
+    # profit from only known-cost rows mixes two different bases.  Keep the
+    # visible result internally consistent and expose the full-period tax
+    # separately for audit.
+    known_revenue = float(cost_summary.get("known_revenue") or 0)
+    tax_basis_revenue = revenue if cost_data_complete else known_revenue
+    tax_expense = tax_basis_revenue * tax_percent / 100.0
+    full_period_tax_expense = revenue * tax_percent / 100.0
     advertising = max(0.0, float(settings.get("advertising_monthly") or 0)) * period_ratio
     storage = max(0.0, float(settings.get("storage_monthly") or 0)) * period_ratio
     other = max(0.0, float(settings.get("other_monthly") or 0)) * period_ratio
@@ -15656,9 +16313,6 @@ def calculate_business_profit(
         - storage
         - other
     )
-    coverage = max(0.0, min(1.0, float(cost_summary.get("coverage") or 0)))
-    missing_count = int(cost_summary.get("missing_count") or 0)
-    cost_data_complete = coverage >= 0.999 or (revenue <= 0 and missing_count == 0)
     return {
         "days": int(days),
         "revenue": revenue,
@@ -15668,6 +16322,8 @@ def calculate_business_profit(
         "cost_total": float(cost_summary.get("cost_total") or 0),
         "known_profit": known_profit,
         "tax_expense": tax_expense,
+        "full_period_tax_expense": full_period_tax_expense,
+        "tax_basis_revenue": tax_basis_revenue,
         "uzum_expense_total": uzum_expense_total,
         "uzum_storage_expense": float(expense_summary.get("storage") or 0),
         "uzum_advertising_expense": float(expense_summary.get("advertising") or 0),
@@ -17138,11 +17794,13 @@ def supply_settings_markup(telegram_id: int) -> InlineKeyboardMarkup:
 def finance_settings_text(telegram_id: int, shop_id: int) -> str:
     lang = get_user_language(telegram_id)
     row = ensure_finance_settings(telegram_id, shop_id)
+    tax_percent = float(row.get("tax_percent") or 0)
+    tax_name = _tax_setting_label(tax_percent, lang=lang)
     if lang == "uz":
         return (
             "🧮 <b>Sof foyda sozlamalari</b>\n\n"
             f"🏪 Do‘kon: <code>{shop_id}</code>\n"
-            f"🏛 Soliq: <b>{float(row.get('tax_percent') or 0):.2f}%</b>\n"
+            f"🏛 Soliq: <b>{escape(tax_name)}</b>\n"
             f"📣 Tashqi reklama / oy: <b>{_format_money(float(row.get('advertising_monthly') or 0))}</b>\n"
             f"🏬 Tashqi saqlash / oy: <b>{_format_money(float(row.get('storage_monthly') or 0))}</b>\n"
             f"🧾 Boshqa tashqi / oy: <b>{_format_money(float(row.get('other_monthly') or 0))}</b>\n\n"
@@ -17151,7 +17809,7 @@ def finance_settings_text(telegram_id: int, shop_id: int) -> str:
     return (
         "🧮 <b>Настройки чистой прибыли</b>\n\n"
         f"🏪 Магазин: <code>{shop_id}</code>\n"
-        f"🏛 Налог: <b>{float(row.get('tax_percent') or 0):.2f}%</b>\n"
+        f"🏛 Налог: <b>{escape(tax_name)}</b>\n"
         f"📣 Внешняя реклама в месяц: <b>{_format_money(float(row.get('advertising_monthly') or 0))}</b>\n"
         f"🏬 Внешнее хранение в месяц: <b>{_format_money(float(row.get('storage_monthly') or 0))}</b>\n"
         f"🧾 Другие внешние расходы: <b>{_format_money(float(row.get('other_monthly') or 0))}</b>\n\n"
@@ -17163,11 +17821,112 @@ def finance_settings_markup(telegram_id: int) -> InlineKeyboardMarkup:
     lang = get_user_language(telegram_id)
     uz = lang == "uz"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=("🏛 Soliq %" if uz else "🏛 Налог %"), callback_data="autoedit:tax_percent")],
+        [InlineKeyboardButton(text=("🏛 Soliq turini tanlash" if uz else "🏛 Выбрать налог"), callback_data="taxmenu:open")],
         [InlineKeyboardButton(text=("📣 Tashqi reklama" if uz else "📣 Внешняя реклама"), callback_data="autoedit:advertising_monthly")],
         [InlineKeyboardButton(text=("🏬 Tashqi saqlash" if uz else "🏬 Внешнее хранение"), callback_data="autoedit:storage_monthly")],
         [InlineKeyboardButton(text=("🧾 Boshqa tashqi" if uz else "🧾 Другие внешние"), callback_data="autoedit:other_monthly")],
     ])
+
+
+def _tax_setting_label(percent: float, *, lang: str) -> str:
+    value = round(max(0.0, min(100.0, float(percent or 0))), 4)
+    uz = normalize_lang(lang) == "uz"
+    if value == 0:
+        return "Soliqsiz — 0%" if uz else "Без налога — 0%"
+    if value == 1:
+        return "Aylanmadan olinadigan soliq — 1%" if uz else "Налог с оборота — 1%"
+    if value == 6:
+        return "Qo‘shilgan qiymat solig‘i — 6%" if uz else "НДС — 6%"
+    if value == 12:
+        return "Qo‘shilgan qiymat solig‘i — 12%" if uz else "НДС — 12%"
+    return f"Soliq — {value:g}%" if uz else f"Налог — {value:g}%"
+
+
+def tax_selection_markup(telegram_id: int, current: float) -> InlineKeyboardMarkup:
+    uz = get_user_language(telegram_id) == "uz"
+
+    def choice(value: float, ru: str, uz_text: str) -> InlineKeyboardButton:
+        marker = "✅" if abs(float(current or 0) - value) < 0.0001 else "▫️"
+        return InlineKeyboardButton(
+            text=f"{marker} {uz_text if uz else ru}",
+            callback_data=f"taxset:{value:g}",
+        )
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [choice(0, "Без налога · 0%", "Soliqsiz · 0%")],
+        [choice(1, "С оборота · 1%", "Aylanmadan · 1%")],
+        [choice(6, "НДС · 6%", "QQS · 6%"), choice(12, "НДС · 12%", "QQS · 12%")],
+        [InlineKeyboardButton(text="✍️ Boshqa foiz" if uz else "✍️ Другой процент", callback_data="taxset:custom")],
+        [InlineKeyboardButton(text="⬅️ Ortga" if uz else "⬅️ Назад", callback_data="taxset:back")],
+    ])
+
+
+@dp.callback_query(F.data == "taxmenu:open")
+async def tax_selection_open(callback: CallbackQuery) -> None:
+    if not callback.from_user:
+        return
+    telegram_id = int(callback.from_user.id)
+    shop_id = db.get_default_shop_id(telegram_id)
+    if shop_id is None:
+        await callback.answer("Avval do‘konni ulang" if get_user_language(telegram_id) == "uz" else "Сначала подключите магазин", show_alert=True)
+        return
+    current = float(ensure_finance_settings(telegram_id, int(shop_id)).get("tax_percent") or 0)
+    text = (
+        "🏛 <b>Soliq turini tanlang</b>\n\nSoliq har bir tovar tushumidan hisoblanadi. Kerak bo‘lsa boshqa foizni qo‘lda kiriting."
+        if get_user_language(telegram_id) == "uz"
+        else "🏛 <b>Выберите налог</b>\n\nНалог рассчитывается с выручки каждого товара. При необходимости можно указать другой процент."
+    )
+    if callback.message:
+        await callback.message.edit_text(text, reply_markup=tax_selection_markup(telegram_id, current))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("taxset:"))
+async def tax_selection_set(callback: CallbackQuery, state: FSMContext) -> None:
+    if not callback.from_user:
+        return
+    telegram_id = int(callback.from_user.id)
+    lang = get_user_language(telegram_id)
+    action = str(callback.data or "").split(":", 1)[-1]
+    shop_id = db.get_default_shop_id(telegram_id)
+    if shop_id is None:
+        await callback.answer("Avval do‘konni ulang" if lang == "uz" else "Сначала подключите магазин", show_alert=True)
+        return
+    if action == "back":
+        if callback.message:
+            await callback.message.edit_text(
+                finance_settings_text(telegram_id, int(shop_id)),
+                reply_markup=finance_settings_markup(telegram_id),
+            )
+        await callback.answer()
+        return
+    if action == "custom":
+        await state.set_state(ProductSettingsStates.waiting_for_value)
+        await state.update_data(product_setting_field="tax_percent", product_setting_return_section="finance")
+        if callback.message:
+            await callback.message.answer(
+                "Soliq foizini kiriting: 0 dan 100 gacha." if lang == "uz" else "Введите налог в процентах: от 0 до 100.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="❌ Bekor qilish" if lang == "uz" else "❌ Отмена", callback_data="settingeditcancel")
+                ]]),
+            )
+        await callback.answer()
+        return
+    try:
+        value = float(action)
+    except ValueError:
+        await callback.answer("Неизвестный налог", show_alert=True)
+        return
+    if value not in {0.0, 1.0, 6.0, 12.0}:
+        await callback.answer("Неизвестный налог", show_alert=True)
+        return
+    update_finance_setting(telegram_id, int(shop_id), "tax_percent", value)
+    if callback.message:
+        await callback.message.edit_text(
+            finance_settings_text(telegram_id, int(shop_id)),
+            reply_markup=finance_settings_markup(telegram_id),
+        )
+    await callback.answer("Saqlandi" if lang == "uz" else "Сохранено")
 
 
 @dp.message(Command("automation", "notification_settings", "auto_reports"))
@@ -19922,6 +20681,7 @@ def _fbo_acceptance_items(products: list[dict[str, Any]]) -> list[dict[str, Any]
                 "accepted_qty": accepted,
                 "accepted_known": accepted_known,
                 "not_accepted_qty": not_accepted,
+                "explicit_problem_qty": explicit_rejected,
                 "defected_qty": defected,
                 "reason": reason,
             })
@@ -19946,6 +20706,7 @@ def summarize_fbo_acceptance(
     known_items = [item for item in items if item.get("accepted_known")]
     product_accepted = sum(float(item.get("accepted_qty") or 0) for item in known_items)
     product_not_accepted = sum(float(item.get("not_accepted_qty") or 0) for item in items)
+    product_explicit_problem = sum(float(item.get("explicit_problem_qty") or 0) for item in items)
     product_defected = sum(float(item.get("defected_qty") or 0) for item in items)
 
     invoice_problem_value, _ = _fbo_first_value(
@@ -19960,12 +20721,40 @@ def summarize_fbo_acceptance(
         ),
     )
     invoice_problem = max(0.0, _num_any(invoice_problem_value))
-    planned = invoice_planned if invoice_planned > 0 else product_planned
+    # Invoice-list totals and invoice-product details are updated by Uzum at
+    # different moments.  Accepted quantity is monotonic, therefore the most
+    # complete observed value must win instead of letting a stale list-level 0
+    # overwrite `quantityAccepted=100` from product details.
+    planned = max(invoice_planned, product_planned)
     accepted_known = invoice_accepted_known or bool(known_items)
-    accepted = invoice_accepted if invoice_accepted_known else product_accepted
+    accepted = max(
+        invoice_accepted if invoice_accepted_known else 0.0,
+        product_accepted if known_items else 0.0,
+    )
+    if planned > 0:
+        accepted = min(planned, accepted)
     difference = max(0.0, planned - accepted) if accepted_known else 0.0
-    not_accepted = max(difference, product_not_accepted, invoice_problem)
-    problem_items = [item for item in items if float(item.get("not_accepted_qty") or 0) > 0]
+    # A stale per-SKU zero is not explicit evidence of a rejected/defective
+    # item.  Only documented problem counters may override a newer accepted
+    # total.  The aggregate difference is still reported when it is non-zero.
+    not_accepted = max(difference, product_explicit_problem, invoice_problem)
+    zero_without_evidence = bool(
+        planned > 0
+        and accepted_known
+        and accepted <= 0
+        and invoice_problem <= 0
+        and product_explicit_problem <= 0
+        and not any(str(item.get("reason") or "").strip() for item in items)
+    )
+    problem_items = [
+        item
+        for item in items
+        if float(item.get("explicit_problem_qty") or 0) > 0
+        or (
+            not zero_without_evidence
+            and float(item.get("not_accepted_qty") or 0) > 0
+        )
+    ]
     details_complete = not_accepted <= 0 or bool(problem_items)
     if not_accepted > 0 and not problem_items:
         problem_items = [{
@@ -19980,7 +20769,15 @@ def summarize_fbo_acceptance(
             "reason": "Uzum API не передал разбивку расхождения по SKU",
         }]
 
-    outcome = "discrepancy" if not_accepted > 0 else ("success" if planned > 0 and accepted_known else "unknown")
+    outcome = (
+        "unknown"
+        if zero_without_evidence
+        else "discrepancy"
+        if not_accepted > 0
+        else "success"
+        if planned > 0 and accepted_known
+        else "unknown"
+    )
     acceptance_rate = (accepted / planned * 100.0) if planned > 0 else 0.0
     return {
         "shop_id": int(shop_id),
@@ -19998,6 +20795,8 @@ def summarize_fbo_acceptance(
         "items": items,
         "problem_items": problem_items,
         "details_complete": details_complete,
+        "zero_without_evidence": zero_without_evidence,
+        "product_reported_not_accepted_qty": product_not_accepted,
         "acceptance_rate": acceptance_rate,
         "outcome": outcome,
     }
@@ -21152,6 +21951,8 @@ def _finance_cancelled_qty(item: dict[str, Any], status: str | None = None) -> f
     explicit = _deep_pick_number(
         item,
         (
+            # Documented SellerOrderItemDto field.
+            "cancelled",
             "amountCancelled",
             "amountCanceled",
             "cancelledAmount",
@@ -21302,10 +22103,35 @@ def _unit_group_key(item: dict[str, Any]) -> str:
     return _finance_variant_key(item)
 
 
-def _unit_cost_lookup(
+def _finance_purchase_price(item: dict[str, Any]) -> float | None:
+    """Historical unit cost documented on the Seller Finance order line."""
+    value = _deep_pick_number(item, ("purchasePrice", "purchase_price"))
+    if value is None or float(value) <= 0:
+        return None
+    return float(value)
+
+
+def _finance_scheme(item: dict[str, Any]) -> str:
+    value = _deep_pick_value(
+        item,
+        ("scheme", "fulfillmentScheme", "fulfilmentScheme", "deliveryScheme"),
+    )
+    if isinstance(value, dict):
+        value = pick(value, "value", "code", "name", "title", default=None)
+    normalized = _status_upper(value)
+    if normalized in {"FBO", "FBS", "DBS"}:
+        return normalized
+    return "—"
+
+
+def _unit_cost_with_source(
     costs: dict[str, dict[str, Any]],
     item: dict[str, Any],
-) -> float | None:
+) -> tuple[float | None, str | None]:
+    historical = _finance_purchase_price(item)
+    if historical is not None:
+        return historical, "uzum_finance_purchasePrice"
+
     candidates: list[str] = []
     for names in (
         ("skuId", "sku_id"),
@@ -21319,17 +22145,27 @@ def _unit_cost_lookup(
         key = _unit_sku_key(value)
         if key:
             candidates.append(key)
-    # Compatibility with old saved costs that used the visible SKU title.
     visible_key = _unit_sku_key(_finance_sku_title(item))
     if visible_key:
         candidates.append(visible_key)
     for key in candidates:
-        if key in costs:
-            try:
-                return float(costs[key].get("cost") or 0)
-            except Exception:
-                return None
-    return None
+        if key not in costs:
+            continue
+        try:
+            value = float(costs[key].get("cost") or 0)
+        except (TypeError, ValueError):
+            return None, None
+        if value > 0:
+            return value, "uzum_catalog_purchasePrice"
+    return None, None
+
+
+def _unit_cost_lookup(
+    costs: dict[str, dict[str, Any]],
+    item: dict[str, Any],
+) -> float | None:
+    value, _ = _unit_cost_with_source(costs, item)
+    return value
 
 
 def _sale_match_keys(item: dict[str, Any]) -> set[str]:
@@ -21526,8 +22362,11 @@ def _build_noorza_today_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
 def _build_unit_rows_from_finance(
     rows: list[dict[str, Any]],
     costs: dict[str, dict[str, Any]],
+    *,
+    tax_percent: float = 0.0,
 ) -> list[dict[str, Any]]:
     groups: dict[str, dict[str, Any]] = {}
+    safe_tax_percent = max(0.0, min(100.0, float(tax_percent or 0)))
     for item in rows:
         status = _finance_status(item)
         qty = _finance_qty(item)
@@ -21542,7 +22381,9 @@ def _build_unit_rows_from_finance(
         logistics = _finance_logistics(item)
         payout_direct = _finance_payout_direct(item)
         payout = payout_direct if payout_direct is not None else max(0.0, revenue - commission - logistics)
-        cost_per_unit = _unit_cost_lookup(costs, item)
+        cost_per_unit, cost_source = _unit_cost_with_source(costs, item)
+        tax_expense = revenue * safe_tax_percent / 100.0
+        scheme = _finance_scheme(item)
 
         entry = groups.setdefault(
             key,
@@ -21554,28 +22395,59 @@ def _build_unit_rows_from_finance(
                 "commission": 0.0,
                 "logistics": 0.0,
                 "payout": 0.0,
-                "cost_per_unit": cost_per_unit,
+                "cost_per_unit": None,
                 "cost_total": 0.0,
+                "known_cost_qty": 0.0,
+                "known_revenue": 0.0,
+                "known_payout": 0.0,
+                "known_tax_expense": 0.0,
+                "tax_expense": 0.0,
+                "missing_cost_qty": 0.0,
+                "cost_sources": set(),
+                "schemes": set(),
                 "profit": None,
             },
         )
-        if entry.get("cost_per_unit") is None and cost_per_unit is not None:
-            entry["cost_per_unit"] = cost_per_unit
         entry["qty"] += qty
         entry["revenue"] += revenue
         entry["commission"] += commission
         entry["logistics"] += logistics
         entry["payout"] += max(0.0, payout)
+        entry["tax_expense"] += tax_expense
+        if scheme != "—":
+            entry["schemes"].add(scheme)
         if cost_per_unit is not None:
             entry["cost_total"] += float(cost_per_unit) * qty
+            entry["known_cost_qty"] += qty
+            entry["known_revenue"] += revenue
+            entry["known_payout"] += max(0.0, payout)
+            entry["known_tax_expense"] += tax_expense
+            if cost_source:
+                entry["cost_sources"].add(cost_source)
+        else:
+            entry["missing_cost_qty"] += qty
 
     for entry in groups.values():
-        if entry.get("cost_per_unit") is not None:
-            entry["profit"] = float(entry.get("payout") or 0) - float(entry.get("cost_total") or 0)
-            revenue = float(entry.get("revenue") or 0)
-            entry["margin"] = float(entry["profit"]) / revenue * 100.0 if revenue > 0 else 0.0
+        known_qty = float(entry.get("known_cost_qty") or 0)
+        known_revenue = float(entry.get("known_revenue") or 0)
+        cost_total = float(entry.get("cost_total") or 0)
+        if known_qty > 0:
+            entry["cost_per_unit"] = cost_total / known_qty
+            entry["profit"] = float(entry.get("known_payout") or 0) - cost_total
+            entry["net_profit"] = float(entry["profit"]) - float(entry.get("known_tax_expense") or 0)
+            entry["margin"] = float(entry["profit"]) / known_revenue * 100.0 if known_revenue > 0 else 0.0
+            entry["net_margin"] = float(entry["net_profit"]) / known_revenue * 100.0 if known_revenue > 0 else 0.0
+            entry["roi"] = float(entry["net_profit"]) / cost_total * 100.0 if cost_total > 0 else None
         else:
             entry["margin"] = None
+            entry["net_profit"] = None
+            entry["net_margin"] = None
+            entry["roi"] = None
+        entry["cost_complete"] = float(entry.get("missing_cost_qty") or 0) <= 0
+        sources = sorted(entry.pop("cost_sources", set()))
+        entry["cost_source"] = ",".join(sources) if sources else None
+        schemes = sorted(entry.pop("schemes", set()))
+        entry["scheme"] = "/".join(schemes) if schemes else "—"
     return sorted(groups.values(), key=lambda value: float(value.get("revenue") or 0), reverse=True)
 
 
@@ -21621,6 +22493,8 @@ def _normalized_finance_piece(
         "logistics": max(0.0, piece_logistics),
         "payout": max(0.0, piece_payout),
         "withdrawn": max(0.0, withdrawn),
+        "reason": _finance_cancel_reason(item) or str(_deep_pick_value(item, ("returnCause", "comment")) or ""),
+        "scheme": _finance_scheme(item),
     }
 
 
@@ -21751,6 +22625,54 @@ def build_new_sale_message(
     )
 
 
+def _finance_cancel_reason(item: dict[str, Any]) -> str:
+    value = _deep_pick_value(
+        item,
+        (
+            "cancelReason",
+            "cancellationReason",
+            "returnCause",
+            "reason",
+            "comment",
+        ),
+    )
+    if isinstance(value, dict):
+        value = pick(value, "value", "code", "name", "title", "text", default=None)
+    return " ".join(str(value or "").strip().split())
+
+
+_CANCEL_REASON_LABELS: dict[str, tuple[str, str]] = {
+    "NOT_FOUND_ON_WAREHOUSE": ("Не найдено на складе", "Omborda topilmadi"),
+    "NOT_FOUND_IN_WAREHOUSE": ("Не найдено на складе", "Omborda topilmadi"),
+    "OUT_OF_STOCK": ("Нет товара на складе", "Omborda tovar yo‘q"),
+    "SELLER_CANCELLED": ("Отменено продавцом", "Sotuvchi bekor qildi"),
+    "SELLER_CANCELED": ("Отменено продавцом", "Sotuvchi bekor qildi"),
+    "CUSTOMER_CANCELLED": ("Отменено покупателем", "Xaridor bekor qildi"),
+    "CUSTOMER_CANCELED": ("Отменено покупателем", "Xaridor bekor qildi"),
+    "BUYER_CANCELLED": ("Отменено покупателем", "Xaridor bekor qildi"),
+    "BUYER_CANCELED": ("Отменено покупателем", "Xaridor bekor qildi"),
+    "DELIVERY_FAILED": ("Не удалось доставить", "Yetkazib berilmadi"),
+    "PICKUP_EXPIRED": ("Не забрано из пункта выдачи", "Olib ketish punktidan olinmadi"),
+    "NOT_PICKED_UP": ("Не забрано покупателем", "Xaridor olib ketmadi"),
+    "OTHER": ("Другая причина", "Boshqa sabab"),
+}
+
+
+def _format_cancel_reason(item: dict[str, Any], *, lang: str) -> str:
+    raw = _finance_cancel_reason(item)
+    if not raw:
+        return (
+            "Uzum API sababni bermadi"
+            if normalize_lang(lang) == "uz"
+            else "Uzum API не передал причину"
+        )
+    normalized = _status_upper(raw)
+    translated = _CANCEL_REASON_LABELS.get(normalized)
+    if translated:
+        return translated[1] if normalize_lang(lang) == "uz" else translated[0]
+    return raw
+
+
 def build_cancel_message(
     item: dict[str, Any],
     shop_id: int | None = None,
@@ -21766,6 +22688,10 @@ def build_cancel_message(
     status = escape(_finance_status(item))
     order_id = escape(_finance_order_id(item))
     date_text = escape(_format_finance_date(_finance_date_value(item)))
+    scheme = escape(_finance_scheme(item))
+    reason = escape(_format_cancel_reason(item, lang=lang))
+    qty_text_uz = f"<b>{qty:g} dona</b>" if qty > 0 else "<b>Uzum aniq sonni bermadi</b>"
+    qty_text_ru = f"<b>{qty:g} шт.</b>" if qty > 0 else "<b>Uzum не передал точное количество</b>"
 
     if lang == "uz":
         shop_line = f"🏪 Do‘kon: <code>{shop_id}</code>\n" if shop_id is not None else ""
@@ -21774,7 +22700,9 @@ def build_cancel_message(
             + shop_line
             + f"📦 Tovar: <b>{title}</b>\n"
             + f"🔖 SKU: <code>{sku}</code>\n"
-            + f"🔢 Bekor qilindi: <b>{qty:g} dona</b>\n\n"
+            + f"🔢 Bekor qilindi: {qty_text_uz}\n"
+            + f"🚚 Sxema: <b>{scheme}</b>\n"
+            + f"💬 Sabab: <b>{reason}</b>\n\n"
             + f"💵 Dona narxi: <b>{_format_money(float(unit_price or 0))}</b>\n"
             + f"💰 Bekor qilingan summa: <b>{_format_money(total)}</b>\n"
             + f"🆔 Buyurtma: <code>{order_id}</code>\n"
@@ -21788,7 +22716,9 @@ def build_cancel_message(
         + shop_line
         + f"📦 Товар: <b>{title}</b>\n"
         + f"🔖 SKU: <code>{sku}</code>\n"
-        + f"🔢 Отменено: <b>{qty:g} шт.</b>\n\n"
+        + f"🔢 Отменено: {qty_text_ru}\n"
+        + f"🚚 Схема: <b>{scheme}</b>\n"
+        + f"💬 Причина: <b>{reason}</b>\n\n"
         + f"💵 Цена за 1 шт.: <b>{_format_money(float(unit_price or 0))}</b>\n"
         + f"💰 Сумма отмены: <b>{_format_money(total)}</b>\n"
         + f"🆔 Заказ: <code>{order_id}</code>\n"
@@ -22126,6 +23056,51 @@ def build_sale_digest_message(
     return "\n".join(lines)
 
 
+def _single_order_payload(data: Any) -> dict[str, Any] | None:
+    if not isinstance(data, dict):
+        return None
+    for key in ("payload", "data", "result"):
+        value = data.get(key)
+        if isinstance(value, dict):
+            nested = _single_order_payload(value)
+            return nested or value
+    return data
+
+
+async def _enrich_cancel_item_from_fbs(
+    telegram_id: int,
+    item: dict[str, Any],
+) -> dict[str, Any]:
+    """Best-effort FBS/DBS detail lookup for exact scheme and cancel reason.
+
+    Finance rows do not document a fulfilment scheme.  The one-order endpoint
+    does, so cancellation alerts use it when available.  A 404 usually means
+    the line is outside FBS/DBS; that must not delay the important alert.
+    """
+    order_id = _finance_order_id(item)
+    try:
+        numeric_order_id = int(str(order_id).strip())
+    except (TypeError, ValueError):
+        return item
+    client = get_uzum_for_user(telegram_id)
+    if client is None:
+        return item
+    try:
+        detail_raw = await client.get_fbs_order(numeric_order_id)
+        detail = _single_order_payload(detail_raw)
+    except Exception as error:
+        logging.info(
+            "Cancellation detail unavailable user=%s order=%s: %s",
+            telegram_id,
+            order_id,
+            str(error)[:160],
+        )
+        return item
+    if not detail:
+        return item
+    return {**item, "_fbs_order_detail": detail}
+
+
 async def _deliver_pending_notifications() -> None:
     rows = _pending_notifications(SALE_NOTIFICATION_BATCH_LIMIT)
     for row in rows:
@@ -22178,6 +23153,7 @@ async def _deliver_pending_notifications() -> None:
                         lang=get_user_language(telegram_id),
                     )
                 elif event_type == "cancel":
+                    item = await _enrich_cancel_item_from_fbs(telegram_id, item)
                     text = build_cancel_message(
                         item,
                         shop_id=shop_id,
@@ -22931,7 +23907,19 @@ async def _load_all_time_loss_rows(
                 if product_filter not in source_filters:
                     source_filters.append(product_filter)
                 current["source_filters"] = source_filters
-                for field in ("price", "total", "active", "fbo", "fbs", "status"):
+                for field in (
+                    "price",
+                    "commission",
+                    "total",
+                    "active",
+                    "fbo",
+                    "fbs",
+                    "status",
+                    "product_id",
+                    "sku_id",
+                    "barcode",
+                    "seller_item_code",
+                ):
                     if current.get(field) in (None, "", "—") and row.get(field) not in (None, "", "—"):
                         current[field] = row.get(field)
 
@@ -23022,7 +24010,7 @@ _cleanup_release_state()
 # Preserves per-user instant/hourly modes while using the durable outbox and
 # adaptive Finance pagination from RELEASE_HARDENING.
 # =============================================================================
-PREMIUM_RELEASE_VERSION = "2026.07.20-premium-r15-audited-stability"
+PREMIUM_RELEASE_VERSION = "2026.07.22-premium-r16-report-reconciliation"
 
 WATCHER_ACCESS_BACKOFF_SECONDS = max(
     300,
@@ -23318,6 +24306,9 @@ async def main() -> None:
     logging.info("MANAGEMENT_PDF_LOADED: sales + profit + stock + cancellations + returns + defects")
     logging.info("STABILITY_SECURITY_LOADED: stock routes + watcher settings + safe backup + bounded Excel import")
     logging.info("UZUM_FINANCE_LOADED: purchasePrice-only cost + expense ledger + IKPU audit")
+    logging.info("REPORT_RECONCILIATION_LOADED: historical purchasePrice + issued-date + cancelled quantity + tax/ROI")
+    logging.info("FBO_ACCEPTANCE_RECONCILIATION_LOADED: invoice/product totals + stale-zero guard")
+    logging.info("MARKET_STYLE_REPORTS_LOADED: daily PDF/Excel + loss/damage claim documents")
     logging.info("LOGISTICS_REMINDERS_LOADED: FBO slots + return paid-storage deadlines")
     logging.info("MULTI_SHOP_NOTIFICATIONS_LOADED: all connected shops + one combined hourly sales digest")
     logging.info("SALES_NOTIFICATION_DEFAULT_LOADED: hourly for all connected shops")

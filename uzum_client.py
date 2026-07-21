@@ -68,6 +68,8 @@ class UzumClient:
         page: int = 0,
         size: int = 20,
         scheme: str | None = None,
+        date_from: int | None = None,
+        date_to: int | None = None,
     ) -> Any:
         params: dict[str, Any] = {
             "shopIds": shop_id,
@@ -77,7 +79,15 @@ class UzumClient:
         }
         if scheme:
             params["scheme"] = scheme
+        if date_from is not None:
+            params["dateFrom"] = int(date_from)
+        if date_to is not None:
+            params["dateTo"] = int(date_to)
         return await self._request("GET", "/v2/fbs/orders", params=params)
+
+    async def get_fbs_order(self, order_id: int) -> Any:
+        """Return one documented FBS/DBS order with scheme and cancel reason."""
+        return await self._request("GET", f"/v1/fbs/order/{int(order_id)}")
 
     async def count_fbs_orders(self, shop_id: int, *, status: str = "CREATED") -> Any:
         params = {"shopIds": shop_id, "status": status}
