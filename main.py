@@ -787,6 +787,25 @@ def _is_uzum_rate_limit_error(error: BaseException) -> bool:
     )
 
 
+def _uzum_access_error_kind(error: BaseException) -> str | None:
+    """Classify expected Uzum access failures without exposing tokens."""
+    text = str(error).lower()
+    if not ("403" in text or "forbidden" in text):
+        return None
+    if "token inactive" in text:
+        return "token_inactive"
+    if "shop is not available" in text:
+        return "shop_unavailable"
+    return "forbidden"
+
+
+_WATCHER_ERROR_LOGGED_AT: dict[tuple[str, int, tuple[int, ...], str], float] = {}
+WATCHER_ACCESS_ERROR_LOG_INTERVAL_SECONDS = max(
+    300,
+    int(os.getenv("WATCHER_ACCESS_ERROR_LOG_INTERVAL_SECONDS", "3600") or "3600"),
+)
+
+
 def _uzum_api_gate_lock() -> asyncio.Lock:
     global _UZUM_API_GATE_LOCK, _UZUM_API_GATE_LOOP
     loop = asyncio.get_running_loop()
@@ -876,6 +895,33 @@ def _log_watcher_api_failure(
             telegram_ids,
         )
         return
+
+    access_kind = _uzum_access_error_kind(error)
+    if access_kind:
+        users_key = tuple(sorted(int(value) for value in telegram_ids))
+        throttle_key = (str(watcher), int(shop_id), users_key, access_kind)
+        now_mono = time.monotonic()
+        last_logged = float(_WATCHER_ERROR_LOGGED_AT.get(throttle_key, 0.0))
+        if now_mono - last_logged < WATCHER_ACCESS_ERROR_LOG_INTERVAL_SECONDS:
+            return
+        _WATCHER_ERROR_LOGGED_AT[throttle_key] = now_mono
+
+        if access_kind == "token_inactive":
+            reason = "API token is inactive; user must reconnect with a new Uzum API key"
+        elif access_kind == "shop_unavailable":
+            reason = "shop is unavailable for this token; reconnect or select an accessible shop"
+        else:
+            reason = "Uzum denied access to this shop or endpoint"
+        logging.warning(
+            "%s: access unavailable shop=%s users=%s reason=%s; "
+            "watcher state kept, retry will continue without traceback spam",
+            watcher,
+            shop_id,
+            telegram_ids,
+            reason,
+        )
+        return
+
     logging.exception(
         "%s: failed shop=%s users=%s",
         watcher,
@@ -5274,18 +5320,29 @@ async def require_connection(message: Message) -> tuple[int, UzumClient, int] | 
 async def send_api_error(message: Message, error: Exception) -> None:
     raw = str(error)
     low = raw.lower()
-    if "401" in raw or "unauthorized" in low:
+    if "token inactive" in low:
+        user_text = (
+            "🔐 <b>API-ключ Uzum больше не активен</b>\n\n"
+            "Создайте новый API-ключ в кабинете Uzum Seller и откройте "
+            "<b>⚙️ Настройки → 🔐 API и подключение → 🔌 Обновить API-ключ</b>."
+        )
+    elif "shop is not available" in low:
+        user_text = (
+            "🏪 <b>Магазин недоступен для этого API-ключа</b>\n\n"
+            "Ключ не имеет доступа к выбранному Shop ID. Обновите API-ключ либо выберите "
+            "магазин, который доступен этому ключу: <b>⚙️ Настройки → 🏪 Магазины</b>."
+        )
+    elif "401" in raw or "unauthorized" in low:
         user_text = (
             "🔐 <b>Uzum API-ключ не принят</b>\n\n"
             "Возможно, ключ неверный, удалён или истёк.\n"
-            "Создайте новый ключ и откройте <b>⚙️ Настройки → 🔐 Подключение Uzum → "
+            "Создайте новый ключ и откройте <b>⚙️ Настройки → 🔐 API и подключение → "
             "🔌 Обновить API-ключ</b>."
         )
     elif "403" in raw or "rbac" in low or "forbidden" in low:
         user_text = (
-            "⛔ <b>Нет доступа к этому методу Uzum API</b>\n\n"
-            "Проверьте права API-ключа в кабинете Uzum Seller.\n"
-            "Иногда отдельные методы недоступны со стороны Uzum для конкретного магазина."
+            "⛔ <b>Uzum запретил доступ</b>\n\n"
+            "Проверьте права API-ключа и доступ ключа к выбранному магазину."
         )
     elif "429" in raw or "too many" in low:
         user_text = (
