@@ -175,6 +175,13 @@ def _date_format(ws, columns: Iterable[str], start_row: int = 2) -> None:
                 cell.number_format = 'dd.mm.yyyy hh:mm'
 
 
+def _excel_datetime(value: Any) -> Any:
+    """OpenPyXL rejects timezone-aware datetimes; keep report wall time safely."""
+    if isinstance(value, datetime) and value.tzinfo is not None:
+        return value.replace(tzinfo=None)
+    return value
+
+
 def _finalize(ws, *, freeze: str = "A2", max_width: int = 42) -> None:
     ws.freeze_panes = freeze
     ws.sheet_view.showGridLines = False
@@ -248,7 +255,7 @@ def build_premium_workbook(
     ws = wb.active
     ws.title = _sheet_name(lang, "Сводка", "Xulosa")
     _title(ws, _t(lang, "Управленческий отчёт Uzum Seller", "Uzum Seller boshqaruv hisoboti"), end_col=12)
-    generated_at = payload.get("generated_at")
+    generated_at = _excel_datetime(payload.get("generated_at"))
     ws["A2"] = _t(lang, "Магазин", "Do‘kon")
     ws["B2"] = str(payload.get("shop_id") or "—")
     ws["D2"] = _t(lang, "Сформирован", "Yaratildi")
@@ -436,7 +443,7 @@ def build_premium_workbook(
     ws.append(headers)
     for row in sales:
         ws.append([
-            row.get("date"), _kind_label(str(row.get("kind") or "sale"), lang), row.get("status"),
+            _excel_datetime(row.get("date")), _kind_label(str(row.get("kind") or "sale"), lang), row.get("status"),
             str(row.get("order_id") or "—"), row.get("title"), str(row.get("sku") or "—"),
             float(row.get("qty") or 0), float(row.get("revenue") or 0),
             float(row.get("commission") or 0), float(row.get("logistics") or 0),
@@ -463,7 +470,7 @@ def build_premium_workbook(
     ws.append(headers)
     for row in daily:
         ws.append([
-            row.get("date"), int(row.get("orders") or 0), float(row.get("units") or 0),
+            _excel_datetime(row.get("date")), int(row.get("orders") or 0), float(row.get("units") or 0),
             int(row.get("cancelled") or 0), float(row.get("returns") or 0),
             float(row.get("revenue") or 0), float(row.get("commission") or 0),
             float(row.get("logistics") or 0), float(row.get("payout") or 0),
@@ -535,7 +542,7 @@ def build_premium_workbook(
     ws.append(headers)
     for row in (x for x in sales if x.get("kind") in {"cancel", "return"}):
         ws.append([
-            row.get("date"), _kind_label(str(row.get("kind")), lang), row.get("status"),
+            _excel_datetime(row.get("date")), _kind_label(str(row.get("kind")), lang), row.get("status"),
             str(row.get("order_id") or "—"), row.get("title"), str(row.get("sku") or "—"),
             float(row.get("qty") or 0), float(row.get("revenue") or 0), float(row.get("payout") or 0),
         ])
@@ -661,7 +668,11 @@ TELEGRAM_BOT_TOKEN = (
 UZUM_API_BASE_URL = os.getenv(
     "UZUM_API_BASE_URL", "https://api-seller.uzum.uz/api/seller-openapi"
 ).strip()
-DB_PATH = os.getenv("DB_PATH", "bot.db").strip()
+DB_PATH = (
+    os.getenv("DB_PATH", "").strip()
+    or os.getenv("BOT_DB_PATH", "").strip()
+    or "bot.db"
+)
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY", "").strip()
 ORDER_CHECK_INTERVAL_SECONDS = int(os.getenv("ORDER_CHECK_INTERVAL_SECONDS", "900") or "900")
 NEW_ORDER_NOTIFICATIONS = (
@@ -1038,20 +1049,47 @@ MAX_CONCURRENT_USER_HANDLERS = max(
     ),
 )
 
-def _parse_admin_ids() -> set[int]:
-    values: list[str] = []
-    for key in ("ADMIN_IDS", "OWNER_TELEGRAM_ID", "OWNER_ID"):
-        raw = os.getenv(key, "")
-        if raw:
-            values.extend(raw.replace(";", ",").split(","))
+# Администраторы. Владельцы имеют полный доступ, менеджеры — без выгрузки базы.
+BUILTIN_OWNER_IDS: set[int] = {
+    445354240,
+    938965878,
+}
+BUILTIN_MANAGER_IDS: set[int] = {
+    8046815224,
+}
+
+
+def _parse_telegram_ids(*keys: str) -> set[int]:
+    """Read Telegram IDs from BotHost variables despite spaces/quotes/newlines."""
+    import re
+
     ids: set[int] = set()
-    for value in values:
-        value = value.strip()
-        if value.isdigit():
-            ids.add(int(value))
+    for key in keys:
+        raw = str(os.getenv(key, "") or "")
+        for value in re.findall(r"(?<!\d)\d{5,20}(?!\d)", raw):
+            try:
+                ids.add(int(value))
+            except (TypeError, ValueError):
+                continue
     return ids
 
-ADMIN_IDS = _parse_admin_ids()
+
+OWNER_IDS = BUILTIN_OWNER_IDS | _parse_telegram_ids(
+    "OWNER_IDS",
+    "OWNER_TELEGRAM_ID",
+    "OWNER_ID",
+)
+ADMIN_IDS = (
+    OWNER_IDS
+    | BUILTIN_MANAGER_IDS
+    | _parse_telegram_ids("ADMIN_IDS", "MANAGER_IDS")
+)
+MANAGER_IDS = ADMIN_IDS - OWNER_IDS
+logging.info(
+    "ADMIN_ROLES_LOADED owners=%s managers=%s",
+    sorted(OWNER_IDS),
+    sorted(MANAGER_IDS),
+)
 
 if not TELEGRAM_BOT_TOKEN:
     raise RuntimeError(
@@ -1130,6 +1168,12 @@ def is_admin(telegram_id: int | None) -> bool:
     if telegram_id is None:
         return False
     return int(telegram_id) in ADMIN_IDS
+
+
+def is_owner(telegram_id: int | None) -> bool:
+    if telegram_id is None:
+        return False
+    return int(telegram_id) in OWNER_IDS
 
 
 def init_subscription_tables() -> None:
@@ -1326,6 +1370,10 @@ async def require_premium_subscription(
 
 def admin_only(telegram_id: int) -> bool:
     return is_admin(int(telegram_id))
+
+
+def owner_only(telegram_id: int) -> bool:
+    return is_owner(int(telegram_id))
 
 
 def admin_contact_link() -> str | None:
@@ -4296,6 +4344,30 @@ ADMIN_PANEL_MENU_UZ = ReplyKeyboardMarkup(
     input_field_placeholder="Admin panel",
 )
 
+ADMIN_PANEL_MANAGER_MENU_RU = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="👥 Пользователи"), KeyboardButton(text="🔑 Подключение API")],
+        [KeyboardButton(text="💳 Оплаты")],
+        [KeyboardButton(text="⏳ Скоро заканчиваются"), KeyboardButton(text="⛔ Заблокированные")],
+        [KeyboardButton(text="✅ Проверить подключение"), KeyboardButton(text="🎥 Видеоинструкция")],
+        [KeyboardButton(text="📢 Рассылка"), KeyboardButton(text="⬅️ Главное меню")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Админ-панель",
+)
+
+ADMIN_PANEL_MANAGER_MENU_UZ = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="👥 Foydalanuvchilar"), KeyboardButton(text="🔑 API ulanishi")],
+        [KeyboardButton(text="💳 To‘lovlar")],
+        [KeyboardButton(text="⏳ Tugayotganlar"), KeyboardButton(text="⛔ Bloklanganlar")],
+        [KeyboardButton(text="✅ Ulanishni tekshirish"), KeyboardButton(text="🎥 API ulash videosi")],
+        [KeyboardButton(text="📢 Xabar yuborish"), KeyboardButton(text="⬅️ Asosiy menyu")],
+    ],
+    resize_keyboard=True,
+    input_field_placeholder="Admin panel",
+)
+
 # Для совместимости: если где-то осталась статичная разметка, будет русский вариант.
 MAIN_MENU = MAIN_MENU_RU
 ADMIN_PANEL_MENU = ADMIN_PANEL_MENU_RU
@@ -4432,7 +4504,10 @@ def menu_for_message(message: Message) -> ReplyKeyboardMarkup:
 
 
 def admin_menu_for_user(telegram_id: int | None) -> ReplyKeyboardMarkup:
-    return ADMIN_PANEL_MENU_UZ if get_user_language(telegram_id) == "uz" else ADMIN_PANEL_MENU_RU
+    lang = get_user_language(telegram_id)
+    if is_owner(telegram_id):
+        return ADMIN_PANEL_MENU_UZ if lang == "uz" else ADMIN_PANEL_MENU_RU
+    return ADMIN_PANEL_MANAGER_MENU_UZ if lang == "uz" else ADMIN_PANEL_MANAGER_MENU_RU
 
 
 def admin_menu_for_message(message: Message) -> ReplyKeyboardMarkup:
@@ -9884,6 +9959,11 @@ async def admin_panel(message: Message) -> None:
     stats = get_admin_stats()
     money_today = f"{stats['payments_today']:,}".replace(",", " ")
     money_30 = f"{stats['payments_30']:,}".replace(",", " ")
+    backup_hint = (
+        "\n• <code>/backup_db</code> — скачать базу"
+        if owner_only(admin_id)
+        else ""
+    )
     await message.answer(
         "👑 <b>Админ-панель</b>\n\n"
         f"👥 Пользователей всего: <b>{stats['total_users']}</b>\n"
@@ -9901,8 +9981,8 @@ async def admin_panel(message: Message) -> None:
         "• <code>/paid1 ID</code> — 1 месяц / 300 000 сум\n"
         "• <code>/paid3 ID</code> — 3 месяца / 800 000 сум\n"
         "• <code>/paid6 ID</code> — 6 месяцев / 1 500 000 сум\n"
-        "• <code>/expiring</code> — кто скоро заканчивается\n"
-        "• <code>/backup_db</code> — скачать базу",
+        "• <code>/expiring</code> — кто скоро заканчивается"
+        + backup_hint,
         reply_markup=admin_menu_for_message(message),
     )
 
@@ -10474,7 +10554,11 @@ def create_sqlite_backup(source_path: str | Path, destination_path: str | Path) 
 @dp.message(Command("backup_db"))
 async def admin_backup_db(message: Message) -> None:
     admin_id = upsert_from_message(message)
-    if not admin_only(admin_id):
+    if not owner_only(admin_id):
+        await message.answer(
+            "⛔ Резервную копию базы может скачать только владелец бота.",
+            reply_markup=admin_menu_for_message(message) if admin_only(admin_id) else menu_for_message(message),
+        )
         return
     path = Path(DB_PATH)
     if not path.exists():
@@ -22938,16 +23022,49 @@ _cleanup_release_state()
 # Preserves per-user instant/hourly modes while using the durable outbox and
 # adaptive Finance pagination from RELEASE_HARDENING.
 # =============================================================================
-PREMIUM_RELEASE_VERSION = "2026.07.20-premium-r14-hourly-default"
+PREMIUM_RELEASE_VERSION = "2026.07.20-premium-r15-audited-stability"
+
+WATCHER_ACCESS_BACKOFF_SECONDS = max(
+    300,
+    int(os.getenv("WATCHER_ACCESS_BACKOFF_SECONDS", "3600") or "3600"),
+)
+_WATCHER_ACCESS_BACKOFF_UNTIL: dict[tuple[str, str], float] = {}
+
+
+def _watcher_access_backoff_key(watcher: str, group: dict[str, Any]) -> tuple[str, str]:
+    return str(watcher), _watch_group_key(group)
+
+
+def _watcher_access_is_paused(watcher: str, group: dict[str, Any]) -> bool:
+    key = _watcher_access_backoff_key(watcher, group)
+    until = float(_WATCHER_ACCESS_BACKOFF_UNTIL.get(key, 0.0))
+    if until <= time.monotonic():
+        _WATCHER_ACCESS_BACKOFF_UNTIL.pop(key, None)
+        return False
+    return True
+
+
+def _watcher_access_pause(watcher: str, group: dict[str, Any], error: BaseException) -> None:
+    if _uzum_access_error_kind(error):
+        _WATCHER_ACCESS_BACKOFF_UNTIL[_watcher_access_backoff_key(watcher, group)] = (
+            time.monotonic() + WATCHER_ACCESS_BACKOFF_SECONDS
+        )
+
+
+def _watcher_access_resume(watcher: str, group: dict[str, Any]) -> None:
+    _WATCHER_ACCESS_BACKOFF_UNTIL.pop(_watcher_access_backoff_key(watcher, group), None)
 
 
 async def check_new_sales_once() -> None:
     hourly_users: set[int] = set()
+    watcher_name = "Premium finance watcher"
     for group in connected_watch_groups(
         "notify_sales",
         "notify_cancellations",
         access_feature="sales_notifications",
     ):
+        if _watcher_access_is_paused(watcher_name, group):
+            continue
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(value) for value in group["telegram_ids"]]
@@ -23009,9 +23126,11 @@ async def check_new_sales_once() -> None:
                 if item_score > current_score:
                     merged[identity] = item
             rows = list(merged.values())
+            _watcher_access_resume(watcher_name, group)
         except Exception as error:
+            _watcher_access_pause(watcher_name, group, error)
             _log_watcher_api_failure(
-                "Premium finance watcher",
+                watcher_name,
                 error,
                 shop_id=shop_id,
                 telegram_ids=telegram_ids,
@@ -23146,12 +23265,39 @@ async def check_new_sales_once() -> None:
     await _deliver_pending_notifications()
 
 
+_BACKGROUND_TASKS: set[asyncio.Task[Any]] = set()
+
+
+def _spawn_background_task(coro: Any, name: str) -> asyncio.Task[Any]:
+    task = asyncio.create_task(coro, name=name)
+    _BACKGROUND_TASKS.add(task)
+
+    def _done(completed: asyncio.Task[Any]) -> None:
+        _BACKGROUND_TASKS.discard(completed)
+        if completed.cancelled():
+            return
+        try:
+            error = completed.exception()
+        except asyncio.CancelledError:
+            return
+        if error is not None:
+            logging.error(
+                "Background task stopped unexpectedly name=%s",
+                completed.get_name(),
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(_done)
+    return task
+
+
 async def main() -> None:
     logging.info(
         "PREMIUM_RELEASE_LOADED version=%s base=%s",
         PREMIUM_RELEASE_VERSION,
         APP_BUILD,
     )
+    logging.info("DATABASE_READY path=%s wal=%s", DB_PATH, SQLITE_WAL)
     logging.info(
         "RELEASE_HARDENING_LOADED version=%s: finance math + persistent watchers + retry outbox",
         RELEASE_VERSION,
@@ -23193,19 +23339,19 @@ async def main() -> None:
     await bot.delete_webhook(drop_pending_updates=DROP_PENDING_UPDATES)
 
     # Loops have staggered initial sleeps inside their implementations.
-    asyncio.create_task(order_watch_loop())
-    asyncio.create_task(low_stock_watch_loop())
-    asyncio.create_task(out_of_stock_watch_loop())
-    asyncio.create_task(sales_watch_loop())
+    _spawn_background_task(order_watch_loop(), "order_watch")
+    _spawn_background_task(low_stock_watch_loop(), "low_stock_watch")
+    _spawn_background_task(out_of_stock_watch_loop(), "out_of_stock_watch")
+    _spawn_background_task(sales_watch_loop(), "sales_watch")
     if STOCK_CHANGE_NOTIFICATIONS:
-        asyncio.create_task(stock_change_watch_loop())
-    asyncio.create_task(loss_defect_watch_loop())
-    asyncio.create_task(fbo_acceptance_watch_loop())
-    asyncio.create_task(logistics_reminder_watch_loop())
-    asyncio.create_task(daily_report_loop())
+        _spawn_background_task(stock_change_watch_loop(), "stock_change_watch")
+    _spawn_background_task(loss_defect_watch_loop(), "loss_defect_watch")
+    _spawn_background_task(fbo_acceptance_watch_loop(), "fbo_acceptance_watch")
+    _spawn_background_task(logistics_reminder_watch_loop(), "logistics_reminder_watch")
+    _spawn_background_task(daily_report_loop(), "daily_report")
     if SUBSCRIPTION_REMINDERS:
-        asyncio.create_task(subscription_reminder_loop())
-    asyncio.create_task(reviews_watch_loop())
+        _spawn_background_task(subscription_reminder_loop(), "subscription_reminder")
+    _spawn_background_task(reviews_watch_loop(), "reviews_watch")
     await dp.start_polling(bot)
 
 
