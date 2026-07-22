@@ -37,11 +37,11 @@ from openpyxl.worksheet.table import Table, TableStyleInfo
 
 from db import Database, TokenCipher
 from seller_pdf_report import build_seller_pdf_report
-from market_plus_reports import (
+from seller_reports import (
     build_claim_docx,
     build_compensation_workbook,
-    build_market_daily_pdf,
-    build_market_daily_workbook,
+    build_daily_finance_pdf,
+    build_daily_finance_workbook,
     prepare_compensation_rows,
 )
 from subscription_automation import (
@@ -4237,10 +4237,9 @@ NOTIFY_MENU_UZ = ReplyKeyboardMarkup(
 
 REPORT_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Отчёт по товарам")],
-        [KeyboardButton(text="📄 PDF-отчёт"), KeyboardButton(text="📊 Excel-отчёт")],
-        [KeyboardButton(text="🌙 Краткий отчёт"), KeyboardButton(text="💰 Прибыль")],
-        [KeyboardButton(text="📈 Эффект рекомендаций"), KeyboardButton(text="📅 Автоотчёты")],
+        [KeyboardButton(text="📅 Отчёт за день")],
+        [KeyboardButton(text="📄 Полный PDF"), KeyboardButton(text="📊 Полный Excel")],
+        [KeyboardButton(text="🌙 Сводка за вчера"), KeyboardButton(text="📅 Автоотчёты")],
         [KeyboardButton(text="🏠 Главное")],
     ],
     resize_keyboard=True,
@@ -4249,10 +4248,9 @@ REPORT_MENU_RU = ReplyKeyboardMarkup(
 
 REPORT_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📊 Tovarlar hisoboti")],
-        [KeyboardButton(text="📄 PDF hisobot"), KeyboardButton(text="📊 Excel hisobot")],
-        [KeyboardButton(text="🌙 Qisqa hisobot"), KeyboardButton(text="💰 Foyda")],
-        [KeyboardButton(text="📈 Tavsiyalar ta’siri"), KeyboardButton(text="📅 Avtohisobotlar")],
+        [KeyboardButton(text="📅 Kunlik hisobot")],
+        [KeyboardButton(text="📄 To‘liq PDF"), KeyboardButton(text="📊 To‘liq Excel")],
+        [KeyboardButton(text="🌙 Kechagi xulosa"), KeyboardButton(text="📅 Avtohisobotlar")],
         [KeyboardButton(text="🏠 Asosiy")],
     ],
     resize_keyboard=True,
@@ -4617,6 +4615,28 @@ def _prune_paged_list_cache() -> None:
         _paged_list_cache.pop(key, None)
 
 
+def _reports_section_text(lang: str) -> str:
+    if normalize_lang(lang) == "uz":
+        return (
+            "📊 <b>Hisobotlar</b>\n\n"
+            "📅 <b>Kunlik hisobot</b> — tanlangan kun uchun savdo, xarajat va foyda; chat, PDF va Excel.\n"
+            "📄 <b>To‘liq PDF</b> — bugun, 7 yoki 30 kunlik biznes xulosa.\n"
+            "📊 <b>To‘liq Excel</b> — 30 kunlik savdo, qoldiq, yo‘qotish va tavsiyalar.\n"
+            "🌙 <b>Kechagi xulosa</b> — chatdagi qisqa natija.\n"
+            "📅 <b>Avtohisobotlar</b> — yuborish jadvali.\n\n"
+            "Kerakli tugmani tanlang 👇"
+        )
+    return (
+        "📊 <b>Отчёты</b>\n\n"
+        "📅 <b>Отчёт за день</b> — продажи, расходы и прибыль за выбранную дату; в чате, PDF и Excel.\n"
+        "📄 <b>Полный PDF</b> — бизнес-сводка за сегодня, 7 или 30 дней.\n"
+        "📊 <b>Полный Excel</b> — продажи, остатки, потери и рекомендации за 30 дней.\n"
+        "🌙 <b>Сводка за вчера</b> — короткий результат прямо в чате.\n"
+        "📅 <b>Автоотчёты</b> — расписание отправки.\n\n"
+        "Выберите нужную кнопку 👇"
+    )
+
+
 def _section_text_and_markup(
     section: str,
     telegram_id: int,
@@ -4644,12 +4664,7 @@ def _section_text_and_markup(
         )
         return text, attention_menu_for_user(telegram_id)
     if section == "reports":
-        text = (
-            "📊 <b>Hisobotlar</b>\n«Tovarlar hisoboti» Market Plus kabi tovarlar jadvalini PDF va Excelda yaratadi 👇"
-            if lang == "uz"
-            else "📊 <b>Отчёты</b>\n«Отчёт по товарам» создаёт таблицу как в Market Plus сразу в PDF и Excel 👇"
-        )
-        return text, report_menu_for_user(telegram_id)
+        return _reports_section_text(lang), report_menu_for_user(telegram_id)
     text = "🏠 <b>Asosiy menyu</b>" if lang == "uz" else "🏠 <b>Главное меню</b>"
     return text, main_menu_for_user(telegram_id)
 
@@ -4984,6 +4999,10 @@ class PaymentStates(StatesGroup):
 
 class ProductSettingsStates(StatesGroup):
     waiting_for_value = State()
+
+
+class DailyReportStates(StatesGroup):
+    waiting_for_date = State()
 
 
 TRIAL_ALLOWED_COMMANDS = frozenset(
@@ -11529,7 +11548,7 @@ async def report_excel(message: Message) -> None:
             else "⌛ Готовлю управленческий Excel-отчёт...\n"
             "Собираю все продажи, прибыль, остатки, потери и готовый список действий."
         ),
-        reply_markup=menu_for_message(message),
+        reply_markup=report_menu_for_message(message),
     )
     filename: Path | None = None
     try:
@@ -11552,7 +11571,7 @@ async def report_excel(message: Message) -> None:
                 "прибыль по товарам, отмены и возвраты, прогноз остатков, "
                 "потери и готовый список действий."
             ),
-            reply_markup=menu_for_message(message),
+            reply_markup=report_menu_for_message(message),
         )
     except Exception as e:
         await send_api_error(message, e)
@@ -13206,12 +13225,7 @@ async def button_notifications_section_simple(message: Message) -> None:
 async def button_reports_section_simple(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     lang = get_user_language(telegram_id)
-    text = (
-        "📊 <b>Hisobotlar</b>\n«Tovarlar hisoboti» Market Plus kabi tovarlar jadvalini PDF va Excelda yaratadi 👇"
-        if lang == "uz"
-        else "📊 <b>Отчёты</b>\n«Отчёт по товарам» создаёт таблицу как в Market Plus сразу в PDF и Excel 👇"
-    )
-    await message.answer(text, reply_markup=report_menu_for_message(message))
+    await message.answer(_reports_section_text(lang), reply_markup=report_menu_for_message(message))
 
 
 @dp.message(F.text.in_({"🏠 Обзор магазина", "🏠 Do‘kon holati"}))
@@ -14038,12 +14052,16 @@ async def button_orders(message: Message) -> None:
 @dp.message(F.text == "📊 Excel отчёт")
 @dp.message(F.text == "📊 Excel-отчёт")
 @dp.message(F.text == "📄 Excel-отчёт")
+@dp.message(F.text == "📊 To‘liq Excel")
+@dp.message(F.text == "📊 Полный Excel")
 async def button_excel_report(message: Message) -> None:
     await report_excel(message)
 
 
 @dp.message(F.text == "📄 PDF-отчёт")
 @dp.message(F.text == "📄 PDF hisobot")
+@dp.message(F.text == "📄 To‘liq PDF")
+@dp.message(F.text == "📄 Полный PDF")
 async def button_pdf_report(message: Message) -> None:
     await seller_pdf_report_menu(message)
 
@@ -15372,7 +15390,7 @@ async def _collect_market_daily_report(
             )
         except Exception as error:
             errors.append(f"{shop_id}: {str(error)[:160]}")
-            logging.exception("Market-style daily report failed shop=%s", shop_id)
+            logging.exception("Daily finance report failed shop=%s", shop_id)
         await asyncio.sleep(0.15)
 
     accepted = _merge_noorza_stats([dict(item.get("accepted") or {}) for item in per_shop])
@@ -15645,10 +15663,15 @@ def _requested_daily_report_date(text: str, *, now: datetime | None = None) -> d
         return today
     if argument in {"yesterday", "kecha", "вчера"}:
         return today - timedelta(days=1)
-    try:
-        selected = datetime.strptime(argument, "%Y-%m-%d").date()
-    except ValueError as error:
-        raise ValueError("Используйте дату в формате YYYY-MM-DD, today или yesterday.") from error
+    selected: date | None = None
+    for date_format in ("%Y-%m-%d", "%d.%m.%Y"):
+        try:
+            selected = datetime.strptime(argument, date_format).date()
+            break
+        except ValueError:
+            continue
+    if selected is None:
+        raise ValueError("Напишите дату в формате ДД.ММ.ГГГГ, например 21.07.2026.")
     if selected > today:
         raise ValueError("Нельзя сформировать отчёт за будущую дату.")
     if selected < today - timedelta(days=60):
@@ -15656,17 +15679,96 @@ def _requested_daily_report_date(text: str, *, now: datetime | None = None) -> d
     return selected
 
 
-@dp.message(Command("market_report", "daily_finance_report", "seller_daily"))
+def _daily_report_date_markup(lang: str) -> InlineKeyboardMarkup:
+    uz = normalize_lang(lang) == "uz"
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Bugun" if uz else "Сегодня", callback_data="dailyreport:today"),
+                InlineKeyboardButton(text="Kecha" if uz else "Вчера", callback_data="dailyreport:yesterday"),
+            ],
+            [InlineKeyboardButton(text="📅 Boshqa sana" if uz else "📅 Другая дата", callback_data="dailyreport:custom")],
+            [InlineKeyboardButton(text="⬅️ Hisobotlar" if uz else "⬅️ К отчётам", callback_data="dailyreport:back")],
+        ]
+    )
+
+
+async def _send_daily_finance_report(
+    message: Message,
+    *,
+    telegram_id: int,
+    client: UzumClient,
+    report_date: date,
+    lang: str,
+) -> None:
+    await message.answer(
+        f"⌛ {report_date.strftime('%d.%m.%Y')} uchun hisobot tayyorlanmoqda..."
+        if lang == "uz"
+        else f"⌛ Готовлю отчёт за {report_date.strftime('%d.%m.%Y')}...",
+        reply_markup=report_menu_for_user(telegram_id),
+    )
+    files: list[Path] = []
+    try:
+        payload = await _collect_market_daily_report(telegram_id, client, report_date)
+        await message.answer(
+            _format_market_daily_report(payload, lang=lang),
+            reply_markup=report_menu_for_user(telegram_id),
+        )
+        stamp = report_date.strftime("%Y-%m-%d")
+        xlsx = await asyncio.to_thread(
+            build_daily_finance_workbook,
+            payload,
+            Path(tempfile.gettempdir()) / f"SellerPro_daily_{stamp}.xlsx",
+            lang=lang,
+        )
+        pdf = await asyncio.to_thread(
+            build_daily_finance_pdf,
+            payload,
+            Path(tempfile.gettempdir()) / f"SellerPro_daily_{stamp}.pdf",
+            lang=lang,
+        )
+        files.extend([Path(pdf), Path(xlsx)])
+        await message.answer_document(
+            FSInputFile(str(pdf), filename=f"SellerPro_daily_{stamp}.pdf"),
+            caption=(
+                f"📄 Kunlik hisobot · {report_date.strftime('%d.%m.%Y')}"
+                if lang == "uz"
+                else f"📄 Дневной отчёт · {report_date.strftime('%d.%m.%Y')}"
+            ),
+            reply_markup=report_menu_for_user(telegram_id),
+        )
+        await message.answer_document(
+            FSInputFile(str(xlsx), filename=f"SellerPro_daily_{stamp}.xlsx"),
+            caption=(
+                "📊 Excel: xulosa, tovarlar va Uzum xarajatlari"
+                if lang == "uz"
+                else "📊 Excel: сводка, товары и расходы Uzum"
+            ),
+            reply_markup=report_menu_for_user(telegram_id),
+        )
+    except Exception as error:
+        await send_api_error(message, error)
+    finally:
+        for path in files:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 @dp.message(F.text.in_({
     "📋 Дневной отчёт",
     "📋 Kunlik hisobot",
     "📊 Отчёт по товарам",
     "📊 Tovarlar hisoboti",
+    "📅 Отчёт за день",
+    "📅 Kunlik hisobot",
 }))
-async def market_style_daily_report(message: Message) -> None:
+async def daily_finance_report_menu(message: Message, state: FSMContext) -> None:
     telegram_id = upsert_from_message(message)
     if not await require_active_subscription(message, telegram_id):
         return
+    await state.clear()
     client = get_uzum_for_user(telegram_id)
     if client is None:
         await message.answer(
@@ -15677,62 +15779,139 @@ async def market_style_daily_report(message: Message) -> None:
         )
         return
     lang = get_user_language(telegram_id)
+    await message.answer(
+        (
+            "📅 <b>Kunlik hisobot</b>\n\nSana tanlang. Bot chatdagi xulosa, tushunarli PDF va uch varaqli Excel yuboradi."
+            if lang == "uz"
+            else "📅 <b>Отчёт за день</b>\n\nВыберите дату. Бот отправит сводку в чат, понятный PDF и Excel с тремя листами: сводка, товары и расходы Uzum."
+        ),
+        reply_markup=_daily_report_date_markup(lang),
+    )
+
+
+@dp.message(Command("daily_file", "market_report", "daily_finance_report", "seller_daily"))
+async def daily_finance_report_command(message: Message) -> None:
+    telegram_id = upsert_from_message(message)
+    if not await require_active_subscription(message, telegram_id):
+        return
+    client = get_uzum_for_user(telegram_id)
+    if client is None:
+        await message.answer(
+            "Avval Uzum API tokenini ulang: <code>/connect</code>"
+            if get_user_language(telegram_id) == "uz"
+            else "Сначала подключите Uzum API-токен: <code>/connect</code>",
+            reply_markup=report_menu_for_user(telegram_id),
+        )
+        return
+    lang = get_user_language(telegram_id)
     try:
         report_date = _requested_daily_report_date(str(message.text or ""))
     except ValueError as error:
         await message.answer(
-            "Sana: <code>/market_report 2026-07-21</code>, <code>today</code> yoki <code>yesterday</code>."
+            "Sanani shunday yozing: <code>/daily_file 21.07.2026</code>."
             if lang == "uz"
-            else f"{escape(str(error))}\nПример: <code>/market_report 2026-07-21</code>.",
-            reply_markup=report_menu_for_message(message),
+            else f"{escape(str(error))}\nПример: <code>/daily_file 21.07.2026</code>.",
+            reply_markup=report_menu_for_user(telegram_id),
         )
         return
-
-    await message.answer(
-        f"⌛ {report_date.strftime('%d.%m.%Y')} uchun kunlik hisobot, PDF va Excel tayyorlanmoqda..."
-        if lang == "uz"
-        else f"⌛ Готовлю дневной отчёт, PDF и Excel за {report_date.strftime('%d.%m.%Y')}...",
-        reply_markup=report_menu_for_message(message),
+    await _send_daily_finance_report(
+        message,
+        telegram_id=telegram_id,
+        client=client,
+        report_date=report_date,
+        lang=lang,
     )
-    files: list[Path] = []
+
+
+@dp.callback_query(F.data.startswith("dailyreport:"))
+async def daily_finance_report_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    telegram_id = int(callback.from_user.id)
+    lang = get_user_language(telegram_id)
+    action = str(callback.data or "").partition(":")[2]
+    if callback.message is None:
+        await callback.answer()
+        return
+    if action == "back":
+        await state.clear()
+        await callback.message.answer(
+            _reports_section_text(lang),
+            reply_markup=report_menu_for_user(telegram_id),
+        )
+        await callback.answer()
+        return
+    if not await require_active_subscription(callback.message, telegram_id):
+        await callback.answer()
+        return
+    if action == "custom":
+        await state.set_state(DailyReportStates.waiting_for_date)
+        await callback.message.answer(
+            "Sanani KK.OO.YYYY formatida yuboring. Masalan: <code>21.07.2026</code>"
+            if lang == "uz"
+            else "Отправьте дату в формате ДД.ММ.ГГГГ. Например: <code>21.07.2026</code>\nДля отмены: /cancel",
+            reply_markup=report_menu_for_user(telegram_id),
+        )
+        await callback.answer()
+        return
+    if action not in {"today", "yesterday"}:
+        await callback.answer("Noto‘g‘ri sana" if lang == "uz" else "Неизвестная дата", show_alert=True)
+        return
+    client = get_uzum_for_user(telegram_id)
+    if client is None:
+        await callback.message.answer(
+            "Avval Uzum API tokenini ulang: <code>/connect</code>"
+            if lang == "uz"
+            else "Сначала подключите Uzum API-токен: <code>/connect</code>",
+            reply_markup=report_menu_for_user(telegram_id),
+        )
+        await callback.answer()
+        return
+    report_date = datetime.now(UZT).date() - (timedelta(days=1) if action == "yesterday" else timedelta())
+    await callback.answer("Boshladim" if lang == "uz" else "Начал подготовку")
+    await _send_daily_finance_report(
+        callback.message,
+        telegram_id=telegram_id,
+        client=client,
+        report_date=report_date,
+        lang=lang,
+    )
+
+
+@dp.message(DailyReportStates.waiting_for_date)
+async def daily_finance_report_custom_date(message: Message, state: FSMContext) -> None:
+    telegram_id = upsert_from_message(message)
+    lang = get_user_language(telegram_id)
+    raw = str(message.text or "").strip()
     try:
-        payload = await _collect_market_daily_report(telegram_id, client, report_date)
+        report_date = _requested_daily_report_date(f"/daily_file {raw}")
+    except ValueError as error:
         await message.answer(
-            _format_market_daily_report(payload, lang=lang),
-            reply_markup=report_menu_for_message(message),
+            "Sanani KK.OO.YYYY formatida yuboring. Masalan: <code>21.07.2026</code>"
+            if lang == "uz"
+            else f"{escape(str(error))}\nПопробуйте ещё раз или отправьте /cancel.",
+            reply_markup=report_menu_for_user(telegram_id),
         )
-        stamp = report_date.strftime("%Y-%m-%d")
-        xlsx = await asyncio.to_thread(
-            build_market_daily_workbook,
-            payload,
-            Path(tempfile.gettempdir()) / f"sellerpro_daily_{stamp}.xlsx",
-            lang=lang,
+        return
+    if not await require_active_subscription(message, telegram_id):
+        await state.clear()
+        return
+    client = get_uzum_for_user(telegram_id)
+    if client is None:
+        await state.clear()
+        await message.answer(
+            "Avval Uzum API tokenini ulang: <code>/connect</code>"
+            if lang == "uz"
+            else "Сначала подключите Uzum API-токен: <code>/connect</code>",
+            reply_markup=report_menu_for_user(telegram_id),
         )
-        pdf = await asyncio.to_thread(
-            build_market_daily_pdf,
-            payload,
-            Path(tempfile.gettempdir()) / f"sellerpro_daily_{stamp}.pdf",
-            lang=lang,
-        )
-        files.extend([Path(pdf), Path(xlsx)])
-        await message.answer_document(
-            FSInputFile(str(pdf), filename=f"sellerpro_daily_{stamp}.pdf"),
-            caption=("📄 Tovarlar bo‘yicha foyda va ROI" if lang == "uz" else "📄 Прибыль и ROI по товарам"),
-            reply_markup=report_menu_for_message(message),
-        )
-        await message.answer_document(
-            FSInputFile(str(xlsx), filename=f"sellerpro_daily_{stamp}.xlsx"),
-            caption=("📊 Tekshiriladigan Excel hisoboti" if lang == "uz" else "📊 Проверяемый Excel-отчёт"),
-            reply_markup=report_menu_for_message(message),
-        )
-    except Exception as error:
-        await send_api_error(message, error)
-    finally:
-        for path in files:
-            try:
-                path.unlink(missing_ok=True)
-            except OSError:
-                pass
+        return
+    await state.clear()
+    await _send_daily_finance_report(
+        message,
+        telegram_id=telegram_id,
+        client=client,
+        report_date=report_date,
+        lang=lang,
+    )
 
 
 @dp.message(Command("extend1", "extend_month"))
@@ -16878,6 +17057,8 @@ async def button_dead_stock(message: Message) -> None:
 @dp.message(F.text == "🌙 Утренний отчёт")
 @dp.message(F.text == "🌙 Qisqa hisobot")
 @dp.message(F.text == "🌙 Краткий отчёт")
+@dp.message(F.text == "🌙 Kechagi xulosa")
+@dp.message(F.text == "🌙 Сводка за вчера")
 async def button_morning_report(message: Message) -> None:
     await morning_report(message)
 
@@ -24531,7 +24712,7 @@ _cleanup_release_state()
 # Preserves per-user instant/hourly modes while using the durable outbox and
 # adaptive Finance pagination from RELEASE_HARDENING.
 # =============================================================================
-PREMIUM_RELEASE_VERSION = "2026.07.22-premium-r18-clear-finance-navigation"
+PREMIUM_RELEASE_VERSION = "2026.07.22-premium-r19-clear-reports"
 
 WATCHER_ACCESS_BACKOFF_SECONDS = max(
     300,
@@ -24830,8 +25011,9 @@ async def main() -> None:
     logging.info("REPORT_RECONCILIATION_LOADED: historical purchasePrice + issued-date + cancelled quantity + tax/ROI")
     logging.info("PROFIT_BRIDGE_LOADED: revenue -> payout -> cost -> tax/expenses -> result")
     logging.info("FINANCE_UI_R18_LOADED: compact renewals + direct tax + Uzum storage + localized expenses")
+    logging.info("REPORTS_UI_R19_LOADED: guided dates + summary-first PDF/Excel + neutral branding")
     logging.info("FBO_ACCEPTANCE_RECONCILIATION_LOADED: invoice/product totals + stale-zero guard")
-    logging.info("MARKET_STYLE_REPORTS_LOADED: daily PDF/Excel + loss/damage claim documents")
+    logging.info("SELLER_REPORTS_LOADED: daily PDF/Excel + loss/damage claim documents")
     logging.info("LOGISTICS_REMINDERS_LOADED: FBO slots + return paid-storage deadlines")
     logging.info("MULTI_SHOP_NOTIFICATIONS_LOADED: all connected shops + one combined hourly sales digest")
     logging.info("SALES_NOTIFICATION_DEFAULT_LOADED: hourly for all connected shops")
