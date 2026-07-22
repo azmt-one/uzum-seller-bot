@@ -42,7 +42,9 @@ from seller_reports import (
     build_compensation_workbook,
     build_daily_finance_pdf,
     build_daily_finance_workbook,
+    build_stock_products_pdf,
     prepare_compensation_rows,
+    prepare_stock_product_rows,
 )
 from subscription_automation import (
     build_reminder_draft,
@@ -6738,15 +6740,22 @@ async def setshop(message: Message) -> None:
 
 
 async def send_stock_list(message: Message, *, mode: str = "all") -> None:
-    """Load and display SKU-level stock for all, FBO or FBS inventory."""
+    """Send current stock as a product-grouped PDF for all, FBO or FBS."""
     req = await require_connection(message)
     if req is None:
         return
     telegram_id, client, shop_id = req
     lang = get_user_language(telegram_id)
     safe_mode = mode if mode in {"all", "fbo", "fbs"} else "all"
+    pdf_path: Path | None = None
 
     try:
+        await message.answer(
+            "⌛ Qoldiqni tovarlar bo'yicha PDFga tayyorlayapman..."
+            if lang == "uz"
+            else "⌛ Формирую PDF с остатками по товарам...",
+            reply_markup=stock_menu_for_message(message),
+        )
         rows = await load_sku_rows(client, shop_id, max_pages=50)
         if safe_mode == "fbo":
             visible_rows = [row for row in rows if float(row.get("fbo") or 0) > 0]
@@ -6756,55 +6765,80 @@ async def send_stock_list(message: Message, *, mode: str = "all") -> None:
             visible_rows = rows
 
         title_by_mode = {
-            "all": ("📦 <b>Остатки по SKU</b>", "📦 <b>SKU qoldiqlari</b>"),
-            "fbo": ("🏭 <b>Остатки FBO</b>", "🏭 <b>FBO qoldiqlari</b>"),
-            "fbs": ("🏠 <b>Остатки FBS/DBS</b>", "🏠 <b>FBS/DBS qoldiqlari</b>"),
+            "all": ("📦 <b>Остатки по товарам</b>", "📦 <b>Tovarlar bo'yicha qoldiq</b>"),
+            "fbo": ("🏭 <b>Остатки FBO по товарам</b>", "🏭 <b>Tovarlar bo'yicha FBO qoldiq</b>"),
+            "fbs": ("🏠 <b>Остатки FBS/DBS по товарам</b>", "🏠 <b>Tovarlar bo'yicha FBS/DBS qoldiq</b>"),
         }
         ru_title, uz_title = title_by_mode[safe_mode]
+        if not visible_rows:
+            if lang == "uz":
+                empty_text = (
+                    "FBO omborida qoldiq topilmadi."
+                    if safe_mode == "fbo"
+                    else "FBS/DBS omborida qoldiq topilmadi."
+                    if safe_mode == "fbs"
+                    else "Tovar qoldiqlari topilmadi."
+                )
+            else:
+                empty_text = (
+                    "Остатки FBO не найдены."
+                    if safe_mode == "fbo"
+                    else "Остатки FBS/DBS не найдены."
+                    if safe_mode == "fbs"
+                    else "Остатки товаров не найдены."
+                )
+            await message.answer(empty_text, reply_markup=stock_menu_for_message(message))
+            return
+
+        product_rows = prepare_stock_product_rows(visible_rows)
         total_fbo = sum(max(0.0, float(row.get("fbo") or 0)) for row in visible_rows)
         total_fbs = sum(max(0.0, float(row.get("fbs") or 0)) for row in visible_rows)
         total_units = sum(max(0.0, float(row.get("total") or 0)) for row in visible_rows)
+        pdf_path = build_stock_products_pdf(
+            product_rows,
+            shop_id=shop_id,
+            sku_count=len(visible_rows),
+            mode=safe_mode,
+            lang=lang,
+            generated_at=datetime.now(UZT),
+        )
+
         if lang == "uz":
-            summary = [
-                f"🏪 Do‘kon: <code>{shop_id}</code>",
-                f"🔖 SKU: <b>{len(visible_rows)}</b>",
-                f"📦 FBO: <b>{clean_num(total_fbo)}</b> · FBS/DBS: <b>{clean_num(total_fbs)}</b> · Jami: <b>{clean_num(total_units)}</b>",
-            ]
-            empty_text = (
-                "FBO omborida musbat qoldiqli SKU topilmadi."
-                if safe_mode == "fbo"
-                else "FBS/DBS omborida musbat qoldiqli SKU topilmadi."
-                if safe_mode == "fbs"
-                else "SKU qoldiqlari topilmadi."
+            caption = (
+                f"{uz_title}\n"
+                f"🏪 Do'kon: <code>{shop_id}</code>\n"
+                f"🛍 Tovarlar: <b>{len(product_rows)}</b> · Variantlar: <b>{len(visible_rows)}</b>\n"
+                f"📦 FBO: <b>{clean_num(total_fbo)}</b> · FBS/DBS: <b>{clean_num(total_fbs)}</b> · "
+                f"Jami: <b>{clean_num(total_units)}</b>\n\n"
+                "O'lcham va ranglar tovar nomi ostida birlashtirildi."
             )
         else:
-            summary = [
-                f"🏪 Магазин: <code>{shop_id}</code>",
-                f"🔖 SKU: <b>{len(visible_rows)}</b>",
-                f"📦 FBO: <b>{clean_num(total_fbo)}</b> · FBS/DBS: <b>{clean_num(total_fbs)}</b> · Всего: <b>{clean_num(total_units)}</b>",
-            ]
-            empty_text = (
-                "Не найдено SKU с положительным остатком FBO."
-                if safe_mode == "fbo"
-                else "Не найдено SKU с положительным остатком FBS/DBS."
-                if safe_mode == "fbs"
-                else "SKU-остатки не найдены."
+            caption = (
+                f"{ru_title}\n"
+                f"🏪 Магазин: <code>{shop_id}</code>\n"
+                f"🛍 Товаров: <b>{len(product_rows)}</b> · Вариантов: <b>{len(visible_rows)}</b>\n"
+                f"📦 FBO: <b>{clean_num(total_fbo)}</b> · FBS/DBS: <b>{clean_num(total_fbs)}</b> · "
+                f"Всего: <b>{clean_num(total_units)}</b>\n\n"
+                "Размеры и цвета объединены под названием товара."
             )
 
-        items = [format_sku_stock_line(row, mode=safe_mode) for row in visible_rows]
-        await send_paginated_list(
-            message,
-            kind=f"stock_{safe_mode}",
-            title=uz_title if lang == "uz" else ru_title,
-            items=items,
-            summary=summary,
-            empty_text=empty_text,
-            section="stock",
-            page_size=5,
+        filename_mode = {"all": "all", "fbo": "fbo", "fbs": "fbs"}[safe_mode]
+        await message.answer_document(
+            FSInputFile(
+                str(pdf_path),
+                filename=f"SellerPro_stock_by_products_{shop_id}_{filename_mode}.pdf",
+            ),
+            caption=caption,
             reply_markup=stock_menu_for_message(message),
         )
     except Exception as error:
         await send_api_error(message, error)
+    finally:
+        if pdf_path is not None:
+            try:
+                pdf_path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 @dp.message(Command("products"))
@@ -14685,19 +14719,52 @@ async def balance_all_shops(message: Message) -> None:
         await send_api_error(message, e)
 
 
+def _finance_product_title(item: dict[str, Any]) -> str:
+    """Prefer the product-card name over a variant/SKU title."""
+    for field in ("productTitle", "productName"):
+        value = _deep_pick_value(item, (field,))
+        if isinstance(value, dict):
+            value = pick(value, "title", "name", "value")
+        text = " ".join(str(value or "").split())
+        if text and text not in {"-", "—"}:
+            return text
+    return _finance_title(item)
+
+
+def _finance_product_group_key(item: dict[str, Any], title: str) -> str:
+    for field in ("productId", "product_id"):
+        value = _deep_pick_value(item, (field,))
+        if isinstance(value, dict):
+            value = pick(value, "id", "value")
+        normalized = " ".join(str(value or "").split())
+        if normalized and normalized not in {"0", "-", "—"}:
+            return f"product:{normalized.casefold()}"
+    return f"title:{' '.join(str(title or '').casefold().split())}"
+
+
 async def _top_products_for_shop(client: UzumClient, shop_id: int, days: int) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     date_from, date_to = _days_range_ms(days)
     rows, _ = await _load_finance_orders(client, shop_id, date_from_ms=date_from, date_to_ms=date_to, max_pages=5, page_size=100)
     groups: dict[str, dict[str, Any]] = {}
     for item in rows:
-        if _is_cancelled_status(_finance_status(item)):
+        status = _finance_status(item)
+        if _is_cancelled_status(status) or _is_returned_status(status):
             continue
-        title = _finance_title(item)
-        sku = _finance_sku_title(item)
-        key = (sku or title or "-").strip().lower()
-        if not key:
-            key = title.strip().lower()
-        entry = groups.setdefault(key, {"title": title, "sku": sku, "qty": 0.0, "revenue": 0.0, "payout": 0.0})
+        title = _finance_product_title(item)
+        key = _finance_product_group_key(item, title)
+        variant = _finance_sku_title(item)
+        entry = groups.setdefault(
+            key,
+            {
+                "title": title,
+                "qty": 0.0,
+                "revenue": 0.0,
+                "payout": 0.0,
+                "_variants": set(),
+            },
+        )
+        if variant and variant not in {"-", "—"}:
+            entry["_variants"].add(variant.casefold())
         gross = _finance_gross_revenue(item)
         commission = _finance_commission(item)
         logistics = _finance_logistics(item)
@@ -14706,7 +14773,12 @@ async def _top_products_for_shop(client: UzumClient, shop_id: int, days: int) ->
         entry["qty"] += _finance_qty(item)
         entry["revenue"] += gross
         entry["payout"] += max(0.0, payout)
-    top = sorted(groups.values(), key=lambda x: float(x.get("revenue") or 0), reverse=True)
+    top: list[dict[str, Any]] = []
+    for entry in groups.values():
+        variants = entry.pop("_variants")
+        entry["variant_count"] = max(1, len(variants))
+        top.append(entry)
+    top.sort(key=lambda x: float(x.get("revenue") or 0), reverse=True)
     return top, _build_noorza_today_stats(rows)
 
 
@@ -14729,24 +14801,31 @@ async def top_products(message: Message) -> None:
         title = f"🏆 <b>{days} kunlik top tovarlar</b>" if lang == "uz" else f"🏆 <b>Топ товаров за {days} дней</b>"
         summary = [
             f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
+            f"🛍 Tovarlar: <b>{len(top)}</b>" if lang == "uz" else f"🛍 Товаров: <b>{len(top)}</b>",
             f"📦 Sotilgan: <b>{float(stats['units']):.0f} dona</b>" if lang == "uz" else f"📦 Всего продано: <b>{float(stats['units']):.0f} шт.</b>",
             f"💵 Tushum: <b>{_format_money(float(stats['revenue']))}</b>" if lang == "uz" else f"💵 Выручка: <b>{_format_money(float(stats['revenue']))}</b>",
         ]
         items: list[str] = []
         for idx, item in enumerate(top, start=1):
-            title_item = escape(_short_text(item.get("title"), 85))
-            sku = escape(_short_text(item.get("sku"), 60))
-            sku_line = f"\n🔖 SKU: <code>{sku}</code>" if sku and sku != "-" else ""
+            title_item = escape(_short_text(item.get("title"), 110))
+            variant_count = max(1, int(item.get("variant_count") or 1))
+            variants_line = (
+                f"\n🎨 Variantlar: <b>{variant_count}</b>"
+                if lang == "uz" and variant_count > 1
+                else f"\n🎨 Вариантов: <b>{variant_count}</b>"
+                if lang != "uz" and variant_count > 1
+                else ""
+            )
             if lang == "uz":
                 items.append(
-                    f"{idx}. <b>{title_item}</b>{sku_line}\n"
+                    f"{idx}. <b>{title_item}</b>{variants_line}\n"
                     f"🔢 Soni: <b>{float(item.get('qty') or 0):.0f} dona</b> | "
                     f"💵 Tushum: <b>{_format_money(float(item.get('revenue') or 0))}</b> | "
                     f"✅ To‘lovga: <b>{_format_money(float(item.get('payout') or 0))}</b>"
                 )
             else:
                 items.append(
-                    f"{idx}. <b>{title_item}</b>{sku_line}\n"
+                    f"{idx}. <b>{title_item}</b>{variants_line}\n"
                     f"🔢 Продано: <b>{float(item.get('qty') or 0):.0f} шт.</b> | "
                     f"💵 Выручка: <b>{_format_money(float(item.get('revenue') or 0))}</b> | "
                     f"✅ К выплате: <b>{_format_money(float(item.get('payout') or 0))}</b>"
@@ -24712,7 +24791,7 @@ _cleanup_release_state()
 # Preserves per-user instant/hourly modes while using the durable outbox and
 # adaptive Finance pagination from RELEASE_HARDENING.
 # =============================================================================
-PREMIUM_RELEASE_VERSION = "2026.07.22-premium-r19-clear-reports"
+PREMIUM_RELEASE_VERSION = "2026.07.22-premium-r20-product-reports"
 
 WATCHER_ACCESS_BACKOFF_SECONDS = max(
     300,
@@ -25029,6 +25108,7 @@ async def main() -> None:
     logging.info("LEGACY_CANCEL_STATUS_FILTER_SCAN_DISABLED: finance orders are scanned without unsupported status parameters")
     logging.info("SKU_LABELS_INTERFACE_LOADED: official barcode types + PDF SKU labels")
     logging.info("STOCK_TRUTH_LOADED: SKU-level FBO/FBS totals + supply forecast")
+    logging.info("PRODUCT_REPORTS_R20_LOADED: stock PDF + product-grouped sales ranking")
 
     init_language_tables()
     init_product_value_tables()

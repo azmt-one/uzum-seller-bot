@@ -89,6 +89,104 @@ def _resolve_output(output: str | Path | None, prefix: str, suffix: str) -> Path
     return path
 
 
+def prepare_stock_product_rows(
+    stock_rows: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Aggregate SKU-level stock into seller-facing product rows.
+
+    Uzum returns current stock per SKU (for example, one row per size or
+    colour).  The stock screen is easier to understand when those variants are
+    grouped under the product card name while the quantities remain exact.
+    """
+
+    products: dict[str, dict[str, Any]] = {}
+    for index, source in enumerate(stock_rows):
+        if not isinstance(source, dict):
+            continue
+
+        product_id = _identifier(source.get("product_id") or source.get("productId"))
+        product_title = _clean(
+            source.get("product_title")
+            or source.get("productTitle")
+        )
+        if not product_title or product_title in {"-", "—"}:
+            product_title = _clean(
+                source.get("sku_full_title")
+                or source.get("sku_title")
+                or source.get("title")
+                or "Без названия"
+            )
+
+        group_key = (
+            f"product:{product_id}"
+            if product_id
+            else f"title:{product_title.casefold()}"
+        )
+        entry = products.setdefault(
+            group_key,
+            {
+                "product_id": product_id,
+                "title": product_title,
+                "variant_count": 0,
+                "fbo": 0.0,
+                "fbs": 0.0,
+                "total": 0.0,
+                "price_min": None,
+                "price_max": None,
+                "_variants": set(),
+            },
+        )
+
+        variant_value = (
+            source.get("sku_id")
+            or source.get("barcode")
+            or source.get("seller_item_code")
+            or source.get("sku_full_title")
+            or source.get("sku_title")
+            or f"row:{index}"
+        )
+        variant_key = _clean(variant_value).casefold() or f"row:{index}"
+        variants = entry["_variants"]
+        if variant_key in variants:
+            # ``load_sku_rows`` normally removes these duplicates already.
+            # Keeping this guard here makes standalone report generation safe.
+            continue
+        variants.add(variant_key)
+
+        fbo_value = _num(source.get("fbo"))
+        fbs_value = _num(source.get("fbs"))
+        fbo = max(0.0, float(fbo_value or 0.0))
+        fbs = max(0.0, float(fbs_value or 0.0))
+        if fbo_value is None and fbs_value is None:
+            total = max(0.0, float(_num(source.get("total")) or 0.0))
+        else:
+            total = fbo + fbs
+
+        entry["fbo"] = float(entry["fbo"]) + fbo
+        entry["fbs"] = float(entry["fbs"]) + fbs
+        entry["total"] = float(entry["total"]) + total
+
+        price = _num(source.get("price"))
+        if price is not None and price > 0:
+            current_min = _num(entry.get("price_min"))
+            current_max = _num(entry.get("price_max"))
+            entry["price_min"] = price if current_min is None else min(current_min, price)
+            entry["price_max"] = price if current_max is None else max(current_max, price)
+
+    result: list[dict[str, Any]] = []
+    for entry in products.values():
+        variants = entry.pop("_variants")
+        entry["variant_count"] = len(variants)
+        result.append(entry)
+    result.sort(
+        key=lambda item: (
+            -float(item.get("total") or 0.0),
+            str(item.get("title") or "").casefold(),
+        )
+    )
+    return result
+
+
 def prepare_compensation_rows(
     stock_rows: Iterable[dict[str, Any]],
     *,
@@ -667,6 +765,313 @@ def _pdf_fonts() -> tuple[str, str]:
     if "SellerProDailyBold" not in pdfmetrics.getRegisteredFontNames():
         pdfmetrics.registerFont(TTFont("SellerProDailyBold", str(bold_path)))
     return "SellerProDaily", "SellerProDailyBold"
+
+
+def build_stock_products_pdf(
+    product_rows: Iterable[dict[str, Any]],
+    output: str | Path | None = None,
+    *,
+    shop_id: int | str,
+    sku_count: int,
+    mode: str = "all",
+    lang: str = "ru",
+    generated_at: datetime | None = None,
+) -> Path:
+    """Create a readable stock PDF with one row per product, not per SKU."""
+
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+
+    normalized_mode = mode if mode in {"all", "fbo", "fbs"} else "all"
+    rows = [dict(item) for item in product_rows if isinstance(item, dict)]
+    path = _resolve_output(output, "sellerpro_stock_products_", ".pdf")
+    regular, bold = _pdf_fonts()
+    uz = str(lang or "ru").lower() == "uz"
+    created = generated_at if isinstance(generated_at, datetime) else datetime.now()
+    created_label = created.strftime("%d.%m.%Y %H:%M")
+
+    titles = {
+        "all": ("Ombordagi qoldiq - tovarlar bo'yicha", "Остатки по товарам"),
+        "fbo": ("FBO qoldig'i - tovarlar bo'yicha", "Остатки FBO по товарам"),
+        "fbs": ("FBS/DBS qoldig'i - tovarlar bo'yicha", "Остатки FBS/DBS по товарам"),
+    }
+    uz_title, ru_title = titles[normalized_mode]
+    report_title = uz_title if uz else ru_title
+
+    doc = SimpleDocTemplate(
+        str(path),
+        pagesize=landscape(A4),
+        leftMargin=10 * mm,
+        rightMargin=10 * mm,
+        topMargin=10 * mm,
+        bottomMargin=12 * mm,
+        title=f"Seller.pro.uz - {report_title}",
+        author="Seller.pro.uz",
+    )
+    title_style = ParagraphStyle(
+        "StockTitle",
+        fontName=bold,
+        fontSize=16,
+        leading=19,
+        textColor=colors.HexColor("#" + NAVY),
+        alignment=TA_LEFT,
+    )
+    meta_style = ParagraphStyle(
+        "StockMeta",
+        fontName=regular,
+        fontSize=8,
+        leading=10,
+        textColor=colors.HexColor("#566573"),
+    )
+    note_style = ParagraphStyle(
+        "StockNote",
+        parent=meta_style,
+        fontSize=7.5,
+        leading=9,
+    )
+    cell_style = ParagraphStyle(
+        "StockCell",
+        fontName=regular,
+        fontSize=7.2,
+        leading=9,
+        alignment=TA_LEFT,
+    )
+    cell_center = ParagraphStyle(
+        "StockCellCenter",
+        parent=cell_style,
+        alignment=TA_CENTER,
+    )
+    cell_right = ParagraphStyle(
+        "StockCellRight",
+        parent=cell_style,
+        alignment=TA_RIGHT,
+    )
+    header_style = ParagraphStyle(
+        "StockHeader",
+        parent=cell_center,
+        fontName=bold,
+        fontSize=7,
+        leading=8.5,
+        textColor=colors.white,
+    )
+    total_style = ParagraphStyle(
+        "StockTotal",
+        parent=cell_right,
+        fontName=bold,
+        fontSize=7.2,
+    )
+    kpi_label = ParagraphStyle(
+        "StockKpiLabel",
+        parent=cell_center,
+        fontSize=7.2,
+        textColor=colors.HexColor("#566573"),
+    )
+    kpi_value = ParagraphStyle(
+        "StockKpiValue",
+        parent=cell_center,
+        fontName=bold,
+        fontSize=11,
+        leading=13,
+        textColor=colors.HexColor("#" + NAVY),
+    )
+
+    product_count = len(rows)
+    variant_count = sum(max(0, int(item.get("variant_count") or 0)) for item in rows)
+    total_fbo = sum(max(0.0, float(_num(item.get("fbo")) or 0.0)) for item in rows)
+    total_fbs = sum(max(0.0, float(_num(item.get("fbs")) or 0.0)) for item in rows)
+    total_units = sum(max(0.0, float(_num(item.get("total")) or 0.0)) for item in rows)
+
+    story: list[Any] = [
+        Paragraph(f"Seller.pro.uz - {report_title}", title_style),
+        Paragraph(
+            (
+                f"Do'kon: {xml_escape(str(shop_id))} - Yaratildi: {created_label}"
+                if uz
+                else f"Магазин: {xml_escape(str(shop_id))} - Сформирован: {created_label}"
+            ),
+            meta_style,
+        ),
+        Spacer(1, 4 * mm),
+    ]
+
+    kpi_labels = (
+        ["Tovarlar", "Variantlar", "FBO", "FBS/DBS", "Jami"]
+        if uz
+        else ["Товаров", "Вариантов", "FBO", "FBS/DBS", "Всего"]
+    )
+    kpi_values = [
+        str(product_count),
+        str(variant_count if variant_count else max(0, int(sku_count))),
+        f"{total_fbo:g}",
+        f"{total_fbs:g}",
+        f"{total_units:g}",
+    ]
+    kpi_table = Table(
+        [
+            [Paragraph(label, kpi_label) for label in kpi_labels],
+            [Paragraph(value, kpi_value) for value in kpi_values],
+        ],
+        colWidths=[54 * mm] * 5,
+        hAlign="LEFT",
+    )
+    kpi_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#" + PALE_BLUE)),
+                ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#D9E2EA")),
+                ("INNERGRID", (0, 0), (-1, -1), 0.2, colors.HexColor("#D9E2EA")),
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("TOPPADDING", (0, 0), (-1, -1), 4),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+            ]
+        )
+    )
+    story.extend([kpi_table, Spacer(1, 3 * mm)])
+
+    note = (
+        "Bir xil tovar kartasidagi o'lcham va ranglar birlashtirildi. "
+        "'Variantlar' ustuni ularning sonini ko'rsatadi."
+        if uz
+        else "Размеры и цвета одной карточки объединены в один товар. "
+        "Колонка «Варианты» показывает их количество."
+    )
+    story.extend([Paragraph(note, note_style), Spacer(1, 3 * mm)])
+
+    if not rows:
+        empty = Table(
+            [[Paragraph(
+                "Qoldiq topilmadi." if uz else "Остатки не найдены.",
+                kpi_value,
+            )]],
+            colWidths=[270 * mm],
+        )
+        empty.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#" + PALE_BLUE)),
+                    ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#D9E2EA")),
+                    ("TOPPADDING", (0, 0), (-1, -1), 12),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 12),
+                ]
+            )
+        )
+        story.append(empty)
+    else:
+        if normalized_mode == "all":
+            headers = (
+                ["#", "Tovar nomi", "Variantlar", "FBO", "FBS/DBS", "Jami", "Narx"]
+                if uz
+                else ["#", "Название товара", "Варианты", "FBO", "FBS/DBS", "Всего", "Цена"]
+            )
+            widths = [8 * mm, 137 * mm, 22 * mm, 22 * mm, 25 * mm, 22 * mm, 41 * mm]
+        elif normalized_mode == "fbo":
+            headers = (
+                ["#", "Tovar nomi", "Variantlar", "FBO qoldiq", "Narx"]
+                if uz
+                else ["#", "Название товара", "Варианты", "Остаток FBO", "Цена"]
+            )
+            widths = [8 * mm, 174 * mm, 25 * mm, 30 * mm, 40 * mm]
+        else:
+            headers = (
+                ["#", "Tovar nomi", "Variantlar", "FBS/DBS qoldiq", "Narx"]
+                if uz
+                else ["#", "Название товара", "Варианты", "Остаток FBS/DBS", "Цена"]
+            )
+            widths = [8 * mm, 170 * mm, 25 * mm, 34 * mm, 40 * mm]
+
+        data: list[list[Any]] = [[Paragraph(value, header_style) for value in headers]]
+        for index, item in enumerate(rows, start=1):
+            price_min = _num(item.get("price_min"))
+            price_max = _num(item.get("price_max"))
+            if price_min is None:
+                price_text = "-"
+            elif price_max is None or abs(price_max - price_min) < 0.005:
+                price_text = _money(price_min)
+            else:
+                price_text = f"{_money(price_min)} - {_money(price_max)}"
+            base = [
+                Paragraph(str(index), cell_center),
+                Paragraph(xml_escape(_clean(item.get("title") or "Без названия")), cell_style),
+                Paragraph(str(max(0, int(item.get("variant_count") or 0))), cell_center),
+            ]
+            if normalized_mode == "all":
+                base.extend(
+                    [
+                        Paragraph(f"{float(item.get('fbo') or 0):g}", cell_center),
+                        Paragraph(f"{float(item.get('fbs') or 0):g}", cell_center),
+                        Paragraph(f"{float(item.get('total') or 0):g}", cell_center),
+                    ]
+                )
+            elif normalized_mode == "fbo":
+                base.append(Paragraph(f"{float(item.get('fbo') or 0):g}", cell_center))
+            else:
+                base.append(Paragraph(f"{float(item.get('fbs') or 0):g}", cell_center))
+            base.append(Paragraph(price_text, cell_right))
+            data.append(base)
+
+        if normalized_mode == "all":
+            total_row = [
+                "",
+                Paragraph("Umumiy" if uz else "Итого", total_style),
+                Paragraph(str(variant_count), total_style),
+                Paragraph(f"{total_fbo:g}", total_style),
+                Paragraph(f"{total_fbs:g}", total_style),
+                Paragraph(f"{total_units:g}", total_style),
+                "",
+            ]
+        elif normalized_mode == "fbo":
+            total_row = [
+                "",
+                Paragraph("Umumiy" if uz else "Итого", total_style),
+                Paragraph(str(variant_count), total_style),
+                Paragraph(f"{total_fbo:g}", total_style),
+                "",
+            ]
+        else:
+            total_row = [
+                "",
+                Paragraph("Umumiy" if uz else "Итого", total_style),
+                Paragraph(str(variant_count), total_style),
+                Paragraph(f"{total_fbs:g}", total_style),
+                "",
+            ]
+        data.append(total_row)
+
+        table = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#" + BLUE)),
+                    ("ROWBACKGROUNDS", (0, 1), (-1, -2), [colors.white, colors.HexColor("#" + PALE_BLUE)]),
+                    ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#" + PALE_GRAY)),
+                    ("GRID", (0, 0), (-1, -1), 0.25, colors.HexColor("#D9E2EA")),
+                    ("LINEABOVE", (0, -1), (-1, -1), 0.6, colors.HexColor("#" + BLUE)),
+                    ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                    ("TOPPADDING", (0, 0), (-1, -1), 4),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+                ]
+            )
+        )
+        story.append(table)
+
+    def footer(canvas, document) -> None:
+        canvas.saveState()
+        canvas.setFont(regular, 7)
+        canvas.setFillColor(colors.HexColor("#6B7280"))
+        footer_text = (
+            f"Seller.pro.uz - {document.page} sahifa"
+            if uz
+            else f"Seller.pro.uz - страница {document.page}"
+        )
+        canvas.drawRightString(287 * mm, 6 * mm, footer_text)
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return path
 
 
 def build_daily_finance_pdf(
