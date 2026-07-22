@@ -180,6 +180,99 @@ def _style_report_sheet(ws, *, widths: list[float], freeze: str = "A4") -> None:
     ws.sheet_properties.outlinePr.summaryBelow = True
 
 
+def _daily_bridge_values(
+    payload: dict[str, Any],
+    products: list[dict[str, Any]],
+) -> dict[str, float]:
+    """Return one internally consistent basis for the daily profit bridge."""
+    known_products = [
+        item
+        for item in products
+        if item.get("cost_per_unit") is not None
+        and float(item.get("known_cost_qty") or item.get("qty") or 0) > 0
+    ]
+    known_revenue = sum(
+        float(
+            item.get("known_revenue")
+            if item.get("known_revenue") is not None
+            else item.get("revenue") or 0
+        )
+        for item in known_products
+    )
+    known_payout = sum(
+        float(
+            item.get("known_payout")
+            if item.get("known_payout") is not None
+            else item.get("payout") or 0
+        )
+        for item in known_products
+    )
+    known_commission = sum(
+        float(
+            item.get("known_commission")
+            if item.get("known_commission") is not None
+            else item.get("commission") or 0
+        )
+        for item in known_products
+    )
+    known_logistics = sum(
+        float(
+            item.get("known_logistics")
+            if item.get("known_logistics") is not None
+            else item.get("logistics") or 0
+        )
+        for item in known_products
+    )
+    known_cost = sum(float(item.get("cost_total") or 0) for item in known_products)
+    known_tax = sum(
+        float(
+            item.get("known_tax_expense")
+            if item.get("known_tax_expense") is not None
+            else item.get("tax_expense") or 0
+        )
+        for item in known_products
+    )
+
+    business = dict(payload.get("business") or {})
+    revenue = float(business.get("calculation_revenue", known_revenue) or 0)
+    payout = float(business.get("calculation_payout", known_payout) or 0)
+    commission = float(
+        business.get("calculation_commission", known_commission) or 0
+    )
+    logistics = float(business.get("calculation_logistics", known_logistics) or 0)
+    residual = revenue - payout - commission - logistics
+    other_payout = float(
+        business.get("other_payout_deductions", max(0.0, residual)) or 0
+    )
+    payout_adjustment = float(
+        business.get("payout_adjustment", max(0.0, -residual)) or 0
+    )
+    cost = float(business.get("cost_total", known_cost) or 0)
+    tax = float(business.get("tax_expense", known_tax) or 0)
+    deductions = max(0.0, float(payload.get("additional_expenses") or 0))
+    refunds = max(0.0, float(payload.get("refunds") or 0))
+    external = max(0.0, float(payload.get("external_expenses") or 0))
+    profit_before_tax = payout - cost
+    product_profit = profit_before_tax - tax
+    final = product_profit - deductions + refunds - external
+    return {
+        "revenue": revenue,
+        "commission": commission,
+        "logistics": logistics,
+        "other_payout": other_payout,
+        "payout_adjustment": payout_adjustment,
+        "payout": payout,
+        "cost": cost,
+        "profit_before_tax": profit_before_tax,
+        "tax": tax,
+        "product_profit": product_profit,
+        "deductions": deductions,
+        "refunds": refunds,
+        "external": external,
+        "final": final,
+    }
+
+
 def build_market_daily_workbook(
     payload: dict[str, Any],
     output: str | Path | None = None,
@@ -265,27 +358,46 @@ def build_market_daily_workbook(
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = Border(top=GRID, bottom=GRID)
 
-    deductions = max(0.0, float(payload.get("additional_expenses") or 0))
-    refunds = max(0.0, float(payload.get("refunds") or 0))
-    external = max(0.0, float(payload.get("external_expenses") or 0))
+    bridge = _daily_bridge_values(payload, products)
     row = total_row + 2
     summary_rows = [
-        ("Qo‘shimcha xarajatlar:" if uz else "Дополнительные расходы:", -deductions, RED),
-        ("Qaytarilgan mablag‘:" if uz else "Возвращённые средства:", refunds, GREEN),
-        ("Tashqi xarajatlar:" if uz else "Внешние расходы:", -external, RED),
+        ("Hisobdagi tushum:" if uz else "Выручка в расчёте:", bridge["revenue"], NAVY, False),
+        ("Uzum komissiyasi:" if uz else "Комиссия Uzum:", -bridge["commission"], RED, False),
+        ("Logistika:" if uz else "Логистика:", -bridge["logistics"], RED, False),
+        ("To‘lov ichidagi boshqa ushlanmalar:" if uz else "Другие удержания внутри выплаты:", -bridge["other_payout"], RED, False),
+        ("To‘lov tuzatishi:" if uz else "Корректировка выплаты:", bridge["payout_adjustment"], GREEN, False),
+        ("To‘lovga:" if uz else "К выплате:", None, NAVY, True),
+        ("Tannarx:" if uz else "Себестоимость:", -bridge["cost"], RED, False),
+        ("Soliqdan oldingi foyda:" if uz else "Прибыль до налога:", None, GREEN, True),
+        ("Soliq:" if uz else "Налог:", -bridge["tax"], RED, False),
+        ("Tovarlar foydasi:" if uz else "Прибыль товаров:", None, GREEN, True),
+        ("Uzum qo‘shimcha xarajatlari:" if uz else "Доп. расходы Uzum:", -bridge["deductions"], RED, False),
+        ("Uzum qaytargan mablag‘:" if uz else "Возвраты от Uzum:", bridge["refunds"], GREEN, False),
+        ("Tashqi xarajatlar:" if uz else "Внешние расходы:", -bridge["external"], RED, False),
     ]
-    for label, value, color in summary_rows:
+    summary_start = row
+    for offset, (label, value, color, subtotal) in enumerate(summary_rows):
         ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
         ws.cell(row, 1, label)
-        ws.cell(row, 8, value)
+        if offset == 5:
+            ws.cell(row, 8, f"=SUM(H{summary_start}:H{summary_start + 4})")
+        elif offset == 7:
+            ws.cell(row, 8, f"=H{summary_start + 5}+H{summary_start + 6}")
+        elif offset == 9:
+            ws.cell(row, 8, f"=H{summary_start + 7}+H{summary_start + 8}")
+        else:
+            ws.cell(row, 8, value)
         ws.cell(row, 8).font = Font(name="Arial", bold=True, color=color)
         ws.cell(row, 1).font = Font(name="Arial", bold=True, color=BLUE)
+        if subtotal:
+            for column in range(1, 9):
+                ws.cell(row, column).border = Border(top=GRID)
         row += 1
 
     ws.merge_cells(start_row=row, start_column=1, end_row=row, end_column=7)
     complete = bool(payload.get("complete"))
     ws.cell(row, 1, "Yakuniy sof summa:" if uz and complete else "Ma’lum ma’lumotlar bo‘yicha natija:" if uz else "Итоговая чистая сумма:" if complete else "Результат по известным данным:")
-    ws.cell(row, 8, f"=H{total_row}-{deductions}+{refunds}-{external}")
+    ws.cell(row, 8, f"=SUM(H{summary_start + 9}:H{summary_start + 12})")
     for cell in ws[row]:
         cell.font = Font(name="Arial", size=11, bold=True)
         cell.border = Border(top=Side(style="medium", color=BLUE))
@@ -314,6 +426,7 @@ def build_market_daily_workbook(
     for cell in ws["I"][first_data_row - 1 : total_row]:
         cell.number_format = "0.00%"
     _style_report_sheet(ws, widths=[74, 13, 9, 16, 16, 16, 14, 18, 12])
+    ws.print_title_rows = "3:3"
     ws.auto_filter.ref = f"A3:I{last_data_row}" if products else "A3:I3"
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
@@ -427,10 +540,22 @@ def build_market_daily_pdf(
         if item.get("cost_per_unit") is not None
         and float(item.get("known_cost_qty") or item.get("qty") or 0) > 0
     ]
+    known_revenue = sum(
+        float(item.get("known_revenue") if item.get("known_revenue") is not None else item.get("revenue") or 0)
+        for item in known_products
+    )
+    known_payout = sum(
+        float(item.get("known_payout") if item.get("known_payout") is not None else item.get("payout") or 0)
+        for item in known_products
+    )
+    known_tax = sum(
+        float(item.get("known_tax_expense") if item.get("known_tax_expense") is not None else item.get("tax_expense") or 0)
+        for item in known_products
+    )
     known_net = sum(
-        float(item.get("payout") or 0)
+        float(item.get("known_payout") if item.get("known_payout") is not None else item.get("payout") or 0)
         - float(item.get("cost_total") or 0)
-        - float(item.get("tax_expense") or 0)
+        - float(item.get("known_tax_expense") if item.get("known_tax_expense") is not None else item.get("tax_expense") or 0)
         for item in known_products
     )
     roi_total = known_net / totals["cost_total"] * 100.0 if totals["cost_total"] > 0 else None
@@ -474,33 +599,52 @@ def build_market_daily_pdf(
             story.append(Spacer(1, 4 * mm))
         else:
             story.append(PageBreak())
-    deductions = max(0.0, float(payload.get("additional_expenses") or 0))
-    refunds = max(0.0, float(payload.get("refunds") or 0))
-    external = max(0.0, float(payload.get("external_expenses") or 0))
-    final = known_net - deductions + refunds - external
+    bridge = _daily_bridge_values(payload, products)
+    final = bridge["final"]
     complete = bool(payload.get("complete"))
     coverage = float(payload.get("cost_coverage") or 0) * 100
     summary_data = [
-        ["Qo‘shimcha xarajatlar" if uz else "Дополнительные расходы", _signed_money(deductions, "-")],
-        ["Qaytarilgan mablag‘" if uz else "Возвращённые средства", _signed_money(refunds, "+")],
-        ["Tashqi xarajatlar" if uz else "Внешние расходы", _signed_money(external, "-")],
+        ["Hisobdagi tushum" if uz else "Выручка в расчёте", _signed_money(bridge["revenue"], "+")],
+        ["Uzum komissiyasi" if uz else "Комиссия Uzum", _signed_money(bridge["commission"], "-")],
+        ["Logistika", _signed_money(bridge["logistics"], "-")],
+        ["To‘lov ichidagi boshqa ushlanmalar" if uz else "Другие удержания внутри выплаты", _signed_money(bridge["other_payout"], "-")],
+        ["To‘lov tuzatishi" if uz else "Корректировка выплаты", _signed_money(bridge["payout_adjustment"], "+")],
+        ["To‘lovga" if uz else "К выплате", _money(bridge["payout"])],
+        ["Tannarx" if uz else "Себестоимость", _signed_money(bridge["cost"], "-")],
+        ["Soliqdan oldingi foyda" if uz else "Прибыль до налога", _money(bridge["profit_before_tax"])],
+        ["Soliq" if uz else "Налог", _signed_money(bridge["tax"], "-")],
+        ["Tovarlar foydasi" if uz else "Прибыль товаров", _money(bridge["product_profit"])],
+        ["Uzum qo‘shimcha xarajatlari" if uz else "Доп. расходы Uzum", _signed_money(bridge["deductions"], "-")],
+        ["Uzum qaytargan mablag‘" if uz else "Возвраты от Uzum", _signed_money(bridge["refunds"], "+")],
+        ["Tashqi xarajatlar" if uz else "Внешние расходы", _signed_money(bridge["external"], "-")],
         [
             "Yakuniy sof summa" if uz and complete else "Ma’lum ma’lumotlar bo‘yicha natija" if uz else "Итоговая чистая сумма" if complete else "Результат по известным данным",
             _money(final),
         ],
-        ["ROI %", "—" if totals["cost_total"] <= 0 else f"{final / totals['cost_total'] * 100:.2f}%"],
+        ["ROI %", "—" if bridge["cost"] <= 0 else f"{final / bridge['cost'] * 100:.2f}%"],
     ]
     summary_table = Table(summary_data, colWidths=[80 * mm, 40 * mm], hAlign="RIGHT")
     summary_table.setStyle(
         TableStyle(
             [
                 ("FONTNAME", (0, 0), (-1, -1), regular),
+                ("FONTNAME", (0, 5), (-1, 5), bold),
+                ("FONTNAME", (0, 7), (-1, 7), bold),
+                ("FONTNAME", (0, 9), (-1, 9), bold),
                 ("FONTNAME", (0, -2), (-1, -1), bold),
                 ("FONTSIZE", (0, 0), (-1, -1), 8),
                 ("ALIGN", (1, 0), (1, -1), "RIGHT"),
+                ("LINEABOVE", (0, 5), (-1, 5), 0.5, colors.HexColor("#" + BLUE)),
+                ("LINEABOVE", (0, 7), (-1, 7), 0.5, colors.HexColor("#" + BLUE)),
+                ("LINEABOVE", (0, 9), (-1, 9), 0.5, colors.HexColor("#" + BLUE)),
                 ("LINEABOVE", (0, -2), (-1, -2), 1, colors.HexColor("#" + BLUE)),
-                ("TEXTCOLOR", (1, 0), (1, 0), colors.HexColor("#" + RED)),
-                ("TEXTCOLOR", (1, 1), (1, 1), colors.HexColor("#" + GREEN)),
+                ("TEXTCOLOR", (1, 1), (1, 3), colors.HexColor("#" + RED)),
+                ("TEXTCOLOR", (1, 4), (1, 4), colors.HexColor("#" + GREEN)),
+                ("TEXTCOLOR", (1, 6), (1, 6), colors.HexColor("#" + RED)),
+                ("TEXTCOLOR", (1, 8), (1, 8), colors.HexColor("#" + RED)),
+                ("TEXTCOLOR", (1, 10), (1, 10), colors.HexColor("#" + RED)),
+                ("TEXTCOLOR", (1, 11), (1, 11), colors.HexColor("#" + GREEN)),
+                ("TEXTCOLOR", (1, 12), (1, 12), colors.HexColor("#" + RED)),
                 ("TOPPADDING", (0, 0), (-1, -1), 3),
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
             ]
@@ -550,15 +694,48 @@ def build_compensation_workbook(
             else ["ИД товара", "Название товара", "SKU", "ШК", "Размер возмещения", "Кол-во", "Итого"]
         )
         widths = [16, 65, 24, 22, 22, 12, 22]
-    ws.append(headers)
-    for cell in ws[1]:
+    total_col = len(headers)
+    total_qty = sum(_qty(item.get("quantity")) for item in rows)
+    known_total = sum(float(_num(item.get("total")) or 0) for item in rows)
+    incomplete = sum(
+        1
+        for item in rows
+        if _num(item.get("compensation")) is None or _num(item.get("total")) is None
+    )
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=total_col)
+    ws.cell(1, 1, "Yo‘qolgan tovarlar reestri" if uz and normalized_kind == "loss" else "Brak tovarlar reestri" if uz else "Реестр потерянных товаров" if normalized_kind == "loss" else "Реестр повреждённых товаров")
+    ws.cell(1, 1).font = Font(name="Arial", size=16, bold=True, color=NAVY)
+    ws.cell(1, 1).alignment = Alignment(vertical="center")
+    ws.row_dimensions[1].height = 30
+    ws.merge_cells(start_row=2, start_column=1, end_row=2, end_column=total_col)
+    ws.cell(2, 1, (
+        f"Pozitsiyalar: {len(rows)} · Jami birlik: {total_qty} · Hisoblangan summa: {_money(known_total)}"
+        if uz
+        else f"Позиций: {len(rows)} · Единиц: {total_qty} · Рассчитанная сумма: {_money(known_total)}"
+    ))
+    ws.cell(2, 1).font = Font(name="Arial", size=10, bold=True, color="34495E")
+    ws.merge_cells(start_row=3, start_column=1, end_row=3, end_column=total_col)
+    ws.cell(3, 1, (
+        f"Diqqat: {incomplete} qator bo‘yicha aniq narx yoki komissiya yo‘q; summa bo‘sh qoldirildi."
+        if uz and incomplete
+        else "Ma’lumotlar Uzum API asosida. Summalar taxmin qilinmaydi."
+        if uz
+        else f"Внимание: по {incomplete} строкам нет точной цены или комиссии; сумма оставлена пустой."
+        if incomplete
+        else "Данные получены из Uzum API. Отсутствующие суммы не подставляются приблизительно."
+    ))
+    ws.cell(3, 1).font = Font(name="Arial", size=9, italic=True, color=RED if incomplete else "6B7280")
+    header_row = 4
+    for column, header in enumerate(headers, start=1):
+        ws.cell(header_row, column, header)
+    for cell in ws[header_row]:
         cell.font = Font(name="Arial", bold=True, color="333333")
         cell.fill = PatternFill("solid", fgColor="E7E7E7")
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = Border(bottom=GRID)
-    ws.row_dimensions[1].height = 28
+    ws.row_dimensions[header_row].height = 28
 
-    for index, item in enumerate(rows, start=2):
+    for index, item in enumerate(rows, start=header_row + 1):
         compensation = _num(item.get("compensation"))
         if normalized_kind == "loss":
             values = [item.get("title"), item.get("barcode"), compensation, item.get("quantity"), item.get("total")]
@@ -572,21 +749,20 @@ def build_compensation_workbook(
             cell.border = Border(bottom=GRID)
         ws.row_dimensions[index].height = 34
 
-    total_row = len(rows) + 2
-    total_col = 5 if normalized_kind == "loss" else 7
+    total_row = header_row + len(rows) + 1
     qty_col = total_col - 1
     ws.cell(total_row, 1, "Umumiy:" if uz else "Итого:")
-    ws.cell(total_row, qty_col, f"=SUM({get_column_letter(qty_col)}2:{get_column_letter(qty_col)}{total_row - 1})")
-    ws.cell(total_row, total_col, f"=SUM({get_column_letter(total_col)}2:{get_column_letter(total_col)}{total_row - 1})")
+    ws.cell(total_row, qty_col, f"=SUM({get_column_letter(qty_col)}{header_row + 1}:{get_column_letter(qty_col)}{total_row - 1})")
+    ws.cell(total_row, total_col, f"=SUM({get_column_letter(total_col)}{header_row + 1}:{get_column_letter(total_col)}{total_row - 1})")
     for cell in ws[total_row]:
         cell.font = Font(name="Arial", bold=True)
         cell.fill = PatternFill("solid", fgColor=PALE_GRAY)
         cell.border = Border(top=GRID, bottom=GRID)
     for column in (total_col - 2, total_col):
-        for cell in ws[get_column_letter(column)][1:]:
+        for cell in ws[get_column_letter(column)][header_row:]:
             cell.number_format = '#,##0'
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = f"A1:{get_column_letter(total_col)}{max(1, total_row - 1)}"
+    ws.freeze_panes = f"A{header_row + 1}"
+    ws.auto_filter.ref = f"A{header_row}:{get_column_letter(total_col)}{max(header_row, total_row - 1)}"
     ws.sheet_view.showGridLines = False
     for idx, width in enumerate(widths, start=1):
         ws.column_dimensions[get_column_letter(idx)].width = width
@@ -594,6 +770,7 @@ def build_compensation_workbook(
     ws.sheet_properties.pageSetUpPr.fitToPage = True
     ws.page_setup.fitToWidth = 1
     ws.page_setup.fitToHeight = 0
+    ws.print_title_rows = f"{header_row}:{header_row}"
     wb.calculation.fullCalcOnLoad = True
     wb.calculation.forceFullCalc = True
     wb.save(path)
@@ -734,7 +911,31 @@ def build_claim_docx(
                 element.set(qn("w:sz"), "4")
                 element.set(qn("w:color"), "D9E2EA")
 
-    document.add_paragraph().paragraph_format.space_after = Pt(0)
+    preview_qty = sum(_qty(item.get("quantity")) for item in rows)
+    preview_total = sum(float(_num(item.get("total")) or 0) for item in rows)
+    preview_incomplete = sum(
+        1
+        for item in rows
+        if _num(item.get("compensation")) is None or _num(item.get("total")) is None
+    )
+    summary = document.add_paragraph()
+    summary.paragraph_format.space_before = Pt(5)
+    summary.paragraph_format.space_after = Pt(5)
+    summary_text = (
+        f"Hujjat tarkibi: {len(rows)} pozitsiya · {preview_qty} dona · hisoblangan summa {_money(preview_total)} so‘m."
+        if uz
+        else f"Состав претензии: {len(rows)} позиций · {preview_qty} единиц · рассчитанная сумма {_money(preview_total)} сум."
+    )
+    if preview_incomplete:
+        summary_text += (
+            f" {preview_incomplete} qator bo‘yicha summa ma’lumot yetishmagani sababli bo‘sh qoldirilgan."
+            if uz
+            else f" По {preview_incomplete} строкам сумма оставлена пустой из-за отсутствующих данных."
+        )
+    summary_run = summary.add_run(summary_text)
+    _set_docx_run_font(summary_run, bold=True, size=8.2)
+    summary_run.font.color.rgb = RGBColor(23, 54, 93)
+
     reason = "Yo‘qotish" if uz and normalized_kind == "loss" else "Shikastlanish" if uz else "Утеря" if normalized_kind == "loss" else "Повреждение"
     headers = (
         ["Tovar nomi", "Shtrix-kod", "Sabab", "Qoplama*", "Soni", "Jami"]
@@ -829,7 +1030,7 @@ def build_claim_docx(
         note_text += (
             f" {incomplete} ta SKU bo‘yicha narx yoki aniq komissiya yo‘q; qiymat taxmin qilinmadi."
             if uz
-            else f" По {incomplete} SKU нет цены или точной комиссии; сумма не была придумана."
+            else f" По {incomplete} SKU нет цены или точной комиссии; сумма не рассчитана и оставлена пустой."
         )
     run = note.add_run(note_text)
     _set_docx_run_font(run, size=7.3)

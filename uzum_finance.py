@@ -254,6 +254,18 @@ def summarize_expenses(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
         for item in booked
         if item["category"] != "order_charge"
     )
+    deductions = sum(
+        float(item["signed_amount"])
+        for item in booked
+        if item["category"] != "order_charge"
+        and float(item["signed_amount"]) > 0
+    )
+    refunds = sum(
+        abs(float(item["signed_amount"]))
+        for item in booked
+        if item["category"] != "order_charge"
+        and float(item["signed_amount"]) < 0
+    )
     ordered = sorted(
         booked,
         key=lambda item: (item.get("date") or datetime.min.replace(tzinfo=timezone.utc), abs(float(item["signed_amount"]))),
@@ -261,6 +273,10 @@ def summarize_expenses(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     )
     return {
         "total": total,
+        # Keep deductions and refunds separate for a readable profit bridge.
+        # ``total`` remains the signed net value for backwards compatibility.
+        "deductions": deductions,
+        "refunds": refunds,
         "storage": categories["storage"],
         "advertising": categories["advertising"],
         "penalty": categories["penalty"],

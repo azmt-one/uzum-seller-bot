@@ -372,8 +372,12 @@ def _page_summary(c: canvas.Canvas, payload: dict[str, Any], lang: str) -> None:
     gap = 10
     card_w = (W - 2 * MARGIN - 2 * gap) / 3
     y1, y2 = H - 240, H - 320
-    _kpi(c, MARGIN, y1, card_w, 70, _t(lang, "Выручка", "Tushum"), _money(stats.get("revenue"), lang), _change_text(revenue_change, lang), GREEN, GREEN_SOFT)
-    _kpi(c, MARGIN + card_w + gap, y1, card_w, 70, _t(lang, "Заказы", "Buyurtmalar"), str(int(_num(stats.get("orders")))), _change_text(orders_change, lang), PURPLE, PURPLE_SOFT)
+    revenue_accent = RED if revenue_change is not None and revenue_change < 0 else GREEN
+    revenue_soft = RED_SOFT if revenue_accent == RED else GREEN_SOFT
+    orders_accent = RED if orders_change is not None and orders_change < 0 else PURPLE
+    orders_soft = RED_SOFT if orders_accent == RED else PURPLE_SOFT
+    _kpi(c, MARGIN, y1, card_w, 70, _t(lang, "Выручка", "Tushum"), _money(stats.get("revenue"), lang), _change_text(revenue_change, lang), revenue_accent, revenue_soft)
+    _kpi(c, MARGIN + card_w + gap, y1, card_w, 70, _t(lang, "Заказы", "Buyurtmalar"), str(int(_num(stats.get("orders")))), _change_text(orders_change, lang), orders_accent, orders_soft)
     _kpi(c, MARGIN + 2 * (card_w + gap), y1, card_w, 70, _t(lang, "Продано", "Sotildi"), f"{_qty(stats.get('units'))} {_t(lang, 'шт.', 'dona')}", _t(lang, "чистое количество", "sof miqdor"), BLUE, BLUE_SOFT)
     _kpi(c, MARGIN, y2, card_w, 70, _t(lang, "К выплате", "To‘lovga"), _money(stats.get("payout_total"), lang), _percent(_num(stats.get("payout_total")) / max(1.0, _num(stats.get("revenue")))), GREEN, GREEN_SOFT)
     result_value = _num(business.get("net_profit", profit.get("profit")))
@@ -384,7 +388,7 @@ def _page_summary(c: canvas.Canvas, payload: dict[str, Any], lang: str) -> None:
     )
     profit_accent = RED if result_value < 0 else PURPLE
     profit_soft = RED_SOFT if result_value < 0 else PURPLE_SOFT
-    _kpi(c, MARGIN + card_w + gap, y2, card_w, 70, profit_label, _money(result_value, lang), _t(lang, f"покрытие {coverage * 100:.1f}%", f"qamrov {coverage * 100:.1f}%"), profit_accent, profit_soft)
+    _kpi(c, MARGIN + card_w + gap, y2, card_w, 70, profit_label, _money(result_value, lang), _t(lang, f"себестоимость {coverage * 100:.1f}%", f"tannarx {coverage * 100:.1f}%"), profit_accent, profit_soft)
     _kpi(c, MARGIN + 2 * (card_w + gap), y2, card_w, 70, _t(lang, "Отмены", "Bekor qilish"), str(int(_num(stats.get("cancelled")))), _t(lang, f"доля {_num(stats.get('cancellation_rate')) * 100:.1f}%", f"ulushi {_num(stats.get('cancellation_rate')) * 100:.1f}%"), ORANGE, ORANGE_SOFT)
 
     chart_y, chart_h = 315, 172
@@ -450,30 +454,63 @@ def _page_finance(c: canvas.Canvas, payload: dict[str, Any], lang: str) -> None:
     coverage = _num(business.get("coverage", profit.get("coverage")))
     business_complete = bool(business.get("complete"))
     _header(c, 2, _t(lang, "Продажи и прибыль", "Savdo va foyda"), _t(lang, "Расходы площадки, себестоимость и товары, формирующие результат", "Platforma xarajatlari, tannarx va natijani shakllantiruvchi tovarlar"), lang)
-    _section(c, _t(lang, "Куда уходит выручка", "Tushum qayerga ketadi"), _t(lang, "Себестоимость берётся только из Uzum purchasePrice", "Tannarx faqat Uzum purchasePrice’dan olinadi"), MARGIN, H - 135)
-    _rounded(c, MARGIN, 522, W - 2 * MARGIN, 170, white, 12)
-    c.setStrokeColor(LINE)
-    c.roundRect(MARGIN, 522, W - 2 * MARGIN, 170, 12, fill=0, stroke=1)
-    bar_x, bar_w = MARGIN + 16, W - 2 * MARGIN - 32
-    maximum = max(1.0, _num(stats.get("revenue")))
-    _bar(c, bar_x, 638, bar_w, _num(profit.get("cost_total")), maximum, PURPLE, _t(lang, "Себестоимость Uzum (известная)", "Uzum tannarxi (ma’lum)"), _money(profit.get("cost_total"), lang))
-    platform_costs = _num(stats.get("commission")) + _num(stats.get("logistics"))
-    _bar(c, bar_x, 603, bar_w, platform_costs, maximum, BLUE, _t(lang, "Комиссия и логистика Uzum", "Uzum komissiya va logistika"), _money(platform_costs, lang))
-    other_costs = (
-        _num(business.get("uzum_expense_total"))
-        + _num(business.get("tax_expense"))
-        + _num(business.get("advertising_expense"))
-        + _num(business.get("storage_expense"))
-        + _num(business.get("other_expense"))
+    _section(c, _t(lang, "Как получился результат", "Natija qanday hisoblandi"), _t(lang, "Каждая сумма показана в порядке расчёта; комиссия и логистика не вычитаются дважды", "Har bir summa hisob tartibida; komissiya va logistika ikki marta ayrilmaydi"), MARGIN, H - 135)
+    calc_revenue = _num(business.get("calculation_revenue", stats.get("revenue")))
+    calc_payout = _num(business.get("calculation_payout", stats.get("payout_total")))
+    calc_commission = _num(business.get("calculation_commission", stats.get("commission")))
+    calc_logistics = _num(business.get("calculation_logistics", stats.get("logistics")))
+    residual = calc_revenue - calc_payout - calc_commission - calc_logistics
+    other_payout = _num(business.get("other_payout_deductions", max(0.0, residual)))
+    payout_adjustment = _num(business.get("payout_adjustment", max(0.0, -residual)))
+    cost_total = _num(business.get("cost_total", profit.get("cost_total")))
+    before_tax = _num(business.get("known_profit", calc_payout - cost_total))
+    tax = _num(business.get("tax_expense"))
+    signed_uzum = _num(business.get("uzum_expense_total"))
+    uzum_deductions = _num(business.get("uzum_expense_deductions", max(0.0, signed_uzum)))
+    uzum_refunds = _num(business.get("uzum_expense_refunds", max(0.0, -signed_uzum)))
+    external = _num(
+        business.get(
+            "external_expense_total",
+            _num(business.get("advertising_expense"))
+            + _num(business.get("storage_expense"))
+            + _num(business.get("other_expense")),
+        )
     )
-    _bar(c, bar_x, 568, bar_w, other_costs, maximum, ORANGE, _t(lang, "Расходы Uzum, налог и внешние", "Uzum xarajatlari, soliq va tashqi"), _money(other_costs, lang))
     profit_value = _num(business.get("net_profit", profit.get("profit")))
     result_label = _t(
         lang,
         "Чистая прибыль" if business_complete else "Результат по известным данным",
         "Sof foyda" if business_complete else "Ma’lum ma’lumotlar natijasi",
     )
-    _bar(c, bar_x, 533, bar_w, profit_value, maximum, RED if profit_value < 0 else GREEN, result_label, _money(profit_value, lang))
+    before_tax_color = RED if before_tax < 0 else GREEN
+    result_color = RED if profit_value < 0 else GREEN
+    bridge_rows = [
+        [_t(lang, "Выручка для расчёта", "Hisob uchun tushum"), "+", _money(calc_revenue, lang)],
+        [_t(lang, "Комиссия Uzum", "Uzum komissiyasi"), "−", _money(calc_commission, lang)],
+        [_t(lang, "Логистика", "Logistika"), "−", _money(calc_logistics, lang)],
+        [_t(lang, "Другие удержания внутри выплаты", "To‘lov ichidagi boshqa ushlanmalar"), "−", _money(other_payout, lang)],
+        [_t(lang, "Корректировка выплаты", "To‘lov tuzatishi"), "+", _money(payout_adjustment, lang)],
+        [_t(lang, "К выплате", "To‘lovga"), "=", _money(calc_payout, lang)],
+        [_t(lang, "Себестоимость", "Tannarx"), "−", _money(cost_total, lang)],
+        [_t(lang, "Прибыль до налога", "Soliqdan oldingi foyda"), "=", _money(before_tax, lang)],
+        [_t(lang, "Налог", "Soliq"), "−", _money(tax, lang)],
+        [_t(lang, "Доп. расходы Uzum", "Uzum qo‘shimcha xarajatlari"), "−", _money(uzum_deductions, lang)],
+        [_t(lang, "Возвраты от Uzum", "Uzum qaytargan mablag‘"), "+", _money(uzum_refunds, lang)],
+        [_t(lang, "Внешние расходы", "Tashqi xarajatlar"), "−", _money(external, lang)],
+        [result_label, "=", _money(profit_value, lang)],
+    ]
+    bridge_colors = [INK, RED, RED, RED, GREEN, BLUE, RED, before_tax_color, RED, RED, GREEN, RED, result_color]
+    _table(
+        c,
+        MARGIN,
+        690,
+        [302, 45, W - 2 * MARGIN - 347],
+        [_t(lang, "ПОКАЗАТЕЛЬ", "KO‘RSATKICH"), _t(lang, "ЗНАК", "BELGI"), _t(lang, "СУММА", "SUMMA")],
+        bridge_rows,
+        row_h=13.5,
+        right={1, 2},
+        last_colors=bridge_colors,
+    )
 
     _section(c, _t(lang, "Товары-лидеры", "Yetakchi tovarlar"), _t(lang, "Топ по выручке с оценкой прибыли и маржи", "Tushum bo‘yicha top, foyda va marja bahosi"), MARGIN, 494)
     product_rows: list[list[str]] = []

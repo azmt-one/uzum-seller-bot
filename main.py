@@ -398,29 +398,67 @@ def build_premium_workbook(
         ws = wb.create_sheet(_sheet_name(lang, "Прибыль", "Foyda"))
         _title(ws, f"{result_name} — 30 {_t(lang, 'дней', 'kun')}", end_col=4)
         ws.append([
-            _t(lang, "Показатель", "Ko‘rsatkich"),
+            _t(lang, "Шаг расчёта", "Hisob bosqichi"),
+            _t(lang, "Знак", "Belgi"),
             _t(lang, "Сумма", "Summa"),
-            _t(lang, "Источник", "Manba"),
-            _t(lang, "Комментарий", "Izoh"),
+            _t(lang, "Что означает", "Nimani anglatadi"),
         ])
-        expense_rows = [
-            (_t(lang, "Выручка", "Tushum"), business_profit.get("revenue"), "Uzum Finance API", ""),
-            (_t(lang, "Комиссия", "Komissiya"), business_profit.get("commission"), "Uzum Finance API", ""),
-            (_t(lang, "Логистика", "Logistika"), business_profit.get("logistics"), "Uzum Finance API", ""),
-            (_t(lang, "Себестоимость", "Tannarx"), business_profit.get("cost_total"), "Uzum purchasePrice", ""),
-            (_t(lang, "Налог", "Soliq"), business_profit.get("tax_expense"), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi"), f"{float(finance_settings.get('tax_percent') or 0):.2f}%"),
-            (_t(lang, "Расходы Uzum", "Uzum xarajatlari"), business_profit.get("uzum_expense_total"), "Uzum Finance API", ""),
-            (_t(lang, "Внешняя реклама", "Tashqi reklama"), business_profit.get("advertising_expense"), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi"), _t(lang, "За 30 дней", "30 kun uchun")),
-            (_t(lang, "Внешнее хранение", "Tashqi saqlash"), business_profit.get("storage_expense"), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi"), _t(lang, "За 30 дней", "30 kun uchun")),
-            (_t(lang, "Другие внешние расходы", "Boshqa tashqi xarajat"), business_profit.get("other_expense"), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi"), _t(lang, "За 30 дней", "30 kun uchun")),
-            (result_name, business_profit.get("net_profit"), _t(lang, "Расчёт бота", "Bot hisobi"), f"{float(business_profit.get('net_margin') or 0):.1f}%"),
-        ]
-        for row in expense_rows:
-            ws.append(list(row))
+        calculation_revenue = float(
+            business_profit.get("calculation_revenue", business_profit.get("revenue")) or 0
+        )
+        calculation_payout = float(
+            business_profit.get("calculation_payout", business_profit.get("payout_total")) or 0
+        )
+        calculation_commission = float(
+            business_profit.get("calculation_commission", business_profit.get("commission")) or 0
+        )
+        calculation_logistics = float(
+            business_profit.get("calculation_logistics", business_profit.get("logistics")) or 0
+        )
+        payout_residual = calculation_revenue - calculation_payout - calculation_commission - calculation_logistics
+        signed_uzum_expenses = float(business_profit.get("uzum_expense_total") or 0)
+        uzum_deductions = float(
+            business_profit.get("uzum_expense_deductions", max(0.0, signed_uzum_expenses)) or 0
+        )
+        uzum_refunds = float(
+            business_profit.get("uzum_expense_refunds", max(0.0, -signed_uzum_expenses)) or 0
+        )
+        ws.append([
+            _t(lang, "Выручка для расчёта", "Hisob uchun tushum"),
+            "+",
+            calculation_revenue,
+            _t(lang, "Все продажи; при неполном покрытии — только SKU с purchasePrice", "Barcha savdo; qamrov to‘liq bo‘lmasa — faqat purchasePrice bor SKU"),
+        ])
+        ws.append([_t(lang, "Комиссия Uzum", "Uzum komissiyasi"), "−", calculation_commission, _t(lang, "Уже учтена в выплате", "To‘lovda allaqachon hisobga olingan")])
+        ws.append([_t(lang, "Логистика", "Logistika"), "−", calculation_logistics, _t(lang, "Уже учтена в выплате", "To‘lovda allaqachon hisobga olingan")])
+        ws.append([_t(lang, "Другие удержания внутри выплаты", "To‘lov ichidagi boshqa ushlanmalar"), "−", float(business_profit.get("other_payout_deductions", max(0.0, payout_residual)) or 0), "Uzum Finance API"])
+        ws.append([_t(lang, "Корректировка выплаты", "To‘lov tuzatishi"), "+", float(business_profit.get("payout_adjustment", max(0.0, -payout_residual)) or 0), "Uzum Finance API"])
+        payout_row = ws.max_row + 1
+        ws.append([_t(lang, "К выплате", "To‘lovga"), "=", f"=C3-C4-C5-C6+C7", _t(lang, "Комиссия и логистика второй раз не вычитаются", "Komissiya va logistika ikkinchi marta ayrilmaydi")])
+        ws.append([_t(lang, "Себестоимость", "Tannarx"), "−", float(business_profit.get("cost_total") or 0), "Uzum purchasePrice"])
+        profit_before_tax_row = ws.max_row + 1
+        ws.append([_t(lang, "Прибыль до налога", "Soliqdan oldingi foyda"), "=", f"=C{payout_row}-C{payout_row + 1}", _t(lang, "К выплате минус себестоимость", "To‘lovga minus tannarx")])
+        ws.append([_t(lang, "Налог", "Soliq"), "−", float(business_profit.get("tax_expense") or 0), f"{float(finance_settings.get('tax_percent') or 0):.2f}%"])
+        ws.append([_t(lang, "Доп. расходы Uzum", "Uzum qo‘shimcha xarajatlari"), "−", uzum_deductions, _t(lang, "Без комиссии и логистики", "Komissiya va logistikasiz")])
+        ws.append([_t(lang, "Возвраты от Uzum", "Uzum qaytargan mablag‘"), "+", uzum_refunds, "Uzum Finance API"])
+        ws.append([_t(lang, "Внешняя реклама", "Tashqi reklama"), "−", float(business_profit.get("advertising_expense") or 0), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi")])
+        ws.append([_t(lang, "Внешнее хранение", "Tashqi saqlash"), "−", float(business_profit.get("storage_expense") or 0), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi")])
+        ws.append([_t(lang, "Другие внешние расходы", "Boshqa tashqi xarajat"), "−", float(business_profit.get("other_expense") or 0), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi")])
+        result_row = ws.max_row + 1
+        ws.append([
+            result_name,
+            "=",
+            f"=C{profit_before_tax_row}-C{profit_before_tax_row + 1}-C{profit_before_tax_row + 2}+C{profit_before_tax_row + 3}-C{profit_before_tax_row + 4}-C{profit_before_tax_row + 5}-C{profit_before_tax_row + 6}",
+            _t(lang, "Итог по показанной формуле", "Ko‘rsatilgan formula bo‘yicha yakun"),
+        ])
         end = ws.max_row
         _header(ws, 2, 1, 4)
         _style_body(ws, 3, end, 1, 4)
-        _money(ws, ("B",), 3)
+        _money(ws, ("C",), 3)
+        for row_number in (payout_row, profit_before_tax_row, result_row):
+            for col in range(1, 5):
+                ws.cell(row_number, col).font = Font(bold=True)
+                ws.cell(row_number, col).fill = PatternFill("solid", fgColor=LIGHT_BLUE)
         for col in range(1, 5):
             ws.cell(end, col).font = Font(bold=True, color=WHITE)
             ws.cell(end, col).fill = PatternFill("solid", fgColor=GREEN if float(business_profit.get("net_profit") or 0) >= 0 else RED)
@@ -431,8 +469,8 @@ def build_premium_workbook(
         ws.cell(note_row, 2).number_format = "0.0%"
         ws.cell(note_row + 1, 1, _t(
             lang,
-            "Себестоимость берётся только из Uzum purchasePrice. Если покрытие ниже 100% или API расходов недоступен, показан только результат по известным данным.",
-            "Tannarx faqat Uzum purchasePrice’dan olinadi. Qamrov 100% dan past yoki xarajatlar API mavjud bo‘lmasa, faqat ma’lum ma’lumotlar natijasi ko‘rsatiladi.",
+            "Себестоимость берётся только из Uzum purchasePrice. Комиссия и логистика находятся внутри суммы «К выплате» и не вычитаются повторно. Если покрытие ниже 100% или API расходов недоступен, показан только результат по известным данным.",
+            "Tannarx faqat Uzum purchasePrice’dan olinadi. Komissiya va logistika «To‘lovga» summasida va qayta ayrilmaydi. Qamrov 100% dan past yoki xarajatlar API mavjud bo‘lmasa, faqat ma’lum ma’lumotlar natijasi ko‘rsatiladi.",
         ))
         ws.merge_cells(start_row=note_row + 1, start_column=1, end_row=note_row + 1, end_column=4)
         _finalize(ws, freeze="A3", max_width=55)
@@ -7743,6 +7781,7 @@ def _format_premium_period_report(
     rows: list[dict[str, Any]],
     previous_stats: dict[str, Any],
     profit_summary: dict[str, Any],
+    business_profit: dict[str, Any] | None = None,
     *,
     lang: str = "ru",
 ) -> str:
@@ -7778,11 +7817,11 @@ def _format_premium_period_report(
             f"🔄 Oldingi shu davrga nisbatan: tushum {revenue_change}, to‘lov {payout_change}",
         ]
         if known_revenue > 0:
-            lines.extend([
-                "",
-                f"💰 Hisobiy foyda: <b>{_format_money(profit)}</b>",
-                f"📌 Tannarx bilan qamrov: <b>{coverage * 100:.1f}%</b>",
-            ])
+            if business_profit:
+                lines.extend(["", *_format_profit_bridge_lines(business_profit, lang=lang)])
+            else:
+                lines.extend(["", f"💰 Hisobiy foyda: <b>{_format_money(profit)}</b>"])
+            lines.append(f"📌 Tannarx bilan qamrov: <b>{coverage * 100:.1f}%</b>")
             if coverage < 0.999:
                 lines.append("<i>Foyda faqat Uzum purchasePrice bergan savdolar bo‘yicha hisoblangan.</i>")
         else:
@@ -7812,11 +7851,11 @@ def _format_premium_period_report(
             f"🔄 К предыдущему такому же периоду: выручка {revenue_change}, выплата {payout_change}",
         ]
         if known_revenue > 0:
-            lines.extend([
-                "",
-                f"💰 Расчётная прибыль: <b>{_format_money(profit)}</b>",
-                f"📌 Покрытие себестоимостью: <b>{coverage * 100:.1f}%</b>",
-            ])
+            if business_profit:
+                lines.extend(["", *_format_profit_bridge_lines(business_profit, lang=lang)])
+            else:
+                lines.extend(["", f"💰 Расчётная прибыль: <b>{_format_money(profit)}</b>"])
+            lines.append(f"📌 Покрытие себестоимостью: <b>{coverage * 100:.1f}%</b>")
             if coverage < 0.999:
                 lines.append("<i>Прибыль рассчитана только по продажам, для которых Uzum передал purchasePrice.</i>")
         else:
@@ -7885,9 +7924,27 @@ async def _send_premium_period_report(
         )
         previous_stats = _build_noorza_today_stats(previous_rows)
         await sync_uzum_sku_financials(client, telegram_id, shop_id)
+        finance_settings = ensure_finance_settings(telegram_id, shop_id)
         costs = get_unit_cost_map(telegram_id, shop_id)
-        unit_rows = _build_unit_rows_from_finance(rows, costs)
+        unit_rows = _build_unit_rows_from_finance(
+            rows,
+            costs,
+            tax_percent=float(finance_settings.get("tax_percent") or 0),
+        )
         profit_summary = _profit_summary_from_unit_rows(unit_rows, stats)
+        expense_summary = await load_uzum_expense_summary(
+            client,
+            shop_id,
+            date_from,
+            date_to,
+        )
+        business_profit = calculate_business_profit(
+            profit_summary,
+            stats,
+            finance_settings,
+            days=max(1, int(comparison_shift_days)),
+            uzum_expenses=expense_summary,
+        )
         text = _format_premium_period_report(
             title_ru,
             title_uz,
@@ -7896,6 +7953,7 @@ async def _send_premium_period_report(
             rows,
             previous_stats,
             profit_summary,
+            business_profit,
             lang=lang,
         )
         if "Достигнут защитный лимит" in source_info:
@@ -11307,9 +11365,13 @@ async def _build_full_excel_report(
     ]
     rows_30 = finance_by_period.get("30d", [])
     stats_30 = _build_noorza_today_stats(rows_30)
-    product_rows = _build_unit_rows_from_finance(rows_30, costs)
-    profit_30 = _profit_summary_from_unit_rows(product_rows, stats_30)
     finance_settings = ensure_finance_settings(telegram_id, shop_id)
+    product_rows = _build_unit_rows_from_finance(
+        rows_30,
+        costs,
+        tax_percent=float(finance_settings.get("tax_percent") or 0),
+    )
+    profit_30 = _profit_summary_from_unit_rows(product_rows, stats_30)
     uzum_expenses = await load_uzum_expense_summary(
         client,
         shop_id,
@@ -11672,9 +11734,13 @@ async def _collect_seller_pdf_payload(
         )
 
     costs = get_unit_cost_map(telegram_id, shop_id)
-    products = _build_unit_rows_from_finance(rows, costs)
-    profit = _profit_summary_from_unit_rows(products, stats)
     finance_settings = ensure_finance_settings(telegram_id, shop_id)
+    products = _build_unit_rows_from_finance(
+        rows,
+        costs,
+        tax_percent=float(finance_settings.get("tax_percent") or 0),
+    )
+    profit = _profit_summary_from_unit_rows(products, stats)
     uzum_expenses = await load_uzum_expense_summary(
         client,
         shop_id,
@@ -14288,8 +14354,13 @@ async def _all_shops_business_stats(
                     sid,
                 )
 
+            settings = ensure_finance_settings(telegram_id, sid)
             costs = get_unit_cost_map(telegram_id, sid)
-            products = _build_unit_rows_from_finance(rows, costs)
+            products = _build_unit_rows_from_finance(
+                rows,
+                costs,
+                tax_percent=float(settings.get("tax_percent") or 0),
+            )
             cost_summary = _profit_summary_from_unit_rows(products, stats)
             expense_summary = await load_uzum_expense_summary(
                 client,
@@ -14297,7 +14368,6 @@ async def _all_shops_business_stats(
                 date_from,
                 date_to,
             )
-            settings = ensure_finance_settings(telegram_id, sid)
             business = calculate_business_profit(
                 cost_summary,
                 stats,
@@ -14332,9 +14402,33 @@ async def _all_shops_business_stats(
         {
             "cost_total": sum(float(row.get("cost_total") or 0) for row in businesses),
             "known_profit": sum(float(row.get("known_profit") or 0) for row in businesses),
+            "calculation_revenue": sum(
+                float(row.get("calculation_revenue") or 0) for row in businesses
+            ),
+            "calculation_payout": sum(
+                float(row.get("calculation_payout") or 0) for row in businesses
+            ),
+            "calculation_commission": sum(
+                float(row.get("calculation_commission") or 0) for row in businesses
+            ),
+            "calculation_logistics": sum(
+                float(row.get("calculation_logistics") or 0) for row in businesses
+            ),
+            "other_payout_deductions": sum(
+                float(row.get("other_payout_deductions") or 0) for row in businesses
+            ),
+            "payout_adjustment": sum(
+                float(row.get("payout_adjustment") or 0) for row in businesses
+            ),
             "tax_expense": sum(float(row.get("tax_expense") or 0) for row in businesses),
             "uzum_expense_total": sum(
                 float(row.get("uzum_expense_total") or 0) for row in businesses
+            ),
+            "uzum_expense_deductions": sum(
+                float(row.get("uzum_expense_deductions") or 0) for row in businesses
+            ),
+            "uzum_expense_refunds": sum(
+                float(row.get("uzum_expense_refunds") or 0) for row in businesses
             ),
             "external_expense_total": sum(
                 float(row.get("advertising_expense") or 0)
@@ -14387,14 +14481,8 @@ def _format_all_shops_business(
             "",
             f"🛒 Buyurtma: <b>{int(totals.get('orders') or 0)}</b> | 📦 Sotildi: <b>{float(totals.get('units') or 0):.0f}</b>",
             f"❌ Bekor: <b>{int(totals.get('cancelled') or 0)}</b> | ↩️ Qaytarish: <b>{float(totals.get('returns') or 0):.0f}</b>",
-            f"💵 Tushum: <b>{_format_money(float(totals.get('revenue') or 0))}</b>",
-            f"✅ To‘lovga: <b>{_format_money(float(totals.get('payout_total') or 0))}</b>",
             "",
-            f"📦 Uzum tannarxi: <b>{_format_money(float(totals.get('cost_total') or 0))}</b>",
-            f"🧾 Uzum xarajatlari: <b>{_format_money(float(totals.get('uzum_expense_total') or 0))}</b>",
-            f"🏛 Soliq: <b>{_format_money(float(totals.get('tax_expense') or 0))}</b>",
-            f"🏢 Tashqi xarajatlar: <b>{_format_money(float(totals.get('external_expense_total') or 0))}</b>",
-            f"💰 {result_label}: <b>{_format_money(float(totals.get('net_profit') or 0))}</b>",
+            *_format_profit_bridge_lines(totals, lang=lang),
             f"📌 Tannarx qamrovi: <b>{coverage * 100:.1f}%</b>",
         ]
     else:
@@ -14404,14 +14492,8 @@ def _format_all_shops_business(
             "",
             f"🛒 Заказов: <b>{int(totals.get('orders') or 0)}</b> | 📦 Продано: <b>{float(totals.get('units') or 0):.0f}</b>",
             f"❌ Отмен: <b>{int(totals.get('cancelled') or 0)}</b> | ↩️ Возвратов: <b>{float(totals.get('returns') or 0):.0f}</b>",
-            f"💵 Выручка: <b>{_format_money(float(totals.get('revenue') or 0))}</b>",
-            f"✅ К выплате: <b>{_format_money(float(totals.get('payout_total') or 0))}</b>",
             "",
-            f"📦 Себестоимость Uzum: <b>{_format_money(float(totals.get('cost_total') or 0))}</b>",
-            f"🧾 Расходы Uzum: <b>{_format_money(float(totals.get('uzum_expense_total') or 0))}</b>",
-            f"🏛 Налог: <b>{_format_money(float(totals.get('tax_expense') or 0))}</b>",
-            f"🏢 Внешние расходы: <b>{_format_money(float(totals.get('external_expense_total') or 0))}</b>",
-            f"💰 {result_label}: <b>{_format_money(float(totals.get('net_profit') or 0))}</b>",
+            *_format_profit_bridge_lines(totals, lang=lang),
             f"📌 Покрытие себестоимостью: <b>{coverage * 100:.1f}%</b>",
         ]
 
@@ -15116,22 +15198,20 @@ def _market_daily_shop_payload(
         schemes[key] += 1
 
     expense_parts = _expense_report_parts(expense_summary)
-    external = (
-        max(0.0, float(settings.get("advertising_monthly") or 0))
-        + max(0.0, float(settings.get("storage_monthly") or 0))
-        + max(0.0, float(settings.get("other_monthly") or 0))
-    ) / 30.0
+    business = calculate_business_profit(
+        profit,
+        accepted_stats,
+        settings,
+        days=1,
+        uzum_expenses=expense_summary,
+    )
+    external = float(business.get("external_expense_total") or 0)
     known_net = sum(
         float(item.get("net_profit") or 0)
         for item in products
         if item.get("net_profit") is not None
     )
-    result = (
-        known_net
-        - float(expense_parts["additional_expenses"])
-        + float(expense_parts["refunds"])
-        - external
-    )
+    result = float(business.get("net_profit") or 0)
     revenue = float(accepted_stats.get("revenue") or 0)
     coverage = float(profit.get("coverage") or 0)
     complete = bool(
@@ -15146,6 +15226,7 @@ def _market_daily_shop_payload(
         "previous_issued": previous_issued_stats,
         "products": products,
         "profit": profit,
+        "business": business,
         "tax_percent": tax_percent,
         "known_net_product_profit": known_net,
         "result": result,
@@ -15254,6 +15335,44 @@ async def _collect_market_daily_report(
         for key, amount in (item.get("expense_names") or {}).items():
             expense_names[str(key)] = expense_names.get(str(key), 0.0) + float(amount or 0)
     complete = bool(per_shop) and not errors and all(bool(item.get("complete")) for item in per_shop)
+    business_fields = (
+        "calculation_revenue",
+        "calculation_payout",
+        "calculation_commission",
+        "calculation_logistics",
+        "other_payout_deductions",
+        "payout_adjustment",
+        "cost_total",
+        "known_profit",
+        "tax_expense",
+        "uzum_expense_deductions",
+        "uzum_expense_refunds",
+        "uzum_expense_total",
+        "external_expense_total",
+        "net_profit",
+    )
+    aggregate_business = {
+        field: sum(
+            float((item.get("business") or {}).get(field) or 0)
+            for item in per_shop
+        )
+        for field in business_fields
+    }
+    aggregate_business.update(
+        {
+            "complete": complete,
+            "coverage": max(0.0, min(1.0, coverage)),
+            "missing_count": sum(
+                int((item.get("business") or {}).get("missing_count") or 0)
+                for item in per_shop
+            ),
+            "uzum_expenses_available": bool(per_shop)
+            and all(
+                bool((item.get("business") or {}).get("uzum_expenses_available"))
+                for item in per_shop
+            ),
+        }
+    )
     return {
         "date": report_date,
         "shop_id": per_shop[0]["shop_id"] if len(per_shop) == 1 else None,
@@ -15271,6 +15390,7 @@ async def _collect_market_daily_report(
         "per_shop": per_shop,
         "cost_coverage": max(0.0, min(1.0, coverage)),
         "complete": complete,
+        "business": aggregate_business,
         "result": sum(float(item.get("result") or 0) for item in per_shop),
         "known_net_product_profit": sum(float(item.get("known_net_product_profit") or 0) for item in per_shop),
         "additional_expenses": sum(float(item.get("additional_expenses") or 0) for item in per_shop),
@@ -15295,12 +15415,7 @@ def _format_market_daily_report(payload: dict[str, Any], *, lang: str) -> str:
     issued = dict(payload.get("issued") or {})
     previous_issued = dict(payload.get("previous_issued") or {})
     complete = bool(payload.get("complete"))
-    result_label = (
-        "Sof foyda" if uz and complete else
-        "Ma’lum ma’lumotlar bo‘yicha natija" if uz else
-        "Чистая прибыль" if complete else
-        "Результат по известным данным"
-    )
+    business = dict(payload.get("business") or {})
     if uz:
         lines = [
             "🟣 <b>Seller.pro.uz · kunlik hisobot</b>",
@@ -15308,11 +15423,10 @@ def _format_market_daily_report(payload: dict[str, Any], *, lang: str) -> str:
             "",
             f"📥 <b>Qabul qilingan buyurtmalar: {int(accepted.get('orders') or 0)}</b>",
             f"🛍 Sotilgan tovarlar: <b>{float(accepted.get('units') or 0):.0f} dona</b>",
-            f"💰 Daromad: <b>{_format_money(float(accepted.get('revenue') or 0))}</b>",
-            f"💳 Chiqarishga: <b>{_format_money(float(accepted.get('payout_total') or 0))}</b>",
-            f"💵 {result_label}: <b>{_format_money(float(payload.get('result') or 0))}</b>",
             "",
-            f"📤 <b>Olib ketilgan buyurtmalar: {int(issued.get('orders') or 0)}</b>",
+            *_format_profit_bridge_lines(business, lang=lang),
+            "",
+            f"📤 <b>Olib ketilgan buyurtmalar: {int(issued.get('orders') or 0)}</b> <i>(ma’lumot uchun)</i>",
             f"🛍 Sotilgan tovarlar: <b>{float(issued.get('units') or 0):.0f} dona</b>",
             f"💰 Daromad: <b>{_format_money(float(issued.get('revenue') or 0))}</b>",
             f"💳 Chiqarishga: <b>{_format_money(float(issued.get('payout_total') or 0))}</b>",
@@ -15327,11 +15441,10 @@ def _format_market_daily_report(payload: dict[str, Any], *, lang: str) -> str:
             "",
             f"📥 <b>Принято заказов: {int(accepted.get('orders') or 0)}</b>",
             f"🛍 Продано товаров: <b>{float(accepted.get('units') or 0):.0f} шт.</b>",
-            f"💰 Выручка: <b>{_format_money(float(accepted.get('revenue') or 0))}</b>",
-            f"💳 К выплате: <b>{_format_money(float(accepted.get('payout_total') or 0))}</b>",
-            f"💵 {result_label}: <b>{_format_money(float(payload.get('result') or 0))}</b>",
             "",
-            f"📤 <b>Выдано заказов: {int(issued.get('orders') or 0)}</b>",
+            *_format_profit_bridge_lines(business, lang=lang),
+            "",
+            f"📤 <b>Выдано заказов: {int(issued.get('orders') or 0)}</b> <i>(справочно, второй раз в прибыль не входит)</i>",
             f"🛍 Выдано товаров: <b>{float(issued.get('units') or 0):.0f} шт.</b>",
             f"💰 Выручка: <b>{_format_money(float(issued.get('revenue') or 0))}</b>",
             f"💳 К выплате: <b>{_format_money(float(issued.get('payout_total') or 0))}</b>",
@@ -15677,7 +15790,12 @@ async def _unit_economy_for_shop(client: UzumClient, telegram_id: int, shop_id: 
     )
     cost_status = await sync_uzum_sku_financials(client, telegram_id, shop_id)
     costs = get_unit_cost_map(telegram_id, shop_id)
-    top = _build_unit_rows_from_finance(rows, costs)
+    finance_settings = ensure_finance_settings(telegram_id, shop_id)
+    top = _build_unit_rows_from_finance(
+        rows,
+        costs,
+        tax_percent=float(finance_settings.get("tax_percent") or 0),
+    )
     return top, _build_noorza_today_stats(rows), int(cost_status.get("with_cost") or 0)
 
 
@@ -16251,6 +16369,12 @@ def _profit_summary_from_unit_rows(rows: list[dict[str, Any]], stats: dict[str, 
         float(r.get("known_revenue") if r.get("known_revenue") is not None else r.get("revenue") or 0)
         for r in known_rows
     )
+    known_payout = sum(
+        float(r.get("known_payout") if r.get("known_payout") is not None else r.get("payout") or 0)
+        for r in known_rows
+    )
+    known_commission = sum(float(r.get("known_commission") or 0) for r in known_rows)
+    known_logistics = sum(float(r.get("known_logistics") or 0) for r in known_rows)
     missing = [r for r in rows if not bool(r.get("cost_complete", r.get("cost_per_unit") is not None))]
     total_revenue = float(stats.get("revenue") or 0)
     margin = (known_profit / known_revenue * 100.0) if known_revenue > 0 else 0.0
@@ -16266,6 +16390,9 @@ def _profit_summary_from_unit_rows(rows: list[dict[str, Any]], stats: dict[str, 
         "total_count": len(rows),
         "total_revenue": total_revenue,
         "known_revenue": known_revenue,
+        "known_payout": known_payout,
+        "known_commission": known_commission,
+        "known_logistics": known_logistics,
         "missing": missing,
     }
 
@@ -16296,6 +16423,29 @@ def calculate_business_profit(
     # separately for audit.
     known_revenue = float(cost_summary.get("known_revenue") or 0)
     tax_basis_revenue = revenue if cost_data_complete else known_revenue
+    calculation_payout = (
+        float(stats.get("payout_total") or 0)
+        if cost_data_complete
+        else float(cost_summary.get("known_payout") or 0)
+    )
+    calculation_commission = (
+        float(stats.get("commission") or 0)
+        if cost_data_complete
+        else float(cost_summary.get("known_commission") or 0)
+    )
+    calculation_logistics = (
+        float(stats.get("logistics") or 0)
+        if cost_data_complete
+        else float(cost_summary.get("known_logistics") or 0)
+    )
+    payout_residual = (
+        tax_basis_revenue
+        - calculation_payout
+        - calculation_commission
+        - calculation_logistics
+    )
+    other_payout_deductions = max(0.0, payout_residual)
+    payout_adjustment = max(0.0, -payout_residual)
     tax_expense = tax_basis_revenue * tax_percent / 100.0
     full_period_tax_expense = revenue * tax_percent / 100.0
     advertising = max(0.0, float(settings.get("advertising_monthly") or 0)) * period_ratio
@@ -16303,15 +16453,27 @@ def calculate_business_profit(
     other = max(0.0, float(settings.get("other_monthly") or 0)) * period_ratio
     expense_summary = dict(uzum_expenses or {})
     uzum_expenses_available = bool(expense_summary.get("available", uzum_expenses is None))
-    uzum_expense_total = float(expense_summary.get("total") or 0)
-    known_profit = float(cost_summary.get("profit") or 0)
+    signed_expense_total = float(expense_summary.get("total") or 0)
+    uzum_expense_deductions = float(
+        expense_summary.get("deductions")
+        if expense_summary.get("deductions") is not None
+        else max(0.0, signed_expense_total)
+    )
+    uzum_expense_refunds = float(
+        expense_summary.get("refunds")
+        if expense_summary.get("refunds") is not None
+        else max(0.0, -signed_expense_total)
+    )
+    uzum_expense_total = uzum_expense_deductions - uzum_expense_refunds
+    cost_total = float(cost_summary.get("cost_total") or 0)
+    known_profit = calculation_payout - cost_total
+    external_expense_total = advertising + storage + other
     net_profit = (
         known_profit
         - tax_expense
-        - uzum_expense_total
-        - advertising
-        - storage
-        - other
+        - uzum_expense_deductions
+        + uzum_expense_refunds
+        - external_expense_total
     )
     return {
         "days": int(days),
@@ -16319,12 +16481,20 @@ def calculate_business_profit(
         "commission": float(stats.get("commission") or 0),
         "logistics": float(stats.get("logistics") or 0),
         "payout_total": float(stats.get("payout_total") or 0),
-        "cost_total": float(cost_summary.get("cost_total") or 0),
+        "calculation_revenue": tax_basis_revenue,
+        "calculation_payout": calculation_payout,
+        "calculation_commission": calculation_commission,
+        "calculation_logistics": calculation_logistics,
+        "other_payout_deductions": other_payout_deductions,
+        "payout_adjustment": payout_adjustment,
+        "cost_total": cost_total,
         "known_profit": known_profit,
         "tax_expense": tax_expense,
         "full_period_tax_expense": full_period_tax_expense,
         "tax_basis_revenue": tax_basis_revenue,
         "uzum_expense_total": uzum_expense_total,
+        "uzum_expense_deductions": uzum_expense_deductions,
+        "uzum_expense_refunds": uzum_expense_refunds,
         "uzum_storage_expense": float(expense_summary.get("storage") or 0),
         "uzum_advertising_expense": float(expense_summary.get("advertising") or 0),
         "uzum_penalty_expense": float(expense_summary.get("penalty") or 0),
@@ -16336,6 +16506,7 @@ def calculate_business_profit(
         "advertising_expense": advertising,
         "storage_expense": storage,
         "other_expense": other,
+        "external_expense_total": external_expense_total,
         "operating_expenses": (
             tax_expense + uzum_expense_total + advertising + storage + other
         ),
@@ -16345,6 +16516,88 @@ def calculate_business_profit(
         "complete": cost_data_complete and uzum_expenses_available,
         "missing_count": missing_count,
     }
+
+
+def _format_profit_bridge_lines(
+    business: dict[str, Any],
+    *,
+    lang: str = "ru",
+) -> list[str]:
+    """Return one reconciled, human-readable path from revenue to result."""
+    uz = normalize_lang(lang) == "uz"
+    complete = bool(business.get("complete"))
+    result_label = (
+        "Sof foyda"
+        if uz and complete
+        else "Ma’lum ma’lumotlar bo‘yicha natija"
+        if uz
+        else "Чистая прибыль"
+        if complete
+        else "Результат по известным данным"
+    )
+    lines = [
+        "🧮 <b>Natija qanday hisoblandi</b>" if uz else "🧮 <b>Как получился результат</b>",
+        f"1. Tushum: <b>{_format_money(float(business.get('calculation_revenue') or 0))}</b>"
+        if uz
+        else f"1. Выручка: <b>{_format_money(float(business.get('calculation_revenue') or 0))}</b>",
+        f"2. − Uzum komissiyasi: <b>{_format_money(float(business.get('calculation_commission') or 0))}</b>"
+        if uz
+        else f"2. − Комиссия Uzum: <b>{_format_money(float(business.get('calculation_commission') or 0))}</b>",
+        f"3. − Logistika: <b>{_format_money(float(business.get('calculation_logistics') or 0))}</b>"
+        if uz
+        else f"3. − Логистика: <b>{_format_money(float(business.get('calculation_logistics') or 0))}</b>",
+    ]
+    other_payout = float(business.get("other_payout_deductions") or 0)
+    payout_adjustment = float(business.get("payout_adjustment") or 0)
+    lines.append(
+        f"4. − To‘lov ichidagi boshqa ushlanmalar: <b>{_format_money(other_payout)}</b>"
+        if uz
+        else f"4. − Другие удержания внутри выплаты: <b>{_format_money(other_payout)}</b>"
+    )
+    if payout_adjustment > 0.5:
+        lines.append(
+            f"4a. + Uzum to‘lov tuzatishi: <b>{_format_money(payout_adjustment)}</b>"
+            if uz
+            else f"4а. + Корректировка выплаты Uzum: <b>{_format_money(payout_adjustment)}</b>"
+        )
+    lines.extend(
+        [
+            f"= To‘lovga: <b>{_format_money(float(business.get('calculation_payout') or 0))}</b>"
+            if uz
+            else f"= К выплате: <b>{_format_money(float(business.get('calculation_payout') or 0))}</b>",
+            f"5. − Tannarx: <b>{_format_money(float(business.get('cost_total') or 0))}</b>"
+            if uz
+            else f"5. − Себестоимость: <b>{_format_money(float(business.get('cost_total') or 0))}</b>",
+            f"= Soliqdan oldingi foyda: <b>{_format_money(float(business.get('known_profit') or 0))}</b>"
+            if uz
+            else f"= Прибыль до налога: <b>{_format_money(float(business.get('known_profit') or 0))}</b>",
+            f"6. − Soliq: <b>{_format_money(float(business.get('tax_expense') or 0))}</b>"
+            if uz
+            else f"6. − Налог: <b>{_format_money(float(business.get('tax_expense') or 0))}</b>",
+            f"7. − Uzum qo‘shimcha xarajatlari: <b>{_format_money(float(business.get('uzum_expense_deductions') or 0))}</b>"
+            if uz
+            else f"7. − Доп. расходы Uzum: <b>{_format_money(float(business.get('uzum_expense_deductions') or 0))}</b>",
+            f"8. + Uzum qaytargan mablag‘: <b>{_format_money(float(business.get('uzum_expense_refunds') or 0))}</b>"
+            if uz
+            else f"8. + Возвраты от Uzum: <b>{_format_money(float(business.get('uzum_expense_refunds') or 0))}</b>",
+            f"9. − Tashqi xarajatlar: <b>{_format_money(float(business.get('external_expense_total') or 0))}</b>"
+            if uz
+            else f"9. − Внешние расходы: <b>{_format_money(float(business.get('external_expense_total') or 0))}</b>",
+            f"<b>= {result_label}: {_format_money(float(business.get('net_profit') or 0))}</b>",
+        ]
+    )
+    lines.append(
+        "<i>Komissiya va logistika «to‘lovga» summasida allaqachon hisobga olingan va ikkinchi marta ayrilmaydi.</i>"
+        if uz
+        else "<i>Комиссия и логистика уже учтены в «к выплате» и второй раз не вычитаются.</i>"
+    )
+    if not complete:
+        lines.append(
+            "⚠️ Hisob faqat tannarxi ma’lum bo‘lgan savdolar bo‘yicha."
+            if uz
+            else "⚠️ Расчёт относится только к продажам с известной себестоимостью."
+        )
+    return lines
 
 
 def _format_profit_report(shop_id: int, rows: list[dict[str, Any]], stats: dict[str, Any], lang: str = "ru") -> str:
@@ -16423,7 +16676,11 @@ async def profit_report(message: Message) -> None:
             days=30,
             uzum_expenses=uzum_expenses,
         )
-        known = sorted([r for r in rows if r.get("cost_per_unit") is not None], key=lambda r: float(r.get("profit") or 0), reverse=True)
+        known = sorted(
+            [r for r in rows if r.get("cost_per_unit") is not None],
+            key=lambda r: float(r.get("net_profit") or 0),
+            reverse=True,
+        )
         complete_profit = bool(business_profit.get("complete"))
         title = (
             "💰 <b>30 kunlik sof foyda</b>" if complete_profit else "💰 <b>Ma’lum tannarx bo‘yicha hisob</b>"
@@ -16432,12 +16689,16 @@ async def profit_report(message: Message) -> None:
         )
         summary = [
             f"🏪 Do‘kon: <code>{shop_id}</code>" if lang == "uz" else f"🏪 Магазин: <code>{shop_id}</code>",
-            f"💵 Tushum: <b>{_format_money(float(stats.get('revenue') or 0))}</b> | 📦 Tannarx: <b>{_format_money(float(summary_stats['cost_total']))}</b>" if lang == "uz" else f"💵 Выручка: <b>{_format_money(float(stats.get('revenue') or 0))}</b> | 📦 Себестоимость: <b>{_format_money(float(summary_stats['cost_total']))}</b>",
-            f"🏛 Soliq: <b>{_format_money(float(business_profit['tax_expense']))}</b> | 📣 Reklama: <b>{_format_money(float(business_profit['advertising_expense']))}</b>" if lang == "uz" else f"🏛 Налог: <b>{_format_money(float(business_profit['tax_expense']))}</b> | 📣 Реклама: <b>{_format_money(float(business_profit['advertising_expense']))}</b>",
-            f"🏦 Uzum xarajatlari: <b>{_format_money(float(business_profit['uzum_expense_total']))}</b>" if lang == "uz" else f"🏦 Расходы Uzum: <b>{_format_money(float(business_profit['uzum_expense_total']))}</b>",
-            f"🏬 Tashqi saqlash: <b>{_format_money(float(business_profit['storage_expense']))}</b> | 🧾 Boshqa tashqi: <b>{_format_money(float(business_profit['other_expense']))}</b>" if lang == "uz" else f"🏬 Внешнее хранение: <b>{_format_money(float(business_profit['storage_expense']))}</b> | 🧾 Другие внешние: <b>{_format_money(float(business_profit['other_expense']))}</b>",
-            (f"💰 Sof foyda: <b>{_format_money(float(business_profit['net_profit']))}</b> | 📈 Marja: <b>{float(business_profit['net_margin']):.1f}%</b>" if complete_profit else f"💰 Ma’lum tannarx bo‘yicha natija: <b>{_format_money(float(business_profit['net_profit']))}</b>") if lang == "uz" else (f"💰 Чистая прибыль: <b>{_format_money(float(business_profit['net_profit']))}</b> | 📈 Маржа: <b>{float(business_profit['net_margin']):.1f}%</b>" if complete_profit else f"💰 Результат по известной себестоимости: <b>{_format_money(float(business_profit['net_profit']))}</b>"),
-            f"📌 Tannarx bilan qamrov: <b>{float(summary_stats['coverage']) * 100:.1f}%</b>" if lang == "uz" else f"📌 Покрытие себестоимостью: <b>{float(summary_stats['coverage']) * 100:.1f}%</b>",
+            "",
+            *_format_profit_bridge_lines(business_profit, lang=lang),
+            f"📌 Tannarx qamrovi: <b>{float(summary_stats['coverage']) * 100:.1f}%</b>"
+            if lang == "uz"
+            else f"📌 Покрытие себестоимостью: <b>{float(summary_stats['coverage']) * 100:.1f}%</b>",
+            (
+                "ℹ️ Tovar foydasi soliqdan keyin, lekin umumiy Uzum va tashqi xarajatlarni taqsimlamasdan ko‘rsatiladi."
+                if lang == "uz"
+                else "ℹ️ Прибыль товара показана после налога, но без распределения общих расходов Uzum и внешних расходов."
+            ),
         ]
         if summary_stats["missing_count"]:
             summary.append(f"⚠️ Uzum tannarx bermagan SKU: <b>{summary_stats['missing_count']}</b>" if lang == "uz" else f"⚠️ Uzum не передал себестоимость: <b>{summary_stats['missing_count']}</b> SKU")
@@ -16461,9 +16722,25 @@ async def profit_report(message: Message) -> None:
         for idx, r in enumerate(known, start=1):
             title_item = escape(_short_text(str(r.get("title") or r.get("sku") or "-"), 70))
             sku = escape(_short_text(str(r.get("sku") or ""), 55))
-            profit = float(r.get("profit") or 0)
-            margin = float(r.get("margin") or 0)
-            items.append((f"{idx}. <b>{title_item}</b>\n🔖 SKU: <code>{sku}</code>\n💰 Foyda: <b>{_format_money(profit)}</b> | 📈 Marja: <b>{margin:.1f}%</b>" if lang == "uz" else f"{idx}. <b>{title_item}</b>\n🔖 SKU: <code>{sku}</code>\n💰 Прибыль: <b>{_format_money(profit)}</b> | 📈 Маржа: <b>{margin:.1f}%</b>"))
+            net_profit = float(r.get("net_profit") or 0)
+            roi = r.get("roi")
+            roi_text = "—" if roi is None else f"{float(roi):.1f}%"
+            if lang == "uz":
+                items.append(
+                    f"{idx}. <b>{title_item}</b>\n"
+                    f"🔖 SKU: <code>{sku}</code>\n"
+                    f"Tushum: {_format_money(float(r.get('revenue') or 0))} · To‘lovga: {_format_money(float(r.get('payout') or 0))}\n"
+                    f"Tannarx: {_format_money(float(r.get('cost_total') or 0))} · Soliq: {_format_money(float(r.get('tax_expense') or 0))}\n"
+                    f"💰 Tovar foydasi: <b>{_format_money(net_profit)}</b> · ROI: <b>{roi_text}</b>"
+                )
+            else:
+                items.append(
+                    f"{idx}. <b>{title_item}</b>\n"
+                    f"🔖 SKU: <code>{sku}</code>\n"
+                    f"Выручка: {_format_money(float(r.get('revenue') or 0))} · К выплате: {_format_money(float(r.get('payout') or 0))}\n"
+                    f"Себестоимость: {_format_money(float(r.get('cost_total') or 0))} · Налог: {_format_money(float(r.get('tax_expense') or 0))}\n"
+                    f"💰 Прибыль товара: <b>{_format_money(net_profit)}</b> · ROI: <b>{roi_text}</b>"
+                )
         if not items:
             items = ["Uzum tannarx bergan savdolar hali yo‘q." if lang == "uz" else "Пока нет продаж, для которых Uzum передал себестоимость."]
         await send_paginated_list(message, kind="profit", title=title, summary=summary, items=items, section="sales", reply_markup=sales_menu_for_message(message))
@@ -22400,6 +22677,8 @@ def _build_unit_rows_from_finance(
                 "known_cost_qty": 0.0,
                 "known_revenue": 0.0,
                 "known_payout": 0.0,
+                "known_commission": 0.0,
+                "known_logistics": 0.0,
                 "known_tax_expense": 0.0,
                 "tax_expense": 0.0,
                 "missing_cost_qty": 0.0,
@@ -22421,6 +22700,8 @@ def _build_unit_rows_from_finance(
             entry["known_cost_qty"] += qty
             entry["known_revenue"] += revenue
             entry["known_payout"] += max(0.0, payout)
+            entry["known_commission"] += commission
+            entry["known_logistics"] += logistics
             entry["known_tax_expense"] += tax_expense
             if cost_source:
                 entry["cost_sources"].add(cost_source)
@@ -24010,7 +24291,7 @@ _cleanup_release_state()
 # Preserves per-user instant/hourly modes while using the durable outbox and
 # adaptive Finance pagination from RELEASE_HARDENING.
 # =============================================================================
-PREMIUM_RELEASE_VERSION = "2026.07.22-premium-r16-report-reconciliation"
+PREMIUM_RELEASE_VERSION = "2026.07.22-premium-r17-clear-profit-bridge"
 
 WATCHER_ACCESS_BACKOFF_SECONDS = max(
     300,
@@ -24307,6 +24588,7 @@ async def main() -> None:
     logging.info("STABILITY_SECURITY_LOADED: stock routes + watcher settings + safe backup + bounded Excel import")
     logging.info("UZUM_FINANCE_LOADED: purchasePrice-only cost + expense ledger + IKPU audit")
     logging.info("REPORT_RECONCILIATION_LOADED: historical purchasePrice + issued-date + cancelled quantity + tax/ROI")
+    logging.info("PROFIT_BRIDGE_LOADED: revenue -> payout -> cost -> tax/expenses -> result")
     logging.info("FBO_ACCEPTANCE_RECONCILIATION_LOADED: invoice/product totals + stale-zero guard")
     logging.info("MARKET_STYLE_REPORTS_LOADED: daily PDF/Excel + loss/damage claim documents")
     logging.info("LOGISTICS_REMINDERS_LOADED: FBO slots + return paid-storage deadlines")
