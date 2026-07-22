@@ -110,17 +110,14 @@ def prepare_stock_product_rows(
             or source.get("productTitle")
         )
         if not product_title or product_title in {"-", "—"}:
-            product_title = _clean(
-                source.get("sku_full_title")
-                or source.get("sku_title")
-                or source.get("title")
-                or "Без названия"
-            )
+            product_title = "—"
 
         group_key = (
             f"product:{product_id}"
             if product_id
             else f"title:{product_title.casefold()}"
+            if product_title != "—"
+            else f"row:{index}"
         )
         entry = products.setdefault(
             group_key,
@@ -234,9 +231,8 @@ def prepare_compensation_rows(
                 "product_id": _identifier(source.get("product_id")),
                 "title": _clean(
                     source.get("product_title")
-                    or source.get("sku_full_title")
-                    or source.get("sku_title")
-                    or "Без названия"
+                    or source.get("productTitle")
+                    or "—"
                 ),
                 "sku": _clean(
                     source.get("seller_item_code")
@@ -586,10 +582,8 @@ def build_daily_finance_workbook(
     first_data_row = 5
     for row_index, product in enumerate(products, start=first_data_row):
         has_cost = product.get("cost_per_unit") is not None and float(product.get("known_cost_qty") or product.get("qty") or 0) > 0
-        sku_text = _identifier(product.get("sku"))
         values = [
-            _clean(product.get("title") or sku_text or "—")
-            + (f" - {sku_text}" if sku_text else ""),
+            _clean(product.get("title") or "—"),
             _clean(product.get("scheme") or "—"),
             _num(product.get("qty")) or 0,
             _num(product.get("revenue")) or 0,
@@ -1285,9 +1279,6 @@ def build_daily_finance_pdf(
     product_rows: list[list[Any]] = []
     for product in products:
         title = _clean(product.get("title") or "—")
-        sku = _identifier(product.get("sku"))
-        if sku:
-            title += f" - {sku}"
         has_cost = product.get("cost_per_unit") is not None and float(product.get("known_cost_qty") or product.get("qty") or 0) > 0
         cost = _num(product.get("cost_total")) if has_cost else None
         tax = _num(product.get("tax_expense")) or 0.0
@@ -1372,20 +1363,22 @@ def build_daily_finance_pdf(
             styles.append(("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#" + PALE_GRAY)))
         table.setStyle(TableStyle(styles))
         story.append(table)
-        if last_chunk:
-            story.append(Spacer(1, 4 * mm))
-        else:
+        if not last_chunk:
             story.append(PageBreak())
-    story.extend([
-        Spacer(1, 2 * mm),
-        Paragraph(
-            "Tovar foydasi to‘lov, tannarx va soliqni hisobga oladi. Uzum qo‘shimcha xarajatlari va qaytarishlar birinchi sahifadagi yakuniy natijada ko‘rsatilgan."
-            if uz
-            else "Прибыль товара учитывает выплату, себестоимость и налог. Дополнительные расходы и возвраты Uzum входят в итог на первой странице.",
-            note_style,
-        ),
-    ])
-    doc.build(story)
+    footer_note = (
+        "Tovar foydasi to‘lov, tannarx va soliqni hisobga oladi. Qo‘shimcha xarajatlar va qaytarishlar 1-sahifadagi yakunda."
+        if uz
+        else "Прибыль товара учитывает выплату, себестоимость и налог. Доп. расходы и возвраты Uzum — в итоге на странице 1."
+    )
+
+    def draw_product_footer(canvas: Any, _: Any) -> None:
+        canvas.saveState()
+        canvas.setFont(regular, 6.5)
+        canvas.setFillColor(colors.HexColor("#6B7280"))
+        canvas.drawString(10 * mm, 4 * mm, footer_note)
+        canvas.restoreState()
+
+    doc.build(story, onLaterPages=draw_product_footer)
     return path
 
 
@@ -1701,9 +1694,6 @@ def build_claim_docx(
         quantity = _qty(item.get("quantity"))
         total_qty += quantity
         title_text = _clean(item.get("title"))
-        sku_text = _identifier(item.get("sku"))
-        if sku_text:
-            title_text += f" - {sku_text}"
         values = [
             title_text,
             _identifier(item.get("barcode")) or "—",

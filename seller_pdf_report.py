@@ -519,7 +519,7 @@ def _page_finance(c: canvas.Canvas, payload: dict[str, Any], lang: str) -> None:
         margin = item.get("margin")
         margin_text = "-" if margin is None else f"{_num(margin):.1f}%"
         product_rows.append([
-            _short(item.get("title") or item.get("sku"), 50),
+            _short(item.get("title") or "—", 50),
             _qty(item.get("qty")),
             _money(item.get("revenue"), lang),
             _money(item.get("profit"), lang) if item.get("profit") is not None else _t(lang, "нет данных", "ma’lumot yo‘q"),
@@ -598,7 +598,7 @@ def _page_stock(c: canvas.Canvas, payload: dict[str, Any], lang: str) -> None:
             priority = _t(lang, "Средний", "O‘rta")
             color = PURPLE
         stock_rows.append([
-            _short(row.get("title") or row.get("sku"), 48),
+            _short(row.get("title") or "—", 48),
             _qty(total),
             f"{_num(row.get('sold_7')) / 7:.1f}/{_t(lang, 'день', 'kun')}",
             "-" if days_left is None else f"{_num(days_left):.0f} {_t(lang, 'дн.', 'kun')}",

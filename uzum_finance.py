@@ -254,7 +254,13 @@ def normalize_expense(row: dict[str, Any]) -> dict[str, Any] | None:
         "PROCESSED",
         "DONE",
     }
-    if status in booked_statuses:
+    if status == "REFUNDED":
+        # Current Seller OpenAPI documents REFUNDED as a final payment state.
+        # It reverses the original deduction even when the API keeps OUTCOME
+        # in the ``type`` field of the original payment.
+        booked = True
+        signed_amount = -amount
+    elif status in booked_statuses:
         booked = True
         signed_amount = -amount if payment_type == "INCOME" else amount
     else:

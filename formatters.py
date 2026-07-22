@@ -281,7 +281,10 @@ def format_product_line(product: Any) -> str:
 
 def format_sku_stock_line(row: dict[str, Any], mode: str = "all") -> str:
     sku_id = row.get("sku_id")
-    title = row.get("sku_full_title") or row.get("sku_title") or row.get("product_title")
+    title = str(row.get("product_title") or "—").strip()
+    variant = str(row.get("sku_full_title") or row.get("sku_title") or "").strip()
+    if variant.casefold() == title.casefold() or variant in {"-", "—"}:
+        variant = ""
     price = row.get("price")
     fbo = row.get("fbo")
     fbs = row.get("fbs")
@@ -295,8 +298,14 @@ def format_sku_stock_line(row: dict[str, Any], mode: str = "all") -> str:
     else:
         stock_part = f"FBO: {safe(clean_num(fbo))} | FBS/DBS: {safe(clean_num(fbs))} | Итого: {safe(clean_num(total))}"
     extra = f" | Активно: {safe(clean_num(active))}" if active is not None and active != total else ""
+    details = []
+    if variant:
+        details.append(f"Вариант: {safe(variant)}")
+    if sku_id not in (None, "", "-", "—"):
+        details.append(f"SKU ID: <code>{safe(sku_id)}</code>")
+    details_line = ("\n" + " | ".join(details)) if details else ""
     return (
-        f"• `{safe(sku_id)}` — {safe(title)}\n"
+        f"• <b>{safe(title)}</b>{details_line}\n"
         f"{stock_part}{extra} | Цена: {format_money(price)} сум"
         + (f" | Статус: {safe(status_display(status))}" if status else "")
     )

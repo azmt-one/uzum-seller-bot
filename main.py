@@ -23,6 +23,7 @@ from typing import Any, Iterable
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -2069,7 +2070,7 @@ def get_unit_cost_map(telegram_id: int, shop_id: int) -> dict[str, dict[str, Any
         entry = {
             **row,
             "cost": float(row.get("purchase_price") or 0),
-            "title": str(row.get("product_title") or row.get("sku_title") or ""),
+            "title": str(row.get("product_title") or ""),
             "source": "uzum",
             "updated_at": row.get("fetched_at"),
         }
@@ -2914,7 +2915,110 @@ def init_product_value_tables() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS telegram_delivery_state (
+                telegram_id INTEGER PRIMARY KEY,
+                blocked INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT,
+                blocked_at TEXT,
+                updated_at TEXT NOT NULL
+            )
+            """
+        )
         conn.commit()
+
+
+def telegram_delivery_allowed(telegram_id: int) -> bool:
+    """Return False after Telegram confirms that the user blocked the bot."""
+    init_product_value_tables()
+    with db.connect() as conn:
+        row = conn.execute(
+            "SELECT blocked FROM telegram_delivery_state WHERE telegram_id = ?",
+            (int(telegram_id),),
+        ).fetchone()
+    return not bool(row and int(row["blocked"] or 0))
+
+
+def mark_telegram_delivery_blocked(
+    telegram_id: int,
+    error: BaseException | str,
+) -> bool:
+    """Pause all background work for a user who blocked the bot.
+
+    Pending digests are removed so an unblock does not trigger a stale sales
+    flood.  Durable outbox rows are retained as ``dead`` for auditability.
+    Returns True only for the first transition to the blocked state.
+    """
+    init_product_value_tables()
+    now_text = _dt_to_db(_utc_now()) or ""
+    error_text = str(error)[:1000]
+    with db.connect() as conn:
+        current = conn.execute(
+            "SELECT blocked FROM telegram_delivery_state WHERE telegram_id = ?",
+            (int(telegram_id),),
+        ).fetchone()
+        changed = not bool(current and int(current["blocked"] or 0))
+        conn.execute(
+            """
+            INSERT INTO telegram_delivery_state
+                (telegram_id, blocked, last_error, blocked_at, updated_at)
+            VALUES (?, 1, ?, ?, ?)
+            ON CONFLICT(telegram_id) DO UPDATE SET
+                blocked = 1,
+                last_error = excluded.last_error,
+                blocked_at = COALESCE(telegram_delivery_state.blocked_at, excluded.blocked_at),
+                updated_at = excluded.updated_at
+            """,
+            (int(telegram_id), error_text, now_text, now_text),
+        )
+        conn.execute(
+            "DELETE FROM sales_digest_queue WHERE telegram_id = ?",
+            (int(telegram_id),),
+        )
+        # ``notification_outbox`` is initialized later in the module.  During
+        # normal polling it always exists; the schema check keeps isolated unit
+        # tests and partial imports safe.
+        outbox_exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'notification_outbox'"
+        ).fetchone()
+        if outbox_exists:
+            conn.execute(
+                """
+                UPDATE notification_outbox
+                SET status = 'dead', next_attempt_at = NULL,
+                    last_error = ?, updated_at = ?
+                WHERE telegram_id = ? AND status = 'pending'
+                """,
+                (error_text, now_text, int(telegram_id)),
+            )
+        conn.commit()
+    if changed:
+        logging.warning(
+            "Telegram delivery paused user=%s reason=bot_blocked; background API work disabled until the user writes again",
+            telegram_id,
+        )
+    return changed
+
+
+def mark_telegram_delivery_active(telegram_id: int) -> bool:
+    """Resume delivery after an incoming message proves the bot is unblocked."""
+    init_product_value_tables()
+    now_text = _dt_to_db(_utc_now()) or ""
+    with db.connect() as conn:
+        cursor = conn.execute(
+            """
+            UPDATE telegram_delivery_state
+            SET blocked = 0, last_error = NULL, blocked_at = NULL, updated_at = ?
+            WHERE telegram_id = ? AND blocked = 1
+            """,
+            (now_text, int(telegram_id)),
+        )
+        conn.commit()
+    resumed = bool(cursor.rowcount)
+    if resumed:
+        logging.info("Telegram delivery resumed user=%s after incoming message", telegram_id)
+    return resumed
 
 
 def ensure_product_settings(telegram_id: int) -> dict[str, Any]:
@@ -3782,6 +3886,7 @@ def translate_runtime_text_to_uz(text: str) -> str:
 
 _ORIGINAL_MESSAGE_ANSWER = Message.answer
 _ORIGINAL_BOT_SEND_MESSAGE = Bot.send_message
+_ORIGINAL_BOT_SEND_DOCUMENT = Bot.send_document
 
 
 async def _answer_with_runtime_translation(self: Message, text: Any = None, *args: Any, **kwargs: Any) -> Any:
@@ -3800,12 +3905,43 @@ async def _send_message_with_runtime_translation(self: Bot, chat_id: Any, text: 
             text = translate_runtime_text_to_uz(text)
     except Exception:
         pass
-    return await _ORIGINAL_BOT_SEND_MESSAGE(self, chat_id, text, *args, **kwargs)
+    try:
+        return await _ORIGINAL_BOT_SEND_MESSAGE(self, chat_id, text, *args, **kwargs)
+    except TelegramForbiddenError as error:
+        try:
+            mark_telegram_delivery_blocked(int(chat_id), error)
+        except Exception:
+            logging.exception("Telegram delivery state update failed user=%s", chat_id)
+        raise
+
+
+async def _send_document_with_delivery_guard(
+    self: Bot,
+    chat_id: Any,
+    document: Any,
+    *args: Any,
+    **kwargs: Any,
+) -> Any:
+    try:
+        return await _ORIGINAL_BOT_SEND_DOCUMENT(
+            self,
+            chat_id,
+            document,
+            *args,
+            **kwargs,
+        )
+    except TelegramForbiddenError as error:
+        try:
+            mark_telegram_delivery_blocked(int(chat_id), error)
+        except Exception:
+            logging.exception("Telegram delivery state update failed user=%s", chat_id)
+        raise
 
 
 Message.answer = _answer_with_runtime_translation
 
 Bot.send_message = _send_message_with_runtime_translation
+Bot.send_document = _send_document_with_delivery_guard
 
 # --- Чистка узбекского текста ---
 # Первый переводчик выше специально не трогает бизнес-логику, а делает замену текста на лету.
@@ -5239,6 +5375,9 @@ def upsert_from_message(message: Message) -> int:
     if not user:
         raise RuntimeError("Unknown Telegram user")
     db.upsert_user(user.id, user.username, user.first_name)
+    # An incoming message is reliable proof that the user has unblocked the
+    # bot. Resume background work only at that point, never on a timer.
+    mark_telegram_delivery_active(user.id)
     return user.id
 
 
@@ -5864,13 +6003,21 @@ async def sync_uzum_sku_financials(
                 status["with_ikpu"],
             )
             return status
-        except Exception:
+        except Exception as error:
             if cached_rows:
-                logging.exception(
-                    "Uzum SKU finance sync failed; using cached data user=%s shop=%s",
-                    telegram_id,
-                    shop_id,
-                )
+                if _uzum_access_error_kind(error) or _is_uzum_rate_limit_error(error):
+                    _log_watcher_api_failure(
+                        "Uzum SKU finance sync",
+                        error,
+                        shop_id=shop_id,
+                        telegram_ids=[telegram_id],
+                    )
+                else:
+                    logging.exception(
+                        "Uzum SKU finance sync failed; using cached data user=%s shop=%s",
+                        telegram_id,
+                        shop_id,
+                    )
                 return _uzum_sku_finance_status(*key, stale=True)
             raise
 
@@ -7059,19 +7206,54 @@ def _finance_status(item: dict[str, Any]) -> str:
 
 
 def _finance_title(item: dict[str, Any]) -> str:
-    value = pick(
+    """Return the Uzum product-card name, never a SKU/variant name.
+
+    The Seller OpenAPI exposes ``productTitle`` and ``skuTitle`` as different
+    fields.  A SKU title is useful for identifying a size or colour, but using
+    it as the product name makes reports show the same text twice and can merge
+    unrelated cards.  Generic ``title``/``name`` fields are accepted only when
+    they are not the same value as the documented SKU fields.
+    """
+
+    sku_value = _deep_pick_value(
         item,
-        "skuTitle",
-        "productTitle",
-        "productName",
-        "title",
-        "name",
-        "skuName",
-        "offerName",
+        ("skuTitle", "skuName", "skuFullTitle", "offerName"),
     )
-    if isinstance(value, dict):
-        value = pick(value, "title", "name")
-    return str(value or "Без названия")
+    if isinstance(sku_value, dict):
+        sku_value = pick(sku_value, "title", "name", "value")
+    sku_text = " ".join(str(sku_value or "").split()).casefold()
+
+    for field in ("productTitle", "productName"):
+        value = _deep_pick_value(item, (field,))
+        if isinstance(value, dict):
+            value = pick(value, "title", "name", "value")
+        text = " ".join(str(value or "").split())
+        if text and text not in {"-", "—"}:
+            return text
+
+    for field in ("title", "name"):
+        value = _deep_pick_value(item, (field,))
+        if isinstance(value, dict):
+            value = pick(value, "title", "name", "value")
+        text = " ".join(str(value or "").split())
+        if (
+            text
+            and text not in {"-", "—"}
+            and text.casefold() != sku_text
+        ):
+            return text
+    return "—"
+
+
+def _distinct_sku_for_display(title: Any, sku: Any) -> str:
+    """Return SKU detail only when it adds information to the product name."""
+    title_text = " ".join(str(title or "").split())
+    sku_text = " ".join(str(sku or "").split())
+    if not sku_text or sku_text in {"-", "—"}:
+        return ""
+    if title_text and title_text.casefold() == sku_text.casefold():
+        return ""
+    return sku_text
 
 
 def _finance_qty(item: dict[str, Any]) -> float:
@@ -7134,16 +7316,23 @@ async def _finance_orders_request(
     *,
     date_from_ms: int,
     date_to_ms: int,
+    date_mode: str = "compatibility",
     page: int = 0,
     size: int = 100,
 ) -> Any:
+    date_from = (
+        int(date_from_ms)
+        if date_mode == "milliseconds"
+        else int(date_from_ms / 1000)
+    )
     params = [
         ("page", page),
         ("size", size),
         ("group", "false"),
-        # Важно: рабочий Noorza Bot использует dateFrom в секундах, dateTo в миллисекундах.
-        # Если отправить dateFrom в миллисекундах, Uzum Finance может вернуть 0 строк.
-        ("dateFrom", int(date_from_ms / 1000)),
+        # Some live deployments still require seconds for dateFrom, while the
+        # current Swagger-compatible mode uses milliseconds. Callers that need
+        # reporting truth probe both modes and validate returned row dates.
+        ("dateFrom", date_from),
         ("dateTo", date_to_ms),
         ("shopIds", shop_id),
     ]
@@ -7160,25 +7349,14 @@ async def _load_finance_orders(
     max_pages: int = 10,
     page_size: int = 100,
 ) -> tuple[list[dict[str, Any]], Any | None]:
-    rows: list[dict[str, Any]] = []
-    first_response: Any | None = None
-    for page in range(max_pages):
-        data = await _finance_orders_request(
-            client,
-            shop_id,
-            date_from_ms=date_from_ms,
-            date_to_ms=date_to_ms,
-            page=page,
-            size=page_size,
-        )
-        if first_response is None:
-            first_response = data
-        items = _deep_items(data)
-        if not items:
-            break
-        rows.extend(items)
-        if len(items) < page_size:
-            break
+    rows, first_response, _ = await _load_finance_range_flexible(
+        client,
+        shop_id,
+        date_from_ms,
+        date_to_ms,
+        max_pages=max_pages,
+        page_size=page_size,
+    )
     return rows, first_response
 
 
@@ -7385,17 +7563,25 @@ async def _finance_orders_request_extra(
     *,
     date_from_ms: int,
     date_to_ms: int,
+    date_mode: str = "compatibility",
     extra_params: list[tuple[str, Any]] | None = None,
     page: int = 0,
     size: int = 100,
 ) -> Any:
+    if date_mode == "milliseconds":
+        date_from = int(date_from_ms)
+        date_to = int(date_to_ms)
+    else:
+        # Some live Uzum deployments still require the historical mixed form
+        # even though the current Swagger describes both values as epoch ms.
+        date_from = int(date_from_ms / 1000)
+        date_to = int(date_to_ms)
     params: list[tuple[str, Any]] = [
         ("page", page),
         ("size", size),
         ("group", "false"),
-        # Важно: рабочий Noorza Bot использует dateFrom в секундах, dateTo в миллисекундах.
-        ("dateFrom", int(date_from_ms / 1000)),
-        ("dateTo", date_to_ms),
+        ("dateFrom", date_from),
+        ("dateTo", date_to),
         ("shopIds", shop_id),
     ]
     if extra_params:
@@ -7411,6 +7597,31 @@ async def _load_today_finance_flexible(
     return await _load_finance_range_flexible(client, shop_id, date_from, date_to)
 
 
+def _finance_rows_outside_requested_window(
+    rows: list[dict[str, Any]],
+    date_from_ms: int,
+    date_to_ms: int,
+) -> bool:
+    """Detect a timestamp-unit mismatch from dates returned by Uzum.
+
+    If a deployment interprets a seconds value as milliseconds, ``dateFrom``
+    becomes a date in 1970 and the API may return the seller's entire history.
+    Rejecting such a page prevents an apparently valid but inflated report.
+    A one-day tolerance covers timezone boundaries and delayed metadata without
+    accepting unrelated historical rows.
+    """
+    start = datetime.fromtimestamp(float(date_from_ms) / 1000.0, UZT).replace(tzinfo=None)
+    end = datetime.fromtimestamp(float(date_to_ms) / 1000.0, UZT).replace(tzinfo=None)
+    tolerance = timedelta(days=1)
+    lower = start - tolerance
+    upper = end + tolerance
+    for row in rows:
+        row_date = _finance_order_datetime(row)
+        if row_date is not None and not (lower <= row_date <= upper):
+            return True
+    return False
+
+
 async def _load_finance_range_flexible(
     client: UzumClient,
     shop_id: int,
@@ -7424,20 +7635,28 @@ async def _load_finance_range_flexible(
 
     The old implementation requested only page 0, so Telegram and Excel silently
     understated totals when a period contained more than 100 rows.  Earlier
-    fallback attempts also sent unsupported ``status``/``statuses`` parameters,
-    which produced HTTP 400 responses when the selected period had no rows.
+    fallback attempts also sent undocumented status names and incompatible
+    filter combinations, which produced HTTP 400 responses on some deployments.
     """
     max_pages = max(1, int(max_pages or FINANCE_REPORT_MAX_PAGES))
     page_size = max(1, min(100, int(page_size or 100)))
-    attempts: list[tuple[str, list[tuple[str, Any]]]] = [
-        ("без дополнительных фильтров", []),
+    attempts: list[tuple[str, str, list[tuple[str, Any]]]] = [
+        ("совместимый диапазон", "compatibility", []),
+        ("официальный диапазон ms", "milliseconds", []),
     ]
     all_rows: list[dict[str, Any]] = []
-    seen: set[str] = set()
     first_response: Any | None = None
     used_attempts: list[str] = []
+    first_error: Exception | None = None
+    range_mismatch_error: Exception | None = None
+    successful_attempts = 0
     truncated = False
-    for label, extra in attempts:
+    for label, date_mode, extra in attempts:
+        attempt_rows_list: list[dict[str, Any]] = []
+        attempt_seen: set[str] = set()
+        attempt_first_response: Any | None = None
+        attempt_truncated = False
+        attempt_range_mismatch = False
         try:
             attempt_rows = 0
             attempt_pages = 0
@@ -7447,35 +7666,80 @@ async def _load_finance_range_flexible(
                     shop_id,
                     date_from_ms=date_from_ms,
                     date_to_ms=date_to_ms,
+                    date_mode=date_mode,
                     extra_params=extra,
                     page=page,
                     size=page_size,
                 )
                 attempt_pages += 1
-                if first_response is None:
-                    first_response = data
+                if attempt_first_response is None:
+                    attempt_first_response = data
                 rows = _deep_items(data)
                 if not rows:
+                    break
+                if _finance_rows_outside_requested_window(
+                    rows,
+                    date_from_ms,
+                    date_to_ms,
+                ):
+                    attempt_range_mismatch = True
+                    mismatch_error = RuntimeError(
+                        f"Finance {label} returned rows outside the requested period"
+                    )
+                    range_mismatch_error = range_mismatch_error or mismatch_error
+                    logging.warning(
+                        "Finance timestamp mode rejected shop=%s mode=%s: rows outside requested range",
+                        shop_id,
+                        date_mode,
+                    )
                     break
                 attempt_rows += len(rows)
                 for row in rows:
                     raw = json.dumps(row, ensure_ascii=False, sort_keys=True, default=str)
                     sig = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-                    if sig not in seen:
-                        seen.add(sig)
-                        all_rows.append(row)
+                    if sig not in attempt_seen:
+                        attempt_seen.add(sig)
+                        attempt_rows_list.append(row)
                 if len(rows) < page_size:
                     break
                 if page + 1 >= max_pages:
-                    truncated = True
+                    attempt_truncated = True
                 await asyncio.sleep(0.04)
+            if attempt_range_mismatch:
+                used_attempts.append(f"{label}: отклонён по датам строк")
+                await asyncio.sleep(0.05)
+                continue
+            successful_attempts += 1
+            if first_response is None:
+                first_response = attempt_first_response
             used_attempts.append(f"{label}: {attempt_pages} стр./{attempt_rows} строк")
-            if all_rows and label == "без дополнительных фильтров":
+            if attempt_rows_list:
+                all_rows = attempt_rows_list
+                first_response = attempt_first_response
+                truncated = attempt_truncated
                 break
             await asyncio.sleep(0.15)
         except Exception as e:
+            first_error = first_error or e
             logging.info("Finance attempt failed: %s: %s", label, e)
+            # Access and rate-limit failures are not an empty sales period.
+            # Propagate them so reports cannot silently display false zeroes.
+            if _uzum_access_error_kind(e) or _is_uzum_rate_limit_error(e):
+                raise
             continue
+    if successful_attempts == 0 and first_error is not None:
+        raise first_error
+    if successful_attempts == 0 and range_mismatch_error is not None:
+        raise range_mismatch_error
+    if (
+        not all_rows
+        and successful_attempts < len(attempts)
+        and first_error is not None
+        and "400" not in str(first_error)
+    ):
+        # One timestamp mode returned an empty page, while the other failed for
+        # a reason unrelated to the request shape. The true result is unknown.
+        raise first_error
     if truncated:
         warning = f"Достигнут защитный лимит {max_pages * page_size} строк"
         used_attempts.append(warning)
@@ -7581,6 +7845,9 @@ async def load_uzum_expense_summary(
         errors: list[str] = []
         rows: list[dict[str, Any]] = []
         date_mode = "milliseconds"
+        successful_attempts = 0
+        fatal_error: Exception | None = None
+        last_error: Exception | None = None
         # Swagger declares int64 but deployments have historically differed on
         # dateFrom units. Try the documented millisecond range first, then the
         # compatibility form already required by Finance orders.
@@ -7590,16 +7857,19 @@ async def load_uzum_expense_summary(
         )
         for attempt_from, attempt_to, label in attempts:
             try:
-                rows = await _load_uzum_expense_rows_attempt(
+                attempt_rows = await _load_uzum_expense_rows_attempt(
                     client,
                     shop_id,
                     date_from=attempt_from,
                     date_to=attempt_to,
                 )
+                successful_attempts += 1
                 date_mode = label
-                if rows:
+                if attempt_rows:
+                    rows = attempt_rows
                     break
             except Exception as error:
+                last_error = error
                 errors.append(f"{label}: {error}")
                 logging.info(
                     "Uzum expenses attempt failed shop=%s mode=%s: %s",
@@ -7607,7 +7877,25 @@ async def load_uzum_expense_summary(
                     label,
                     error,
                 )
-        if not rows and len(errors) == len(attempts):
+                if _uzum_access_error_kind(error) or _is_uzum_rate_limit_error(error):
+                    fatal_error = error
+                    break
+        unavailable = fatal_error is not None or (
+            not rows
+            and successful_attempts == 0
+            and bool(errors)
+        )
+        if (
+            not unavailable
+            and not rows
+            and last_error is not None
+            and successful_attempts < len(attempts)
+            and "400" not in str(last_error)
+        ):
+            # An empty result in one timestamp mode plus a transport/server
+            # failure in the other mode is not proof that expenses are zero.
+            unavailable = True
+        if unavailable:
             summary = {
                 **summarize_expenses([]),
                 "available": False,
@@ -8192,7 +8480,7 @@ async def _load_all_time_loss_rows_legacy(
     rows.sort(
         key=lambda row: (
             -(_loss_qty(row, "missing") + _loss_qty(row, "defected")),
-            str(row.get("product_title") or row.get("sku_full_title") or ""),
+            str(row.get("product_title") or ""),
         )
     )
     return rows, unavailable_filters
@@ -8225,7 +8513,7 @@ def _format_lost_sku_line(row: dict[str, Any], idx: int, lang: str) -> str:
     missing = _loss_qty(row, "missing")
     defected = _loss_qty(row, "defected")
     available = max(0, int(_num_from_value(row.get("total")) or 0))
-    title = escape(_short_text(row.get("product_title") or row.get("sku_full_title") or row.get("sku_title") or "Без названия"))
+    title = escape(_short_text(row.get("product_title") or "—"))
     sku_value = row.get("sku_id") or row.get("barcode") or row.get("seller_item_code") or row.get("sku_full_title") or "-"
     sku = escape(_short_text(sku_value, limit=90))
     status_value = status_display(row.get("status")) if row.get("status") else "-"
@@ -8668,8 +8956,10 @@ async def fbo_invoices(message: Message) -> None:
 def _format_invoice_product_line(item: dict[str, Any], idx: int) -> str:
     product_title = _value_by_path(item, "productTitle", "title", "product.name")
     sku_title = _value_by_path(item, "skuTitle", "sku.title", "skuName")
-    title = escape(_short_text(product_title or sku_title or "Без названия", 90))
-    sku_text = escape(_short_text(sku_title or "—", 90))
+    product_text = str(product_title or "—")
+    title = escape(_short_text(product_text, 90))
+    distinct_sku = _distinct_sku_for_display(product_text, sku_title)
+    sku_text = escape(_short_text(distinct_sku, 90)) if distinct_sku else ""
     item_id = _value_by_path(item, "id", "skuId", "productId")
     to_stock = _value_by_path(item, "quantityToStock", "toStock", "quantity")
     accepted = _value_by_path(item, "quantityAccepted", "accepted", "acceptedQuantity")
@@ -8681,7 +8971,7 @@ def _format_invoice_product_line(item: dict[str, Any], idx: int) -> str:
     lines = [f"{idx}. <b>{title}</b>"]
     if item_id not in (None, ""):
         lines.append(f"ID/SKU: <code>{escape(str(item_id))}</code>")
-    if sku_text != "—":
+    if sku_text:
         lines.append(f"SKU: {sku_text}")
     lines.append(f"По накладной: <b>{_fmt_qty(to_stock)}</b> шт. | Принято: <b>{_fmt_qty(accepted)}</b> шт.")
     if abs(diff) > 0.00001:
@@ -9253,7 +9543,7 @@ def _review_answer(review: Any) -> str:
 
 def format_review_line(review: Any) -> str:
     review_id = _review_id(review)
-    product = pick(review, "productTitle", "productName", "title", "name", "skuTitle", default="—")
+    product = pick(review, "productTitle", "productName", default="—")
     rating = pick(review, "rating", "stars", "mark", "grade", "score", default="—")
     author = pick(review, "customerName", "userName", "buyerName", "clientName", "author", default="—")
     created = pick(review, "createdAt", "date", "createdDate", "publishedAt", default="—")
@@ -9487,7 +9777,7 @@ def _review_seen_key(review: Any) -> str:
 def build_review_notification(review: Any, shop_id: int, lang: str = "ru") -> str:
     lang = normalize_lang(lang)
     review_id = escape(_review_id(review))
-    product = safe(pick(review, "productTitle", "productName", "title", "name", "skuTitle", default="—"))
+    product = safe(pick(review, "productTitle", "productName", default="—"))
     rating = safe(pick(review, "rating", "stars", "mark", "grade", "score", default="—"))
     author = safe(pick(review, "customerName", "userName", "buyerName", "clientName", "author", default="—"))
     created = safe(pick(review, "createdAt", "date", "createdDate", "publishedAt", default="—"))
@@ -11257,7 +11547,7 @@ def _build_stock_report_rows(
             "product_id": row.get("product_id"),
             "sku_id": row.get("sku_id"),
             "barcode": row.get("barcode"),
-            "title": row.get("product_title") or row.get("sku_full_title") or row.get("sku_title") or "Без названия",
+            "title": row.get("product_title") or "—",
             "sku": row.get("sku_full_title") or row.get("sku_title") or row.get("sku_id") or row.get("barcode"),
             "price": price,
             "purchase_price": row.get("purchase_price"),
@@ -12225,6 +12515,7 @@ def connected_users_for_order_watch(access_feature: str = "premium") -> list[dic
             """
         ).fetchall()
     allowed_by_user: dict[int, bool] = {}
+    delivery_by_user: dict[int, bool] = {}
     result: list[dict[str, Any]] = []
     seen_scopes: set[tuple[int, int]] = set()
     for raw_row in rows:
@@ -12239,7 +12530,9 @@ def connected_users_for_order_watch(access_feature: str = "premium") -> list[dic
                 telegram_id,
                 access_feature,
             )
-        if not allowed_by_user[telegram_id]:
+        if telegram_id not in delivery_by_user:
+            delivery_by_user[telegram_id] = telegram_delivery_allowed(telegram_id)
+        if not allowed_by_user[telegram_id] or not delivery_by_user[telegram_id]:
             continue
         seen_scopes.add(scope)
         result.append(row)
@@ -12898,14 +13191,9 @@ def _stock_snapshot_item(row: dict[str, Any]) -> dict[str, Any]:
         "total": _stock_qty(row.get("total")),
         "fbo": _stock_qty(row.get("fbo")),
         "fbs": _stock_qty(row.get("fbs")),
-        "title": str(
-            row.get("title")
-            or row.get("productTitle")
-            or row.get("skuTitle")
-            or row.get("name")
-            or row.get("product_name")
-            or "SKU"
-        ),
+        # Keep the product-card name and the SKU/variant identity separate.
+        # ``skuTitle`` must never become the customer-facing product name.
+        "title": _stock_row_title(row),
         "price": row.get("price"),
         "row": row,
     }
@@ -13413,14 +13701,20 @@ async def ikpu_catalog_report(message: Message) -> None:
             return
         items: list[str] = []
         for index, row in enumerate(missing_rows, start=1):
-            product = escape(_short_text(str(row.get("product_title") or row.get("sku_title") or "—"), 80))
-            sku = escape(_short_text(str(row.get("sku_title") or row.get("sku_id") or "—"), 65))
+            product_full = str(row.get("product_title") or "—")
+            product = escape(_short_text(product_full, 80))
+            sku_raw = _distinct_sku_for_display(
+                product_full,
+                row.get("sku_title") or row.get("sku_id"),
+            )
+            sku = escape(_short_text(sku_raw, 65)) if sku_raw else ""
             article = escape(_short_text(str(row.get("seller_item_code") or "—"), 45))
+            sku_line = f"\n🔖 SKU: <code>{sku}</code>" if sku else ""
             items.append(
                 (
-                    f"{index}. <b>{product}</b>\n🔖 SKU: <code>{sku}</code> | Artikul: <code>{article}</code>\n⚠️ IKPU / MXIK yo‘q"
+                    f"{index}. <b>{product}</b>{sku_line}\nArtikul: <code>{article}</code>\n⚠️ IKPU / MXIK yo‘q"
                     if lang == "uz"
-                    else f"{index}. <b>{product}</b>\n🔖 SKU: <code>{sku}</code> | Артикул: <code>{article}</code>\n⚠️ ИКПУ / МХИК не заполнен"
+                    else f"{index}. <b>{product}</b>{sku_line}\nАртикул: <code>{article}</code>\n⚠️ ИКПУ / МХИК не заполнен"
                 )
             )
         await send_paginated_list(
@@ -14214,10 +14508,15 @@ async def _user_shop_list(telegram_id: int, client: UzumClient | None = None) ->
 
 
 def _stock_row_title(row: dict[str, Any]) -> str:
-    value = pick(row, "skuTitle", "sku_title", "title", "productTitle", "product_title", "name")
+    value = pick(row, "productTitle", "product_title")
     if value in (None, ""):
-        value = _deep_pick_value(row, ("skuTitle", "productTitle", "title", "name"))
-    return str(value or "Без названия")
+        value = _deep_pick_value(row, ("productTitle", "productName"))
+    if value in (None, ""):
+        generic = pick(row, "title", "name")
+        sku_value = pick(row, "skuTitle", "sku_title", "sku_full_title")
+        if _distinct_sku_for_display(sku_value, generic):
+            value = generic
+    return " ".join(str(value or "—").split())
 
 
 def _stock_row_sku(row: dict[str, Any]) -> str:
@@ -14338,10 +14637,9 @@ def _merge_noorza_stats(stats_list: list[dict[str, Any]]) -> dict[str, Any]:
         for status, count in (stats.get("statuses") or {}).items():
             statuses[str(status)] = statuses.get(str(status), 0) + int(count or 0)
         for product in stats.get("top_products") or []:
-            key = str(product.get("sku") or product.get("title") or "—").strip().lower()
+            key = " ".join(str(product.get("title") or "—").casefold().split())
             entry = products.setdefault(key, {
                 "title": product.get("title"),
-                "sku": product.get("sku"),
                 "qty": 0.0,
                 "revenue": 0.0,
                 "payout": 0.0,
@@ -15288,6 +15586,14 @@ async def _daily_fbs_scheme_index(
                     break
                 await asyncio.sleep(0.04)
         except Exception as error:
+            if _uzum_access_error_kind(error):
+                _log_watcher_api_failure(
+                    "Daily FBS/DBS scheme mapping",
+                    error,
+                    shop_id=shop_id,
+                    telegram_ids=[],
+                )
+                return result
             logging.info(
                 "Daily FBS/DBS scheme mapping unavailable shop=%s status=%s: %s",
                 shop_id,
@@ -15443,10 +15749,21 @@ async def _collect_market_daily_report(
                 ]
             try:
                 await sync_uzum_sku_financials(client, telegram_id, shop_id)
-            except Exception:
+            except Exception as error:
                 # Historical Finance purchasePrice remains usable.  The exact
                 # coverage below will reveal any SKU that still lacks a cost.
-                logging.exception("Daily report cost fallback sync failed shop=%s", shop_id)
+                if _uzum_access_error_kind(error):
+                    _log_watcher_api_failure(
+                        "Daily report catalog sync",
+                        error,
+                        shop_id=shop_id,
+                        telegram_ids=[telegram_id],
+                    )
+                else:
+                    logging.exception(
+                        "Daily report cost fallback sync failed shop=%s",
+                        shop_id,
+                    )
             costs = get_unit_cost_map(telegram_id, shop_id)
             settings = ensure_finance_settings(telegram_id, shop_id)
             expenses = await load_uzum_expense_summary(
@@ -15469,7 +15786,15 @@ async def _collect_market_daily_report(
             )
         except Exception as error:
             errors.append(f"{shop_id}: {str(error)[:160]}")
-            logging.exception("Daily finance report failed shop=%s", shop_id)
+            if _uzum_access_error_kind(error) or _is_uzum_rate_limit_error(error):
+                _log_watcher_api_failure(
+                    "Daily finance report",
+                    error,
+                    shop_id=shop_id,
+                    telegram_ids=[telegram_id],
+                )
+            else:
+                logging.exception("Daily finance report failed shop=%s", shop_id)
         await asyncio.sleep(0.15)
 
     accepted = _merge_noorza_stats([dict(item.get("accepted") or {}) for item in per_shop])
@@ -16066,9 +16391,12 @@ def _build_unit_rows_from_finance(
         status = _finance_status(item)
         if _is_cancelled_status(status) or _is_returned_status(status):
             continue
-        key = _unit_group_key(item)
+        title = _finance_product_title(item)
+        key = _finance_product_group_key(item, title)
         if not key:
             continue
+        variant_key = _finance_variant_key(item) or f"row:{finance_identity_key(item)}"
+        variant_label = _distinct_sku_for_display(title, _finance_sku_title(item))
         qty = _finance_qty(item)
         revenue = _finance_gross_revenue(item)
         commission = _finance_commission(item)
@@ -16148,8 +16476,10 @@ def _format_unit_economy(shop_id: int, days: int, rows: list[dict[str, Any]], st
             lines.append(f"💰 Taxminiy sof foyda: <b>{_format_money(total_known_profit)}</b>")
         lines.append("\n<b>Top tovarlar:</b>")
         for idx, item in enumerate(rows[:10], start=1):
-            sku = escape(_short_text(item.get("sku"), 55))
-            title = escape(_short_text(item.get("title"), 70))
+            title_raw = str(item.get("title") or "—")
+            sku = escape(_short_text(_distinct_sku_for_display(title_raw, item.get("sku")), 55))
+            title = escape(_short_text(title_raw, 70))
+            sku_line = f"\n   🔖 Variant / SKU: <code>{sku}</code>" if sku else ""
             cost = item.get("cost_per_unit")
             if cost is None:
                 hint = "\n   ⚠️ Uzum bu SKU uchun tannarx bermagan"
@@ -16158,8 +16488,7 @@ def _format_unit_economy(shop_id: int, days: int, rows: list[dict[str, Any]], st
                 margin = float(item.get("margin") or 0)
                 hint = f"\n   🧾 Tannarx: <b>{_format_money(float(cost))}</b> | 💰 Foyda: <b>{_format_money(profit)}</b> | 📈 Marja: <b>{margin:.1f}%</b>"
             lines.append(
-                f"{idx}. <b>{title}</b>\n"
-                f"   🔖 SKU: <code>{sku}</code>\n"
+                f"{idx}. <b>{title}</b>{sku_line}\n"
                 f"   🔢 Soni: <b>{float(item.get('qty') or 0):.0f} dona</b> | "
                 f"💵 Tushum: <b>{_format_money(float(item.get('revenue') or 0))}</b> | "
                 f"✅ To‘lovga: <b>{_format_money(float(item.get('payout') or 0))}</b>" + hint
@@ -16186,8 +16515,10 @@ def _format_unit_economy(shop_id: int, days: int, rows: list[dict[str, Any]], st
         lines.append(f"💰 Примерная чистая прибыль: <b>{_format_money(total_known_profit)}</b>")
     lines.append("\n<b>Топ товаров:</b>")
     for idx, item in enumerate(rows[:10], start=1):
-        sku = escape(_short_text(item.get("sku"), 55))
-        title = escape(_short_text(item.get("title"), 70))
+        title_raw = str(item.get("title") or "—")
+        sku = escape(_short_text(_distinct_sku_for_display(title_raw, item.get("sku")), 55))
+        title = escape(_short_text(title_raw, 70))
+        sku_line = f"\n   🔖 Вариант / SKU: <code>{sku}</code>" if sku else ""
         cost = item.get("cost_per_unit")
         if cost is None:
             hint = "\n   ⚠️ Uzum не передал себестоимость для этого SKU"
@@ -16196,8 +16527,7 @@ def _format_unit_economy(shop_id: int, days: int, rows: list[dict[str, Any]], st
             margin = float(item.get("margin") or 0)
             hint = f"\n   🧾 Себестоимость: <b>{_format_money(float(cost))}</b> | 💰 Прибыль: <b>{_format_money(profit)}</b> | 📈 Маржа: <b>{margin:.1f}%</b>"
         lines.append(
-            f"{idx}. <b>{title}</b>\n"
-            f"   🔖 SKU: <code>{sku}</code>\n"
+            f"{idx}. <b>{title}</b>{sku_line}\n"
             f"   🔢 Кол-во: <b>{float(item.get('qty') or 0):.0f} шт.</b> | "
             f"💵 Выручка: <b>{_format_money(float(item.get('revenue') or 0))}</b> | "
             f"✅ К выплате: <b>{_format_money(float(item.get('payout') or 0))}</b>" + hint
@@ -16233,8 +16563,16 @@ async def unit_economy(message: Message) -> None:
             summary.append(f"💰 Taxminiy sof foyda: <b>{_format_money(total_known_profit)}</b>" if lang == "uz" else f"💰 Примерная чистая прибыль: <b>{_format_money(total_known_profit)}</b>")
         items: list[str] = []
         for idx, item in enumerate(rows, start=1):
-            sku = escape(_short_text(item.get("sku"), 55))
-            title_item = escape(_short_text(item.get("title"), 70))
+            title_raw = str(item.get("title") or "—")
+            sku = escape(_short_text(_distinct_sku_for_display(title_raw, item.get("sku")), 55))
+            title_item = escape(_short_text(title_raw, 70))
+            sku_line = (
+                f"\n🔖 Variant / SKU: <code>{sku}</code>"
+                if sku and lang == "uz"
+                else f"\n🔖 Вариант / SKU: <code>{sku}</code>"
+                if sku
+                else ""
+            )
             cost = item.get("cost_per_unit")
             if cost is None:
                 hint = "\n⚠️ Uzum bu SKU uchun tannarx bermagan" if lang == "uz" else "\n⚠️ Uzum не передал себестоимость для этого SKU"
@@ -16243,9 +16581,9 @@ async def unit_economy(message: Message) -> None:
                 margin = float(item.get("margin") or 0)
                 hint = f"\n🧾 Tannarx: <b>{_format_money(float(cost))}</b> | 💰 Foyda: <b>{_format_money(profit)}</b> | 📈 Marja: <b>{margin:.1f}%</b>" if lang == "uz" else f"\n🧾 Себестоимость: <b>{_format_money(float(cost))}</b> | 💰 Прибыль: <b>{_format_money(profit)}</b> | 📈 Маржа: <b>{margin:.1f}%</b>"
             if lang == "uz":
-                items.append(f"{idx}. <b>{title_item}</b>\n🔖 SKU: <code>{sku}</code>\n🔢 Soni: <b>{float(item.get('qty') or 0):.0f} dona</b> | 💵 Tushum: <b>{_format_money(float(item.get('revenue') or 0))}</b> | ✅ To‘lovga: <b>{_format_money(float(item.get('payout') or 0))}</b>{hint}")
+                items.append(f"{idx}. <b>{title_item}</b>{sku_line}\n🔢 Soni: <b>{float(item.get('qty') or 0):.0f} dona</b> | 💵 Tushum: <b>{_format_money(float(item.get('revenue') or 0))}</b> | ✅ To‘lovga: <b>{_format_money(float(item.get('payout') or 0))}</b>{hint}")
             else:
-                items.append(f"{idx}. <b>{title_item}</b>\n🔖 SKU: <code>{sku}</code>\n🔢 Кол-во: <b>{float(item.get('qty') or 0):.0f} шт.</b> | 💵 Выручка: <b>{_format_money(float(item.get('revenue') or 0))}</b> | ✅ К выплате: <b>{_format_money(float(item.get('payout') or 0))}</b>{hint}")
+                items.append(f"{idx}. <b>{title_item}</b>{sku_line}\n🔢 Кол-во: <b>{float(item.get('qty') or 0):.0f} шт.</b> | 💵 Выручка: <b>{_format_money(float(item.get('revenue') or 0))}</b> | ✅ К выплате: <b>{_format_money(float(item.get('payout') or 0))}</b>{hint}")
         await send_paginated_list(message, kind="unit", title=title, summary=summary, items=items, section="sales", reply_markup=sales_menu_for_message(message))
     except Exception as e:
         await send_api_error(message, e)
@@ -16519,7 +16857,7 @@ def _save_unit_costs_bulk(
             int(telegram_id),
             int(shop_id),
             _unit_sku_key(item.get("sku")),
-            str(item.get("title") or item.get("sku") or "").strip(),
+            str(item.get("title") or "—").strip(),
             float(item.get("cost") or 0),
             now_text,
         )
@@ -16688,7 +17026,6 @@ async def receive_costs_excel_wrong(message: Message) -> None:
 
 def _profit_summary_from_unit_rows(rows: list[dict[str, Any]], stats: dict[str, Any]) -> dict[str, Any]:
     known_rows = [r for r in rows if float(r.get("known_cost_qty") or (r.get("qty") if r.get("cost_per_unit") is not None else 0) or 0) > 0]
-    complete_rows = [r for r in rows if bool(r.get("cost_complete", r.get("cost_per_unit") is not None))]
     cost_total = sum(float(r.get("cost_total") or 0) for r in known_rows)
     known_profit = sum(float(r.get("profit") or 0) for r in known_rows)
     known_net_profit = sum(float(r.get("net_profit") if r.get("net_profit") is not None else r.get("profit") or 0) for r in known_rows)
@@ -16703,6 +17040,19 @@ def _profit_summary_from_unit_rows(rows: list[dict[str, Any]], stats: dict[str, 
     known_commission = sum(float(r.get("known_commission") or 0) for r in known_rows)
     known_logistics = sum(float(r.get("known_logistics") or 0) for r in known_rows)
     missing = [r for r in rows if not bool(r.get("cost_complete", r.get("cost_per_unit") is not None))]
+    missing_count = sum(
+        int(r.get("missing_variant_count") or 1)
+        for r in missing
+    )
+    known_count = sum(
+        int(
+            r.get("known_variant_count")
+            if r.get("known_variant_count") is not None
+            else 1
+        )
+        for r in known_rows
+    )
+    total_count = sum(max(1, int(r.get("variant_count") or 1)) for r in rows)
     total_revenue = float(stats.get("revenue") or 0)
     margin = (known_profit / known_revenue * 100.0) if known_revenue > 0 else 0.0
     coverage = known_revenue / total_revenue if total_revenue > 0 else 0.0
@@ -16712,9 +17062,9 @@ def _profit_summary_from_unit_rows(rows: list[dict[str, Any]], stats: dict[str, 
         "net_profit_after_tax": known_net_profit,
         "margin": margin,
         "coverage": max(0.0, min(1.0, coverage)),
-        "missing_count": len(missing),
-        "known_count": len(complete_rows),
-        "total_count": len(rows),
+        "missing_count": missing_count,
+        "known_count": known_count,
+        "total_count": total_count,
         "total_revenue": total_revenue,
         "known_revenue": known_revenue,
         "known_payout": known_payout,
@@ -16970,7 +17320,7 @@ def _format_profit_report(shop_id: int, rows: list[dict[str, Any]], stats: dict[
         if top_profit:
             lines.append("\n🏆 <b>Foyda bo‘yicha top tovarlar:</b>")
             for idx, r in enumerate(top_profit, start=1):
-                lines.append(f"{idx}. {escape(_short_text(str(r.get('title') or r.get('sku') or '-'), 55))} — <b>{_format_money(float(r.get('profit') or 0))}</b>")
+                lines.append(f"{idx}. {escape(_short_text(str(r.get('title') or '—'), 55))} — <b>{_format_money(float(r.get('profit') or 0))}</b>")
         return "\n".join(lines)
     lines = [
         "💰 <b>Прибыль за 30 дней</b>",
@@ -16992,7 +17342,7 @@ def _format_profit_report(shop_id: int, rows: list[dict[str, Any]], stats: dict[
     if top_profit:
         lines.append("\n🏆 <b>Топ товаров по прибыли:</b>")
         for idx, r in enumerate(top_profit, start=1):
-            lines.append(f"{idx}. {escape(_short_text(str(r.get('title') or r.get('sku') or '-'), 55))} — <b>{_format_money(float(r.get('profit') or 0))}</b>")
+            lines.append(f"{idx}. {escape(_short_text(str(r.get('title') or '—'), 55))} — <b>{_format_money(float(r.get('profit') or 0))}</b>")
     return "\n".join(lines)
 
 
@@ -17066,23 +17416,29 @@ async def profit_report(message: Message) -> None:
         )
         items: list[str] = []
         for idx, r in enumerate(known, start=1):
-            title_item = escape(_short_text(str(r.get("title") or r.get("sku") or "-"), 70))
-            sku = escape(_short_text(str(r.get("sku") or ""), 55))
+            title_raw = str(r.get("title") or "—")
+            title_item = escape(_short_text(title_raw, 70))
+            sku = escape(_short_text(_distinct_sku_for_display(title_raw, r.get("sku")), 55))
+            sku_line = (
+                f"\n🔖 Variant / SKU: <code>{sku}</code>"
+                if sku and lang == "uz"
+                else f"\n🔖 Вариант / SKU: <code>{sku}</code>"
+                if sku
+                else ""
+            )
             net_profit = float(r.get("net_profit") or 0)
             roi = r.get("roi")
             roi_text = "—" if roi is None else f"{float(roi):.1f}%"
             if lang == "uz":
                 items.append(
-                    f"{idx}. <b>{title_item}</b>\n"
-                    f"🔖 SKU: <code>{sku}</code>\n"
+                    f"{idx}. <b>{title_item}</b>{sku_line}\n"
                     f"Tushum: {_format_money(float(r.get('revenue') or 0))} · To‘lovga: {_format_money(float(r.get('payout') or 0))}\n"
                     f"Tannarx: {_format_money(float(r.get('cost_total') or 0))} · Soliq: {_format_money(float(r.get('tax_expense') or 0))}\n"
                     f"💰 Tovar foydasi: <b>{_format_money(net_profit)}</b> · ROI: <b>{roi_text}</b>"
                 )
             else:
                 items.append(
-                    f"{idx}. <b>{title_item}</b>\n"
-                    f"🔖 SKU: <code>{sku}</code>\n"
+                    f"{idx}. <b>{title_item}</b>{sku_line}\n"
                     f"Выручка: {_format_money(float(r.get('revenue') or 0))} · К выплате: {_format_money(float(r.get('payout') or 0))}\n"
                     f"Себестоимость: {_format_money(float(r.get('cost_total') or 0))} · Налог: {_format_money(float(r.get('tax_expense') or 0))}\n"
                     f"💰 Прибыль товара: <b>{_format_money(net_profit)}</b> · ROI: <b>{roi_text}</b>"
@@ -17205,7 +17561,12 @@ def _connected_users_basic() -> list[dict[str, Any]]:
             WHERE uzum_token_encrypted IS NOT NULL
             """
         ).fetchall()
-    return [dict(row) for row in rows if has_active_subscription(int(row["telegram_id"]))]
+    return [
+        dict(row)
+        for row in rows
+        if has_active_subscription(int(row["telegram_id"]))
+        and telegram_delivery_allowed(int(row["telegram_id"]))
+    ]
 
 
 async def _build_scheduled_period_text(
@@ -17333,6 +17694,14 @@ async def daily_report_loop() -> None:
                         if kind == "daily":
                             mark_daily_report_sent(telegram_id, period_key)
                         await asyncio.sleep(0.5)
+                    except TelegramForbiddenError as error:
+                        mark_telegram_delivery_blocked(telegram_id, error)
+                        logging.warning(
+                            "Scheduled reports paused user=%s kind=%s reason=bot_blocked",
+                            telegram_id,
+                            kind,
+                        )
+                        break
                     except Exception:
                         logging.exception("Scheduled report failed user=%s kind=%s", telegram_id, kind)
         except Exception:
@@ -17486,7 +17855,10 @@ async def _load_watch_stock_rows(
 
 
 async def check_new_orders_once() -> None:
+    watcher_name = "Order watcher"
     for group in connected_watch_groups("notify_orders"):
+        if _watcher_access_is_paused(watcher_name, group):
+            continue
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(x) for x in group["telegram_ids"]]
@@ -17496,9 +17868,11 @@ async def check_new_orders_once() -> None:
             client = UzumClient(token, UZUM_API_BASE_URL)
             data = await client.get_fbs_orders(shop_id, status="CREATED", page=0, size=20)
             items = extract_items(data)
+            _watcher_access_resume(watcher_name, group)
         except Exception as error:
+            _watcher_access_pause(watcher_name, group, error)
             _log_watcher_api_failure(
-                "Order watcher",
+                watcher_name,
                 error,
                 shop_id=shop_id,
                 telegram_ids=telegram_ids,
@@ -17538,6 +17912,12 @@ async def check_new_orders_once() -> None:
             try:
                 await bot.send_message(telegram_id, text, reply_markup=main_menu_for_user(telegram_id))
                 await asyncio.sleep(0.15)
+            except TelegramForbiddenError:
+                logging.info(
+                    "Order watcher delivery paused user=%s shop=%s reason=bot_blocked",
+                    telegram_id,
+                    shop_id,
+                )
             except Exception:
                 logging.exception("Order watcher: failed to send notification to %s", telegram_id)
         await asyncio.sleep(0.5)
@@ -20153,12 +20533,6 @@ init_sale_status_watch_table()
 
 
 def _sales_digest_product_title(item: dict[str, Any]) -> str:
-    for field in ("productTitle", "productName", "offerName", "title", "name", "skuTitle"):
-        value = _deep_pick_value(item, (field,))
-        if isinstance(value, dict):
-            value = pick(value, "title", "name", "value")
-        if value not in (None, ""):
-            return str(value)
     return _finance_title(item)
 
 
@@ -20178,7 +20552,7 @@ def _sales_digest_event(
         "identity_key": finance_identity_key(item),
         "order_id": str(normalized.get("order_id") or "-"),
         "product_title": _sales_digest_product_title(item),
-        "sku_title": str(normalized.get("sku") or _finance_sku_title(item) or "-"),
+        "sku_title": str(normalized.get("sku") or ""),
         "quantity": max(0.0, float(normalized.get("qty") or 0)),
         "revenue": max(0.0, float(normalized.get("revenue") or 0)),
         "commission": max(0.0, float(normalized.get("commission") or 0)),
@@ -20336,13 +20710,13 @@ def _sales_digest_summary_from_events(
         for event in events
         if str(event.get("order_id") or "") not in {"", "-", "—"}
     }
-    products: dict[tuple[str, str], dict[str, Any]] = {}
+    products: dict[str, dict[str, Any]] = {}
     for event in events:
-        title = str(event.get("product_title") or "Без названия")
-        sku = str(event.get("sku_title") or "-")
+        title = str(event.get("product_title") or "—")
+        key = " ".join(title.casefold().split())
         product = products.setdefault(
-            (title, sku),
-            {"title": title, "sku": sku, "quantity": 0.0, "revenue": 0.0},
+            key,
+            {"title": title, "quantity": 0.0, "revenue": 0.0},
         )
         product["quantity"] = float(product["quantity"]) + float(event.get("quantity") or 0)
         product["revenue"] = float(product["revenue"]) + float(event.get("revenue") or 0)
@@ -20409,7 +20783,7 @@ def load_sales_digest_summary(
                 COALESCE(SUM(commission), 0) AS commission,
                 COALESCE(SUM(logistics), 0) AS logistics,
                 COALESCE(SUM(payout), 0) AS payout,
-                COUNT(DISTINCT COALESCE(product_title, '') || char(31) || COALESCE(sku_title, ''))
+                COUNT(DISTINCT COALESCE(product_title, ''))
                     AS product_count
             FROM sales_digest_queue
             WHERE telegram_id = ? AND shop_id = ?
@@ -20419,13 +20793,12 @@ def load_sales_digest_summary(
         top_rows = conn.execute(
             """
             SELECT
-                COALESCE(product_title, 'Без названия') AS title,
-                COALESCE(sku_title, '-') AS sku,
+                COALESCE(NULLIF(product_title, ''), '—') AS title,
                 COALESCE(SUM(quantity), 0) AS quantity,
                 COALESCE(SUM(revenue), 0) AS revenue
             FROM sales_digest_queue
             WHERE telegram_id = ? AND shop_id = ?
-            GROUP BY product_title, sku_title
+            GROUP BY product_title
             ORDER BY revenue DESC, quantity DESC
             LIMIT 5
             """,
@@ -20493,7 +20866,7 @@ def build_sales_digest_message(
         if top_products:
             lines.extend(["", "🏆 <b>Top tovarlar:</b>"])
             for index, product in enumerate(top_products, start=1):
-                title = escape(_short_text(str(product.get("title") or product.get("sku") or "-"), 55))
+                title = escape(_short_text(str(product.get("title") or "—"), 55))
                 lines.append(
                     f"{index}. {title} — <b>{float(product.get('quantity') or 0):g} dona</b> · "
                     f"{_format_money(float(product.get('revenue') or 0))}"
@@ -20518,7 +20891,7 @@ def build_sales_digest_message(
     if top_products:
         lines.extend(["", "🏆 <b>Топ товаров:</b>"])
         for index, product in enumerate(top_products, start=1):
-            title = escape(_short_text(str(product.get("title") or product.get("sku") or "-"), 55))
+            title = escape(_short_text(str(product.get("title") or "—"), 55))
             lines.append(
                 f"{index}. {title} — <b>{float(product.get('quantity') or 0):g} шт.</b> · "
                 f"{_format_money(float(product.get('revenue') or 0))}"
@@ -20590,6 +20963,14 @@ async def maybe_send_hourly_sales_digest(
             ),
             reply_markup=main_menu_for_user(telegram_id),
         )
+    except TelegramForbiddenError as error:
+        mark_telegram_delivery_blocked(telegram_id, error)
+        logging.warning(
+            "Hourly sales digest paused user=%s shop=%s reason=bot_blocked",
+            telegram_id,
+            shop_id,
+        )
+        return False
     except Exception:
         logging.exception(
             "Hourly sales digest: delivery failed user=%s shop=%s events=%s",
@@ -20881,6 +21262,13 @@ async def maybe_send_hourly_sales_digest_all_shops(
             message,
             reply_markup=main_menu_for_user(telegram_id),
         )
+    except TelegramForbiddenError as error:
+        mark_telegram_delivery_blocked(telegram_id, error)
+        logging.warning(
+            "Hourly multi-shop digest paused user=%s reason=bot_blocked",
+            telegram_id,
+        )
+        return False
     except Exception:
         logging.exception(
             "Hourly multi-shop digest: delivery failed user=%s shops=%s events=%s",
@@ -21169,9 +21557,7 @@ def _loss_watch_snapshot(rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]
             "sku_key": key,
             "product_title": str(
                 row.get("product_title")
-                or row.get("sku_full_title")
-                or row.get("sku_title")
-                or "Без названия"
+                or "—"
             ),
             "sku_title": str(row.get("sku_full_title") or row.get("sku_title") or ""),
             "sku_id": str(row.get("sku_id") or row.get("seller_item_code") or ""),
@@ -21243,12 +21629,17 @@ def build_loss_defect_notification(
         if total_value > 0:
             lines.append(f"💰 Sotuv narxi bo‘yicha baho: <b>{_format_money(total_value)}</b>")
         for index, item in enumerate(shown, start=1):
-            sku = item.get("sku_id") or item.get("barcode") or item.get("sku_title") or "—"
+            product_raw = str(item.get("product_title") or "—")
+            sku = _distinct_sku_for_display(
+                product_raw,
+                item.get("sku_id") or item.get("barcode") or item.get("sku_title"),
+            )
             lines.extend([
                 "",
-                f"{index}. <b>{escape(_short_text(item.get('product_title'), 70))}</b>",
-                f"SKU: <code>{escape(_short_text(sku, 80))}</code>",
+                f"{index}. <b>{escape(_short_text(product_raw, 70))}</b>",
             ])
+            if sku:
+                lines.append(f"SKU: <code>{escape(_short_text(sku, 80))}</code>")
             if int(item.get("missing_delta") or 0) > 0:
                 lines.append(
                     f"🧭 Yo‘qotildi: <b>+{int(item['missing_delta'])}</b> "
@@ -21273,12 +21664,17 @@ def build_loss_defect_notification(
     if total_value > 0:
         lines.append(f"💰 Оценка по цене продажи: <b>{_format_money(total_value)}</b>")
     for index, item in enumerate(shown, start=1):
-        sku = item.get("sku_id") or item.get("barcode") or item.get("sku_title") or "—"
+        product_raw = str(item.get("product_title") or "—")
+        sku = _distinct_sku_for_display(
+            product_raw,
+            item.get("sku_id") or item.get("barcode") or item.get("sku_title"),
+        )
         lines.extend([
             "",
-            f"{index}. <b>{escape(_short_text(item.get('product_title'), 70))}</b>",
-            f"SKU: <code>{escape(_short_text(sku, 80))}</code>",
+            f"{index}. <b>{escape(_short_text(product_raw, 70))}</b>",
         ])
+        if sku:
+            lines.append(f"SKU: <code>{escape(_short_text(sku, 80))}</code>")
         if int(item.get("missing_delta") or 0) > 0:
             lines.append(
                 f"🧭 Потеряно: <b>+{int(item['missing_delta'])}</b> "
@@ -21421,8 +21817,12 @@ def _fbo_acceptance_items(products: list[dict[str, Any]]) -> list[dict[str, Any]
                 accepted_known = True
             difference = max(0.0, planned - accepted) if accepted_known else 0.0
             not_accepted = max(difference, explicit_rejected)
+            # The merged SKU object may contain its own generic ``title``.
+            # Prefer Uzum's documented product name and only use the parent
+            # product-card title as a compatibility fallback.
             title = str(
-                _value_by_path(source, "productTitle", "title", "product.name", "name")
+                _value_by_path(source, "productTitle")
+                or _value_by_path(product, "productTitle", "title", "product.name", "name")
                 or "Без названия"
             )
             sku = str(
@@ -21867,7 +22267,10 @@ def build_fbo_acceptance_pdf(
 
 
 async def check_loss_defect_once() -> None:
+    watcher_name = "Loss/defect watcher"
     for group in connected_watch_groups("notify_losses", "notify_defects"):
+        if _watcher_access_is_paused(watcher_name, group):
+            continue
         shop_id = int(group["shop_id"])
         telegram_ids = [int(value) for value in group["telegram_ids"]]
         try:
@@ -21875,9 +22278,11 @@ async def check_loss_defect_once() -> None:
             client = UzumClient(token, UZUM_API_BASE_URL)
             rows, unavailable_filters = await _load_all_time_loss_rows(client, shop_id)
             current = _loss_watch_snapshot(rows)
+            _watcher_access_resume(watcher_name, group)
         except Exception as error:
+            _watcher_access_pause(watcher_name, group, error)
             _log_watcher_api_failure(
-                "Loss/defect watcher",
+                watcher_name,
                 error,
                 shop_id=shop_id,
                 telegram_ids=telegram_ids,
@@ -21943,6 +22348,12 @@ async def check_loss_defect_once() -> None:
                         len(changes),
                     )
                     await asyncio.sleep(0.15)
+                except TelegramForbiddenError:
+                    logging.info(
+                        "Loss/defect watcher delivery paused user=%s shop=%s reason=bot_blocked",
+                        telegram_id,
+                        shop_id,
+                    )
                 except Exception:
                     logging.exception(
                         "Loss/defect watcher: delivery failed user=%s shop=%s",
@@ -21990,7 +22401,10 @@ _fbo_full_scan_at_by_group: dict[str, float] = {}
 
 
 async def check_fbo_acceptance_once() -> None:
+    watcher_name = "FBO acceptance watcher"
     for group in connected_watch_groups("notify_fbo_acceptance"):
+        if _watcher_access_is_paused(watcher_name, group):
+            continue
         shop_id = int(group["shop_id"])
         telegram_ids = [int(value) for value in group["telegram_ids"]]
         watch_key = _watch_group_key(group)
@@ -22018,6 +22432,7 @@ async def check_fbo_acceptance_once() -> None:
                 max_pages=invoice_pages,
                 page_size=20,
             )
+            _watcher_access_resume(watcher_name, group)
             if full_scan:
                 _fbo_full_scan_at_by_group[watch_key] = time.monotonic()
                 logging.info(
@@ -22028,8 +22443,9 @@ async def check_fbo_acceptance_once() -> None:
                     FBO_ACCEPTANCE_FULL_SCAN_INTERVAL_SECONDS,
                 )
         except Exception as error:
+            _watcher_access_pause(watcher_name, group, error)
             _log_watcher_api_failure(
-                "FBO acceptance watcher invoice list",
+                watcher_name,
                 error,
                 shop_id=shop_id,
                 telegram_ids=telegram_ids,
@@ -22176,6 +22592,8 @@ async def check_fbo_acceptance_once() -> None:
                                 caption=text,
                                 reply_markup=main_menu_for_user(telegram_id),
                             )
+                        except TelegramForbiddenError:
+                            raise
                         except Exception:
                             logging.exception(
                                 "FBO acceptance PDF failed; sending text fallback user=%s shop=%s invoice=%s",
@@ -22212,6 +22630,13 @@ async def check_fbo_acceptance_once() -> None:
                         summary.get("outcome"),
                     )
                     await asyncio.sleep(0.2)
+                except TelegramForbiddenError:
+                    logging.info(
+                        "FBO acceptance delivery paused user=%s shop=%s invoice=%s reason=bot_blocked",
+                        telegram_id,
+                        shop_id,
+                        _invoice_id(invoice),
+                    )
                 except Exception:
                     logging.exception(
                         "FBO acceptance watcher: delivery failed user=%s shop=%s invoice=%s",
@@ -22630,10 +23055,10 @@ SALE_WATCH_BASELINE_PAGES = max(
 SALE_WATCH_PAGE_SIZE = max(
     20, min(100, int(os.getenv("SALE_WATCH_PAGE_SIZE", "100") or "100"))
 )
-# Finance /v1/finance/orders does not document a status filter.  Older builds
-# sent statuses=CANCELLED/CANCELED/... and received repeated HTTP 400 responses.
-# Cancellation changes are now detected from normal Finance rows, with a deeper
-# unfiltered scan at a low frequency for older orders.
+# Current Finance Swagger has an optional ``statuses`` filter, but older/live
+# deployments rejected several legacy values (for example CANCELLED instead of
+# CANCELED) and combinations. Cancellation changes are therefore detected from
+# normal unfiltered rows, with a deeper low-frequency scan for older orders.
 CANCEL_WATCH_DEEP_SCAN_INTERVAL_SECONDS = max(
     900,
     int(os.getenv("CANCEL_WATCH_DEEP_SCAN_INTERVAL_SECONDS", "3600") or "3600"),
@@ -22671,8 +23096,8 @@ LOSS_REPORT_FILTERS = tuple(
     for value in os.getenv("LOSS_REPORT_FILTERS", "ALL,ARCHIVE,DEFECTED").replace(";", ",").split(",")
     if value.strip()
 ) or ("ALL", "ARCHIVE", "DEFECTED")
-# Kept only as an in-memory scheduler.  No unsupported status query parameters
-# are sent to Uzum Finance API.
+# Kept only as an in-memory scheduler. No optional status query parameters are
+# needed for this scan.
 _CANCEL_DEEP_SCAN_LAST_ATTEMPT: dict[int, float] = {}
 
 
@@ -23009,16 +23434,16 @@ def _build_sales_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
         revenue += amount
         units += qty
 
-        sku = _finance_variant_key(item) or _finance_title(item)
-        if sku not in products:
-            products[sku] = {
-                "title": _finance_title(item),
-                "sku": sku,
+        title = _finance_product_title(item)
+        product_key = _finance_product_group_key(item, title)
+        if product_key not in products:
+            products[product_key] = {
+                "title": title,
                 "qty": 0.0,
                 "revenue": 0.0,
             }
-        products[sku]["qty"] = float(products[sku]["qty"]) + qty
-        products[sku]["revenue"] = float(products[sku]["revenue"]) + amount
+        products[product_key]["qty"] = float(products[product_key]["qty"]) + qty
+        products[product_key]["revenue"] = float(products[product_key]["revenue"]) + amount
 
     top_products = sorted(
         products.values(),
@@ -23090,24 +23515,32 @@ def _build_noorza_today_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
         payout_total += max(0.0, payout)
         withdrawn += _finance_withdrawn(item)
 
-        sku = _finance_variant_key(item) or "—"
+        title = _finance_product_title(item)
+        product_key = _finance_product_group_key(item, title)
         product = products.setdefault(
-            sku,
+            product_key,
             {
-                "title": _finance_title(item),
-                "sku": _finance_sku_title(item),
+                "title": title,
                 "qty": 0.0,
                 "revenue": 0.0,
                 "payout": 0.0,
+                "_variants": set(),
             },
         )
+        variant = _distinct_sku_for_display(title, _finance_sku_title(item))
+        if variant:
+            product["_variants"].add(variant.casefold())
         product["qty"] = float(product["qty"]) + qty
         product["revenue"] = float(product["revenue"]) + gross
         product["payout"] = float(product["payout"]) + max(0.0, payout)
 
     orders = len(order_keys)
+    product_values = list(products.values())
+    for product in product_values:
+        variants = product.pop("_variants", set())
+        product["variant_count"] = max(1, len(variants))
     top_products = sorted(
-        products.values(),
+        product_values,
         key=lambda value: float(value.get("revenue") or 0),
         reverse=True,
     )[:5]
@@ -23149,9 +23582,15 @@ def _build_unit_rows_from_finance(
         qty = _finance_qty(item)
         if qty <= 0 or _is_returned_status(status):
             continue
-        key = _unit_group_key(item)
+        title = _finance_product_title(item)
+        key = _finance_product_group_key(item, title)
         if not key:
             continue
+        variant_key = _finance_variant_key(item) or f"row:{finance_identity_key(item)}"
+        variant_label = _distinct_sku_for_display(
+            title,
+            _finance_sku_title(item),
+        )
 
         revenue = _finance_gross_revenue(item)
         commission = _finance_commission(item)
@@ -23165,8 +23604,8 @@ def _build_unit_rows_from_finance(
         entry = groups.setdefault(
             key,
             {
-                "sku": _finance_sku_title(item),
-                "title": _finance_title(item),
+                "sku": variant_label,
+                "title": title,
                 "qty": 0.0,
                 "revenue": 0.0,
                 "commission": 0.0,
@@ -23184,9 +23623,15 @@ def _build_unit_rows_from_finance(
                 "missing_cost_qty": 0.0,
                 "cost_sources": set(),
                 "schemes": set(),
+                "variants": set(),
+                "variant_labels": set(),
+                "missing_variants": set(),
                 "profit": None,
             },
         )
+        entry["variants"].add(variant_key)
+        if variant_label:
+            entry["variant_labels"].add(variant_label)
         entry["qty"] += qty
         entry["revenue"] += revenue
         entry["commission"] += commission
@@ -23207,6 +23652,7 @@ def _build_unit_rows_from_finance(
                 entry["cost_sources"].add(cost_source)
         else:
             entry["missing_cost_qty"] += qty
+            entry["missing_variants"].add(variant_key)
 
     for entry in groups.values():
         known_qty = float(entry.get("known_cost_qty") or 0)
@@ -23225,6 +23671,13 @@ def _build_unit_rows_from_finance(
             entry["net_margin"] = None
             entry["roi"] = None
         entry["cost_complete"] = float(entry.get("missing_cost_qty") or 0) <= 0
+        variants = set(entry.pop("variants", set()))
+        variant_labels = sorted(entry.pop("variant_labels", set()), key=str.casefold)
+        missing_variants = set(entry.pop("missing_variants", set()))
+        entry["variant_count"] = max(1, len(variants))
+        entry["missing_variant_count"] = len(missing_variants)
+        entry["known_variant_count"] = max(0, len(variants - missing_variants))
+        entry["sku"] = variant_labels[0] if len(variant_labels) == 1 else ""
         sources = sorted(entry.pop("cost_sources", set()))
         entry["cost_source"] = ",".join(sources) if sources else None
         schemes = sorted(entry.pop("schemes", set()))
@@ -23239,6 +23692,11 @@ def _normalized_finance_piece(
     qty: float,
     revenue: float,
 ) -> dict[str, Any]:
+    product_title = _finance_title(item)
+    sku_title = _distinct_sku_for_display(
+        product_title,
+        _finance_sku_title(item),
+    )
     gross_net = _finance_gross_revenue(item)
     commission = _finance_commission(item)
     logistics = _finance_logistics(item)
@@ -23266,8 +23724,8 @@ def _normalized_finance_piece(
         "kind": kind,
         "status": _finance_status(item),
         "order_id": _finance_order_key_for_stats(item),
-        "title": _finance_title(item),
-        "sku": _finance_sku_title(item),
+        "title": product_title,
+        "sku": sku_title,
         "qty": max(0.0, qty),
         "revenue": max(0.0, revenue),
         "commission": max(0.0, piece_commission),
@@ -23357,8 +23815,10 @@ def build_new_sale_message(
     lang: str = "ru",
 ) -> str:
     lang = normalize_lang(lang)
-    title = escape(_finance_title(item))
-    sku = escape(_finance_sku_title(item))
+    title_raw = _finance_title(item)
+    title = escape(title_raw)
+    sku_raw = _distinct_sku_for_display(title_raw, _finance_sku_title(item))
+    sku = escape(sku_raw)
     qty = _finance_qty(item)
     unit_price = _finance_unit_price(item)
     total = _finance_gross_revenue(item)
@@ -23372,11 +23832,12 @@ def build_new_sale_message(
 
     if lang == "uz":
         shop_line = f"🏪 Do‘kon: <code>{shop_id}</code>\n" if shop_id is not None else ""
+        sku_line = f"🔖 Variant / SKU: <code>{sku}</code>\n" if sku else ""
         return (
             "🛒 <b>Yangi savdo</b>\n\n"
             + shop_line
             + f"📦 Tovar: <b>{title}</b>\n"
-            + f"🔖 SKU: <code>{sku}</code>\n"
+            + sku_line
             + f"🔢 Soni: <b>{qty:g} dona</b>\n\n"
             + f"💵 Dona narxi: <b>{_format_money(float(unit_price or 0))}</b>\n"
             + f"💰 Jami: <b>{_format_money(total)}</b>\n"
@@ -23389,11 +23850,12 @@ def build_new_sale_message(
         )
 
     shop_line = f"🏪 Магазин: <code>{shop_id}</code>\n" if shop_id is not None else ""
+    sku_line = f"🔖 Вариант / SKU: <code>{sku}</code>\n" if sku else ""
     return (
         "🛒 <b>Новая продажа</b>\n\n"
         + shop_line
         + f"📦 Товар: <b>{title}</b>\n"
-        + f"🔖 SKU: <code>{sku}</code>\n"
+        + sku_line
         + f"🔢 Кол-во: <b>{qty:g} шт.</b>\n\n"
         + f"💵 Цена за 1 шт.: <b>{_format_money(float(unit_price or 0))}</b>\n"
         + f"💰 Сумма: <b>{_format_money(total)}</b>\n"
@@ -23461,8 +23923,10 @@ def build_cancel_message(
     cancel_qty: float | None = None,
 ) -> str:
     lang = normalize_lang(lang)
-    title = escape(_finance_title(item))
-    sku = escape(_finance_sku_title(item))
+    title_raw = _finance_title(item)
+    title = escape(title_raw)
+    sku_raw = _distinct_sku_for_display(title_raw, _finance_sku_title(item))
+    sku = escape(sku_raw)
     qty = _finance_cancelled_qty(item) if cancel_qty is None else max(0.0, float(cancel_qty))
     unit_price = _finance_unit_price(item)
     total = _finance_gross_for_qty(item, qty)
@@ -23476,11 +23940,12 @@ def build_cancel_message(
 
     if lang == "uz":
         shop_line = f"🏪 Do‘kon: <code>{shop_id}</code>\n" if shop_id is not None else ""
+        sku_line = f"🔖 Variant / SKU: <code>{sku}</code>\n" if sku else ""
         return (
             "❌ <b>Buyurtma bekor qilindi</b>\n\n"
             + shop_line
             + f"📦 Tovar: <b>{title}</b>\n"
-            + f"🔖 SKU: <code>{sku}</code>\n"
+            + sku_line
             + f"🔢 Bekor qilindi: {qty_text_uz}\n"
             + f"🚚 Sxema: <b>{scheme}</b>\n"
             + f"💬 Sabab: <b>{reason}</b>\n\n"
@@ -23492,11 +23957,12 @@ def build_cancel_message(
         )
 
     shop_line = f"🏪 Магазин: <code>{shop_id}</code>\n" if shop_id is not None else ""
+    sku_line = f"🔖 Вариант / SKU: <code>{sku}</code>\n" if sku else ""
     return (
         "❌ <b>Отмена заказа</b>\n\n"
         + shop_line
         + f"📦 Товар: <b>{title}</b>\n"
-        + f"🔖 SKU: <code>{sku}</code>\n"
+        + sku_line
         + f"🔢 Отменено: {qty_text_ru}\n"
         + f"🚚 Схема: <b>{scheme}</b>\n"
         + f"💬 Причина: <b>{reason}</b>\n\n"
@@ -23808,7 +24274,7 @@ def build_sale_digest_message(
         if products:
             lines.append("\n🏆 <b>Top tovarlar:</b>")
             for product in products:
-                title = escape(_short_text(str(product.get("title") or product.get("sku") or "—"), 55))
+                title = escape(_short_text(str(product.get("title") or "—"), 55))
                 lines.append(
                     f"• {title}: {float(product.get('qty') or 0):g} dona — "
                     f"<b>{_format_money(float(product.get('revenue') or 0))}</b>"
@@ -23828,7 +24294,7 @@ def build_sale_digest_message(
     if products:
         lines.append("\n🏆 <b>Топ товаров:</b>")
         for product in products:
-            title = escape(_short_text(str(product.get("title") or product.get("sku") or "—"), 55))
+            title = escape(_short_text(str(product.get("title") or "—"), 55))
             lines.append(
                 f"• {title}: {float(product.get('qty') or 0):g} шт. — "
                 f"<b>{_format_money(float(product.get('revenue') or 0))}</b>"
@@ -23891,6 +24357,8 @@ async def _deliver_pending_notifications() -> None:
             telegram_id = int(row["telegram_id"])
             shop_id = int(row["shop_id"])
             event_type = str(row["event_type"])
+            if not telegram_delivery_allowed(telegram_id):
+                continue
             required_feature = (
                 "sales_notifications"
                 if event_type in {"sale", "sale_digest"}
@@ -23958,6 +24426,14 @@ async def _deliver_pending_notifications() -> None:
                 row.get("event_key"),
             )
             await asyncio.sleep(0.12)
+        except TelegramForbiddenError as exc:
+            telegram_id = int(row.get("telegram_id") or 0)
+            mark_telegram_delivery_blocked(telegram_id, exc)
+            logging.warning(
+                "Notification outbox paused user=%s reason=bot_blocked",
+                telegram_id,
+            )
+            continue
         except Exception as exc:
             _mark_notification_failed(
                 notification_id,
@@ -23984,68 +24460,111 @@ async def _load_finance_watch_pages(
     date_from_ms = int((now - timedelta(days=SALE_WATCH_LOOKBACK_DAYS)).timestamp() * 1000)
     date_to_ms = int(now.timestamp() * 1000)
     max_pages = SALE_WATCH_BASELINE_PAGES if baseline else SALE_WATCH_MAX_PAGES
+    successful_attempts = 0
+    first_error: Exception | None = None
+    range_mismatch_seen = False
 
-    result: list[dict[str, Any]] = []
-    seen_rows: set[str] = set()
-    consecutive_known_pages = 0
-    for page in range(max_pages):
-        data = await _finance_orders_request(
-            client,
-            shop_id,
-            date_from_ms=date_from_ms,
-            date_to_ms=date_to_ms,
-            page=page,
-            size=SALE_WATCH_PAGE_SIZE,
-        )
-        items = _deep_items(data)
-        if not items:
-            break
+    for date_mode in ("compatibility", "milliseconds"):
+        result: list[dict[str, Any]] = []
+        seen_rows: set[str] = set()
+        consecutive_known_pages = 0
+        range_mismatch = False
+        try:
+            for page in range(max_pages):
+                data = await _finance_orders_request(
+                    client,
+                    shop_id,
+                    date_from_ms=date_from_ms,
+                    date_to_ms=date_to_ms,
+                    date_mode=date_mode,
+                    page=page,
+                    size=SALE_WATCH_PAGE_SIZE,
+                )
+                items = _deep_items(data)
+                if not items:
+                    break
+                if _finance_rows_outside_requested_window(
+                    items,
+                    date_from_ms,
+                    date_to_ms,
+                ):
+                    range_mismatch = True
+                    logging.warning(
+                        "Finance watcher timestamp mode rejected shop=%s mode=%s: rows outside requested range",
+                        shop_id,
+                        date_mode,
+                    )
+                    break
 
-        page_ids: list[str] = []
-        for item in items:
-            identity = finance_identity_key(item)
-            signature = (
-                f"{identity}|{_finance_status(item)}|"
-                f"{_finance_cancelled_qty(item)}|{_finance_return_qty(item)}"
+                page_ids: list[str] = []
+                for item in items:
+                    identity = finance_identity_key(item)
+                    signature = (
+                        f"{identity}|{_finance_status(item)}|"
+                        f"{_finance_cancelled_qty(item)}|{_finance_return_qty(item)}"
+                    )
+                    if signature in seen_rows:
+                        continue
+                    seen_rows.add(signature)
+                    page_ids.append(identity)
+                    result.append(item)
+
+                if known_identities and page_ids and all(
+                    value in known_identities for value in page_ids
+                ):
+                    consecutive_known_pages += 1
+                else:
+                    consecutive_known_pages = 0
+
+                if len(items) < SALE_WATCH_PAGE_SIZE:
+                    break
+                if not baseline and consecutive_known_pages >= 2:
+                    break
+                await asyncio.sleep(0.04)
+        except Exception as error:
+            if _uzum_access_error_kind(error) or _is_uzum_rate_limit_error(error):
+                raise
+            first_error = first_error or error
+            logging.info(
+                "Finance watcher timestamp attempt failed shop=%s mode=%s: %s",
+                shop_id,
+                date_mode,
+                error,
             )
-            if signature in seen_rows:
-                continue
-            seen_rows.add(signature)
-            page_ids.append(identity)
-            result.append(item)
+            continue
 
-        if known_identities and page_ids and all(value in known_identities for value in page_ids):
-            consecutive_known_pages += 1
-        else:
-            consecutive_known_pages = 0
+        if range_mismatch:
+            range_mismatch_seen = True
+            continue
+        successful_attempts += 1
+        if result:
+            if len(result) >= max_pages * SALE_WATCH_PAGE_SIZE:
+                logging.warning(
+                    "Finance watcher reached safety limit shop=%s rows=%s pages=%s",
+                    shop_id,
+                    len(result),
+                    max_pages,
+                )
+            return result
 
-        if len(items) < SALE_WATCH_PAGE_SIZE:
-            break
-        if not baseline and consecutive_known_pages >= 2:
-            break
-        await asyncio.sleep(0.04)
-
-    if len(result) >= max_pages * SALE_WATCH_PAGE_SIZE:
-        logging.warning(
-            "Finance watcher reached safety limit shop=%s rows=%s pages=%s",
-            shop_id,
-            len(result),
-            max_pages,
-        )
-    return result
+    if successful_attempts == 0 and first_error is not None:
+        raise first_error
+    if successful_attempts == 0 and range_mismatch_seen:
+        raise RuntimeError("Finance watcher received rows outside the requested period")
+    if successful_attempts < 2 and first_error is not None and "400" not in str(first_error):
+        raise first_error
+    return []
 
 
 async def _load_cancel_status_rows(
     client: UzumClient,
     shop_id: int,
 ) -> list[dict[str, Any]]:
-    """Periodically search older cancellations without unsupported filters.
+    """Periodically search older cancellations without optional filters.
 
-    Uzum's documented Finance endpoint accepts date/shop/pagination parameters,
-    but not ``statuses``.  We therefore load ordinary Finance pages and filter
-    cancellation rows locally.  The deep scan runs at most once per configured
-    interval for each shop, which avoids both HTTP 400 log spam and unnecessary
-    pressure that previously caused HTTP 429 responses.
+    Loading ordinary Finance pages and filtering locally avoids incompatibility
+    between status names used by different live deployments. The deep scan runs
+    at most once per configured interval for each shop.
     """
 
     now_mono = time.monotonic()
@@ -24065,37 +24584,39 @@ async def _load_cancel_status_rows(
     pages_loaded = 0
 
     try:
-        for page in range(CANCEL_WATCH_DEEP_SCAN_MAX_PAGES):
-            data = await _finance_orders_request(
-                client,
-                shop_id,
-                date_from_ms=date_from_ms,
-                date_to_ms=date_to_ms,
-                page=page,
-                size=SALE_WATCH_PAGE_SIZE,
+        finance_rows, _, source_info = await _load_finance_range_flexible(
+            client,
+            shop_id,
+            date_from_ms,
+            date_to_ms,
+            max_pages=CANCEL_WATCH_DEEP_SCAN_MAX_PAGES,
+            page_size=SALE_WATCH_PAGE_SIZE,
+        )
+        pages_loaded = max(
+            1,
+            min(
+                CANCEL_WATCH_DEEP_SCAN_MAX_PAGES,
+                math.ceil(len(finance_rows) / max(1, SALE_WATCH_PAGE_SIZE)),
+            ),
+        )
+        for item in finance_rows:
+            status = _finance_status(item)
+            cancelled_qty = _finance_cancelled_qty(item)
+            if not _has_cancel_event_status(status) and cancelled_qty <= 0:
+                continue
+            signature = (
+                f"{finance_identity_key(item)}|{_status_upper(status)}|"
+                f"{cancelled_qty:g}|{_finance_return_qty(item):g}"
             )
-            pages_loaded += 1
-            items = _deep_items(data)
-            if not items:
-                break
-
-            for item in items:
-                status = _finance_status(item)
-                cancelled_qty = _finance_cancelled_qty(item)
-                if not _has_cancel_event_status(status) and cancelled_qty <= 0:
-                    continue
-                signature = (
-                    f"{finance_identity_key(item)}|{_status_upper(status)}|"
-                    f"{cancelled_qty:g}|{_finance_return_qty(item):g}"
-                )
-                if signature in seen:
-                    continue
-                seen.add(signature)
-                rows.append(item)
-
-            if len(items) < SALE_WATCH_PAGE_SIZE:
-                break
-            await asyncio.sleep(0.08)
+            if signature in seen:
+                continue
+            seen.add(signature)
+            rows.append(item)
+        logging.debug(
+            "Cancel deep scan Finance source shop=%s source=%s",
+            shop_id,
+            source_info,
+        )
     except Exception as exc:
         if _is_uzum_rate_limit_error(exc):
             logging.warning(
@@ -24383,14 +24904,24 @@ async def _stock_rows_for_watch(
 
 
 async def check_low_stock_once() -> None:
+    watcher_name = "Stock watcher"
     for group in connected_watch_groups("notify_low_stock"):
+        if _watcher_access_is_paused(watcher_name, group):
+            continue
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(value) for value in group["telegram_ids"]]
         try:
             rows = await _stock_rows_for_watch(encrypted_token, shop_id)
-        except Exception:
-            logging.exception("Low stock watcher failed shop=%s", shop_id)
+            _watcher_access_resume(watcher_name, group)
+        except Exception as error:
+            _watcher_access_pause(watcher_name, group, error)
+            _log_watcher_api_failure(
+                watcher_name,
+                error,
+                shop_id=shop_id,
+                telegram_ids=telegram_ids,
+            )
             continue
 
         current = _minimal_stock_snapshot(rows)
@@ -24429,7 +24960,7 @@ async def check_low_stock_once() -> None:
             delivered = True
             if event_rows:
                 lines = [format_sku_stock_line(row, mode="all") for row in event_rows[:10]]
-                more = "" if len(event_rows) <= 10 else f"\n\nЕщё SKU: {len(event_rows) - 10}"
+                more = "" if len(event_rows) <= 10 else f"\n\nЕщё позиций: {len(event_rows) - 10}"
                 text = (
                     "📉 <b>Товар заканчивается</b>\n"
                     f"Магазин: <code>{shop_id}</code>\n"
@@ -24445,6 +24976,13 @@ async def check_low_stock_once() -> None:
                         text,
                         reply_markup=main_menu_for_user(telegram_id),
                     )
+                except TelegramForbiddenError:
+                    delivered = False
+                    logging.info(
+                        "Low stock delivery paused user=%s shop=%s reason=bot_blocked",
+                        telegram_id,
+                        shop_id,
+                    )
                 except Exception:
                     delivered = False
                     logging.exception("Low stock watcher send failed user=%s shop=%s", telegram_id, shop_id)
@@ -24455,14 +24993,24 @@ async def check_low_stock_once() -> None:
 
 
 async def check_out_of_stock_once() -> None:
+    watcher_name = "Stock watcher"
     for group in connected_watch_groups("notify_out_of_stock"):
+        if _watcher_access_is_paused(watcher_name, group):
+            continue
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(value) for value in group["telegram_ids"]]
         try:
             rows = await _stock_rows_for_watch(encrypted_token, shop_id)
-        except Exception:
-            logging.exception("Out-of-stock watcher failed shop=%s", shop_id)
+            _watcher_access_resume(watcher_name, group)
+        except Exception as error:
+            _watcher_access_pause(watcher_name, group, error)
+            _log_watcher_api_failure(
+                watcher_name,
+                error,
+                shop_id=shop_id,
+                telegram_ids=telegram_ids,
+            )
             continue
 
         current = _minimal_stock_snapshot(rows)
@@ -24494,7 +25042,7 @@ async def check_out_of_stock_once() -> None:
             delivered = True
             if event_rows:
                 lines = [format_sku_stock_line(row, mode="all") for row in event_rows[:10]]
-                more = "" if len(event_rows) <= 10 else f"\n\nЕщё SKU: {len(event_rows) - 10}"
+                more = "" if len(event_rows) <= 10 else f"\n\nЕщё позиций: {len(event_rows) - 10}"
                 text = (
                     "❌ <b>Товар закончился</b>\n"
                     f"Магазин: <code>{shop_id}</code>\n"
@@ -24509,6 +25057,13 @@ async def check_out_of_stock_once() -> None:
                         text,
                         reply_markup=main_menu_for_user(telegram_id),
                     )
+                except TelegramForbiddenError:
+                    delivered = False
+                    logging.info(
+                        "Out-of-stock delivery paused user=%s shop=%s reason=bot_blocked",
+                        telegram_id,
+                        shop_id,
+                    )
                 except Exception:
                     delivered = False
                     logging.exception("Out-of-stock watcher send failed user=%s shop=%s", telegram_id, shop_id)
@@ -24519,14 +25074,24 @@ async def check_out_of_stock_once() -> None:
 
 
 async def check_stock_change_once() -> None:
+    watcher_name = "Stock watcher"
     for group in connected_watch_groups("notify_stock_change"):
+        if _watcher_access_is_paused(watcher_name, group):
+            continue
         shop_id = int(group["shop_id"])
         encrypted_token = group["uzum_token_encrypted"]
         telegram_ids = [int(value) for value in group["telegram_ids"]]
         try:
             rows = await _stock_rows_for_watch(encrypted_token, shop_id)
-        except Exception:
-            logging.exception("Stock change watcher failed shop=%s", shop_id)
+            _watcher_access_resume(watcher_name, group)
+        except Exception as error:
+            _watcher_access_pause(watcher_name, group, error)
+            _log_watcher_api_failure(
+                watcher_name,
+                error,
+                shop_id=shop_id,
+                telegram_ids=telegram_ids,
+            )
             continue
 
         current = _minimal_stock_snapshot(rows)
@@ -24555,14 +25120,10 @@ async def check_stock_change_once() -> None:
                     or int(after.get("fbo") or 0) < int(before.get("fbo") or 0)
                     or int(after.get("fbs") or 0) < int(before.get("fbs") or 0)
                 ):
+                    source_row = rows_by_key.get(key)
                     before_display = {
                         **before,
-                        "title": (
-                            rows_by_key.get(key, {}).get("sku_full_title")
-                            or rows_by_key.get(key, {}).get("sku_title")
-                            or rows_by_key.get(key, {}).get("product_title")
-                            or key
-                        ),
+                        "title": _stock_row_title(source_row) if source_row else "—",
                     }
                     after_display = {
                         **after,
@@ -24580,7 +25141,7 @@ async def check_stock_change_once() -> None:
                 text = (
                     "📦 <b>Изменение остатков</b>\n"
                     f"Магазин: <code>{shop_id}</code>\n"
-                    "Уменьшился остаток по SKU.\n\n"
+                    "Уменьшился остаток товара.\n\n"
                     + "\n\n".join(lines)
                     + more
                     + "\n\nПроверить остатки: <code>/stock</code>"
@@ -24590,6 +25151,13 @@ async def check_stock_change_once() -> None:
                         telegram_id,
                         text,
                         reply_markup=main_menu_for_user(telegram_id),
+                    )
+                except TelegramForbiddenError:
+                    delivered = False
+                    logging.info(
+                        "Stock change delivery paused user=%s shop=%s reason=bot_blocked",
+                        telegram_id,
+                        shop_id,
                     )
                 except Exception:
                     delivered = False
@@ -24711,7 +25279,7 @@ async def _load_all_time_loss_rows(
     rows.sort(
         key=lambda row: (
             -(_loss_qty(row, "missing") + _loss_qty(row, "defected")),
-            str(row.get("product_title") or row.get("sku_full_title") or ""),
+            str(row.get("product_title") or ""),
         )
     )
     logging.info(
@@ -24791,7 +25359,7 @@ _cleanup_release_state()
 # Preserves per-user instant/hourly modes while using the durable outbox and
 # adaptive Finance pagination from RELEASE_HARDENING.
 # =============================================================================
-PREMIUM_RELEASE_VERSION = "2026.07.22-premium-r20-product-reports"
+PREMIUM_RELEASE_VERSION = "2026.07.22-premium-r21-product-title-stability"
 
 WATCHER_ACCESS_BACKOFF_SECONDS = max(
     300,
@@ -25091,6 +25659,8 @@ async def main() -> None:
     logging.info("PROFIT_BRIDGE_LOADED: revenue -> payout -> cost -> tax/expenses -> result")
     logging.info("FINANCE_UI_R18_LOADED: compact renewals + direct tax + Uzum storage + localized expenses")
     logging.info("REPORTS_UI_R19_LOADED: guided dates + summary-first PDF/Excel + neutral branding")
+    logging.info("PRODUCT_TITLE_R21_LOADED: Uzum productTitle canonical + distinct variant/SKU")
+    logging.info("DELIVERY_GUARD_R21_LOADED: blocked users paused + API failures never shown as zero")
     logging.info("FBO_ACCEPTANCE_RECONCILIATION_LOADED: invoice/product totals + stale-zero guard")
     logging.info("SELLER_REPORTS_LOADED: daily PDF/Excel + loss/damage claim documents")
     logging.info("LOGISTICS_REMINDERS_LOADED: FBO slots + return paid-storage deadlines")
@@ -25105,7 +25675,7 @@ async def main() -> None:
         )
     except RuntimeError as error:
         logging.warning("PDF_FONT_MISSING: %s", error)
-    logging.info("LEGACY_CANCEL_STATUS_FILTER_SCAN_DISABLED: finance orders are scanned without unsupported status parameters")
+    logging.info("LEGACY_CANCEL_STATUS_FILTER_SCAN_DISABLED: finance orders are scanned without optional status filters")
     logging.info("SKU_LABELS_INTERFACE_LOADED: official barcode types + PDF SKU labels")
     logging.info("STOCK_TRUTH_LOADED: SKU-level FBO/FBS totals + supply forecast")
     logging.info("PRODUCT_REPORTS_R20_LOADED: stock PDF + product-grouped sales ranking")
