@@ -66,6 +66,8 @@ from formatters import (
 from uzum_client import UzumClient
 from uzum_finance import (
     build_stock_records,
+    expense_display_name,
+    expense_display_source,
     expense_items,
     parse_api_datetime,
     return_reminder_bucket,
@@ -442,13 +444,12 @@ def build_premium_workbook(
         ws.append([_t(lang, "Доп. расходы Uzum", "Uzum qo‘shimcha xarajatlari"), "−", uzum_deductions, _t(lang, "Без комиссии и логистики", "Komissiya va logistikasiz")])
         ws.append([_t(lang, "Возвраты от Uzum", "Uzum qaytargan mablag‘"), "+", uzum_refunds, "Uzum Finance API"])
         ws.append([_t(lang, "Внешняя реклама", "Tashqi reklama"), "−", float(business_profit.get("advertising_expense") or 0), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi")])
-        ws.append([_t(lang, "Внешнее хранение", "Tashqi saqlash"), "−", float(business_profit.get("storage_expense") or 0), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi")])
         ws.append([_t(lang, "Другие внешние расходы", "Boshqa tashqi xarajat"), "−", float(business_profit.get("other_expense") or 0), _t(lang, "Настройка продавца", "Sotuvchi sozlamasi")])
         result_row = ws.max_row + 1
         ws.append([
             result_name,
             "=",
-            f"=C{profit_before_tax_row}-C{profit_before_tax_row + 1}-C{profit_before_tax_row + 2}+C{profit_before_tax_row + 3}-C{profit_before_tax_row + 4}-C{profit_before_tax_row + 5}-C{profit_before_tax_row + 6}",
+            f"=C{profit_before_tax_row}-C{profit_before_tax_row + 1}-C{profit_before_tax_row + 2}+C{profit_before_tax_row + 3}-C{profit_before_tax_row + 4}-C{profit_before_tax_row + 5}",
             _t(lang, "Итог по показанной формуле", "Ko‘rsatilgan formula bo‘yicha yakun"),
         ])
         end = ws.max_row
@@ -2529,24 +2530,20 @@ def build_subscription_action_digest(rows: list[dict[str, Any]], created: int = 
         key = str(row.get("milestone") or "")
         if key in counts:
             counts[key] += 1
-    lines = [subscription_action_line(row) for row in rows[:25]]
-    more = len(rows) - len(lines)
-    body = "\n\n".join(lines) if lines else "— сейчас действий нет"
-    if more > 0:
-        body += f"\n\nЕщё записей: <b>{more}</b>"
+    total = len(rows)
+    if not total:
+        return (
+            "🔐 <b>Контроль подписок</b>\n\n"
+            "✅ Сейчас нет подписок, требующих внимания."
+        )
+    new_line = f"\n🆕 Новых сегодня: <b>{created}</b>" if created else ""
     return (
         "🔐 <b>Контроль подписок</b>\n\n"
-        f"🚨 Уже закончились: <b>{counts['expired']}</b>\n"
-        f"🔴 До 1 дня: <b>{counts['d1']}</b>\n"
-        f"🟠 До 3 дней: <b>{counts['d3']}</b>\n"
-        f"🟡 До 7 дней: <b>{counts['d7']}</b>\n"
-        f"🆕 Новых черновиков: <b>{created}</b>\n\n"
-        f"{body}\n\n"
-        "<b>Что делать:</b>\n"
-        "1. Откройте черновик командой <code>/reminder НОМЕР</code>.\n"
-        "2. Проверьте текст и дату.\n"
-        "3. Отправьте его кнопкой подтверждения или отклоните.\n\n"
-        "Без вашего нажатия клиенту ничего не отправляется, подписка не продлевается и не блокируется."
+        f"Всего требуют внимания: <b>{total}</b>\n"
+        f"🚨 Просрочены: <b>{counts['expired']}</b>  ·  🔴 до 1 дня: <b>{counts['d1']}</b>\n"
+        f"🟠 до 3 дней: <b>{counts['d3']}</b>  ·  🟡 до 7 дней: <b>{counts['d7']}</b>"
+        f"{new_line}\n\n"
+        "Выберите клиента кнопкой ниже. Ничего не отправится без вашего подтверждения."
     )
 
 
@@ -2651,7 +2648,6 @@ PRODUCT_SETTING_FIELDS = {
 FINANCE_SETTING_FIELDS = {
     "tax_percent",
     "advertising_monthly",
-    "storage_monthly",
     "other_monthly",
 }
 
@@ -4241,7 +4237,7 @@ NOTIFY_MENU_UZ = ReplyKeyboardMarkup(
 
 REPORT_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📋 Дневной отчёт")],
+        [KeyboardButton(text="📊 Отчёт по товарам")],
         [KeyboardButton(text="📄 PDF-отчёт"), KeyboardButton(text="📊 Excel-отчёт")],
         [KeyboardButton(text="🌙 Краткий отчёт"), KeyboardButton(text="💰 Прибыль")],
         [KeyboardButton(text="📈 Эффект рекомендаций"), KeyboardButton(text="📅 Автоотчёты")],
@@ -4253,7 +4249,7 @@ REPORT_MENU_RU = ReplyKeyboardMarkup(
 
 REPORT_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="📋 Kunlik hisobot")],
+        [KeyboardButton(text="📊 Tovarlar hisoboti")],
         [KeyboardButton(text="📄 PDF hisobot"), KeyboardButton(text="📊 Excel hisobot")],
         [KeyboardButton(text="🌙 Qisqa hisobot"), KeyboardButton(text="💰 Foyda")],
         [KeyboardButton(text="📈 Tavsiyalar ta’siri"), KeyboardButton(text="📅 Avtohisobotlar")],
@@ -4267,7 +4263,7 @@ SETTINGS_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🔔 Уведомления")],
         [KeyboardButton(text="🏪 Магазины"), KeyboardButton(text="🌐 Язык")],
-        [KeyboardButton(text="💰 Себестоимость и расходы"), KeyboardButton(text="🚚 Настройки поставки")],
+        [KeyboardButton(text="💰 Налог и расходы"), KeyboardButton(text="🚚 Настройки поставки")],
         [KeyboardButton(text="🔐 API и подключение"), KeyboardButton(text="🌐 Веб-кабинет")],
         [KeyboardButton(text="ℹ️ Помощь"), KeyboardButton(text="💎 Подписка")],
         [KeyboardButton(text="🏠 Главное")],
@@ -4280,7 +4276,7 @@ SETTINGS_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="🔔 Xabarnomalar")],
         [KeyboardButton(text="🏪 Do‘konlar"), KeyboardButton(text="🌐 Til")],
-        [KeyboardButton(text="💰 Tannarx va xarajat"), KeyboardButton(text="🚚 Yetkazish sozlamalari")],
+        [KeyboardButton(text="💰 Soliq va xarajatlar"), KeyboardButton(text="🚚 Yetkazish sozlamalari")],
         [KeyboardButton(text="🔐 API va ulanish"), KeyboardButton(text="🌐 Veb-kabinet")],
         [KeyboardButton(text="ℹ️ Yordam"), KeyboardButton(text="💎 Obuna")],
         [KeyboardButton(text="🏠 Asosiy")],
@@ -4291,9 +4287,9 @@ SETTINGS_MENU_UZ = ReplyKeyboardMarkup(
 
 FINANCE_MENU_RU = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔄 Себестоимость Uzum"), KeyboardButton(text="🧾 Расходы Uzum")],
-        [KeyboardButton(text="🧮 Расходы и налоги"), KeyboardButton(text="💰 Прибыль")],
-        [KeyboardButton(text="🧾 Юнит-экономика")],
+        [KeyboardButton(text="🏛 Налоговая ставка"), KeyboardButton(text="🧾 Расходы Uzum")],
+        [KeyboardButton(text="🔄 Себестоимость Uzum"), KeyboardButton(text="💰 Прибыль")],
+        [KeyboardButton(text="📣 Внешние расходы"), KeyboardButton(text="🧾 Юнит-экономика")],
         [KeyboardButton(text="⬅️ Настройки"), KeyboardButton(text="🏠 Главное")],
     ],
     resize_keyboard=True,
@@ -4302,9 +4298,9 @@ FINANCE_MENU_RU = ReplyKeyboardMarkup(
 
 FINANCE_MENU_UZ = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text="🔄 Uzum tannarxi"), KeyboardButton(text="🧾 Uzum xarajatlari")],
-        [KeyboardButton(text="🧮 Xarajat va soliq"), KeyboardButton(text="💰 Foyda")],
-        [KeyboardButton(text="🧾 Unit iqtisodiyot")],
+        [KeyboardButton(text="🏛 Soliq stavkasi"), KeyboardButton(text="🧾 Uzum xarajatlari")],
+        [KeyboardButton(text="🔄 Uzum tannarxi"), KeyboardButton(text="💰 Foyda")],
+        [KeyboardButton(text="📣 Tashqi xarajatlar"), KeyboardButton(text="🧾 Unit iqtisodiyot")],
         [KeyboardButton(text="⬅️ Sozlamalar"), KeyboardButton(text="🏠 Asosiy")],
     ],
     resize_keyboard=True,
@@ -4649,9 +4645,9 @@ def _section_text_and_markup(
         return text, attention_menu_for_user(telegram_id)
     if section == "reports":
         text = (
-            "📊 <b>Hisobotlar</b>\nPDF, Excel, foyda va tayyor hisobotlar 👇"
+            "📊 <b>Hisobotlar</b>\n«Tovarlar hisoboti» Market Plus kabi tovarlar jadvalini PDF va Excelda yaratadi 👇"
             if lang == "uz"
-            else "📊 <b>Отчёты</b>\nPDF, Excel, прибыль и готовые отчёты 👇"
+            else "📊 <b>Отчёты</b>\n«Отчёт по товарам» создаёт таблицу как в Market Plus сразу в PDF и Excel 👇"
         )
         return text, report_menu_for_user(telegram_id)
     text = "🏠 <b>Asosiy menyu</b>" if lang == "uz" else "🏠 <b>Главное меню</b>"
@@ -10231,18 +10227,52 @@ async def check_connection(message: Message) -> None:
     await message.answer("\n".join(lines), reply_markup=menu_for_message(message))
 
 
-def subscription_queue_markup(rows: list[dict[str, Any]]) -> InlineKeyboardMarkup | None:
-    buttons = []
-    for row in rows[:10]:
+def subscription_queue_markup(
+    rows: list[dict[str, Any]],
+    *,
+    page: int = 0,
+    page_size: int = 5,
+) -> InlineKeyboardMarkup | None:
+    if not rows:
+        return None
+    safe_page_size = max(1, min(8, int(page_size)))
+    total_pages = max(1, math.ceil(len(rows) / safe_page_size))
+    safe_page = max(0, min(int(page), total_pages - 1))
+    start = safe_page * safe_page_size
+    buttons: list[list[InlineKeyboardButton]] = []
+    milestone_emoji = {"expired": "🚨", "d1": "🔴", "d3": "🟠", "d7": "🟡"}
+    for row in rows[start : start + safe_page_size]:
         queue_id = int(row.get("id") or 0)
         label = _renewal_user_label(row)
+        until = _fmt_dt(row.get("active_until")).split(" ", 1)[0]
+        emoji = milestone_emoji.get(str(row.get("milestone") or ""), "▫️")
         buttons.append([
             InlineKeyboardButton(
-                text=f"👁 #{queue_id} · {label}"[:60],
+                text=f"{emoji} {label} · до {until}"[:60],
                 callback_data=f"renewal_preview:{queue_id}",
             )
         ])
-    return InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+    if total_pages > 1:
+        navigation: list[InlineKeyboardButton] = []
+        if safe_page > 0:
+            navigation.append(
+                InlineKeyboardButton(text="⬅️", callback_data=f"renewal_page:{safe_page - 1}")
+            )
+        navigation.append(
+            InlineKeyboardButton(
+                text=f"{safe_page + 1}/{total_pages}",
+                callback_data=f"renewal_page:{safe_page}",
+            )
+        )
+        if safe_page + 1 < total_pages:
+            navigation.append(
+                InlineKeyboardButton(text="➡️", callback_data=f"renewal_page:{safe_page + 1}")
+            )
+        buttons.append(navigation)
+    buttons.append([
+        InlineKeyboardButton(text="🔄 Обновить", callback_data=f"renewal_page:{safe_page}")
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def subscription_reminder_review_markup(queue_id: int) -> InlineKeyboardMarkup:
@@ -10285,11 +10315,34 @@ async def admin_expiring(message: Message) -> None:
     if not admin_only(admin_id):
         return
     summary = refresh_subscription_reminder_queue()
-    rows = list_pending_subscription_reminders(100)
+    rows = list_pending_subscription_reminders(500)
     await message.answer(
         build_subscription_action_digest(rows, int(summary.get("created") or 0)),
         reply_markup=subscription_queue_markup(rows) or admin_menu_for_message(message),
     )
+
+
+@dp.callback_query(F.data.startswith("renewal_page:"))
+async def subscription_queue_page_callback(callback: CallbackQuery) -> None:
+    admin_id = int(callback.from_user.id) if callback.from_user else 0
+    if not admin_only(admin_id):
+        await callback.answer("Только для администратора", show_alert=True)
+        return
+    raw_page = str(callback.data or "").split(":", 1)[-1]
+    if not raw_page.isdigit():
+        await callback.answer("Некорректная страница", show_alert=True)
+        return
+    summary = refresh_subscription_reminder_queue()
+    rows = list_pending_subscription_reminders(500)
+    page_size = 5
+    max_page = max(0, math.ceil(len(rows) / page_size) - 1)
+    page = min(int(raw_page), max_page)
+    if callback.message:
+        await callback.message.edit_text(
+            build_subscription_action_digest(rows, int(summary.get("created") or 0)),
+            reply_markup=subscription_queue_markup(rows, page=page, page_size=page_size),
+        )
+    await callback.answer("Обновлено")
 
 
 @dp.message(Command("reminder"))
@@ -13153,7 +13206,11 @@ async def button_notifications_section_simple(message: Message) -> None:
 async def button_reports_section_simple(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     lang = get_user_language(telegram_id)
-    text = "📊 <b>Hisobotlar</b>\nPDF, Excel, foyda va tayyor hisobotlar 👇" if lang == "uz" else "📊 <b>Отчёты</b>\nPDF, Excel, прибыль и готовые отчёты 👇"
+    text = (
+        "📊 <b>Hisobotlar</b>\n«Tovarlar hisoboti» Market Plus kabi tovarlar jadvalini PDF va Excelda yaratadi 👇"
+        if lang == "uz"
+        else "📊 <b>Отчёты</b>\n«Отчёт по товарам» создаёт таблицу как в Market Plus сразу в PDF и Excel 👇"
+    )
     await message.answer(text, reply_markup=report_menu_for_message(message))
 
 
@@ -13167,13 +13224,20 @@ async def button_important_now(message: Message) -> None:
     await business_control_center(message)
 
 
-@dp.message(F.text.in_({"🧮 Финансы", "🧮 Moliya", "💰 Себестоимость и расходы", "💰 Tannarx va xarajat"}))
+@dp.message(F.text.in_({
+    "🧮 Финансы",
+    "🧮 Moliya",
+    "💰 Себестоимость и расходы",
+    "💰 Tannarx va xarajat",
+    "💰 Налог и расходы",
+    "💰 Soliq va xarajatlar",
+}))
 async def button_finance_section(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     text = (
-        "🧮 <b>Moliya</b>\nTannarx, xarajatlar va haqiqiy foydani boshqaring."
+        "🧮 <b>Moliya</b>\nSoliq stavkasi, Uzum xarajatlari va haqiqiy foyda shu yerda."
         if get_user_language(telegram_id) == "uz"
-        else "🧮 <b>Финансы</b>\nСебестоимость, расходы и реальная прибыль — в одном месте."
+        else "🧮 <b>Финансы</b>\nЗдесь выбирается налоговая ставка, показываются расходы Uzum и реальная прибыль."
     )
     await message.answer(text, reply_markup=finance_menu_for_message(message))
 
@@ -15593,7 +15657,12 @@ def _requested_daily_report_date(text: str, *, now: datetime | None = None) -> d
 
 
 @dp.message(Command("market_report", "daily_finance_report", "seller_daily"))
-@dp.message(F.text.in_({"📋 Дневной отчёт", "📋 Kunlik hisobot"}))
+@dp.message(F.text.in_({
+    "📋 Дневной отчёт",
+    "📋 Kunlik hisobot",
+    "📊 Отчёт по товарам",
+    "📊 Tovarlar hisoboti",
+}))
 async def market_style_daily_report(message: Message) -> None:
     telegram_id = upsert_from_message(message)
     if not await require_active_subscription(message, telegram_id):
@@ -16449,7 +16518,10 @@ def calculate_business_profit(
     tax_expense = tax_basis_revenue * tax_percent / 100.0
     full_period_tax_expense = revenue * tax_percent / 100.0
     advertising = max(0.0, float(settings.get("advertising_monthly") or 0)) * period_ratio
-    storage = max(0.0, float(settings.get("storage_monthly") or 0)) * period_ratio
+    # Paid storage is loaded from the booked Uzum expense ledger below.  Keep
+    # the legacy value only for transparency and never deduct it a second time.
+    legacy_storage = max(0.0, float(settings.get("storage_monthly") or 0)) * period_ratio
+    storage = 0.0
     other = max(0.0, float(settings.get("other_monthly") or 0)) * period_ratio
     expense_summary = dict(uzum_expenses or {})
     uzum_expenses_available = bool(expense_summary.get("available", uzum_expenses is None))
@@ -16490,6 +16562,7 @@ def calculate_business_profit(
         "cost_total": cost_total,
         "known_profit": known_profit,
         "tax_expense": tax_expense,
+        "tax_percent": tax_percent,
         "full_period_tax_expense": full_period_tax_expense,
         "tax_basis_revenue": tax_basis_revenue,
         "uzum_expense_total": uzum_expense_total,
@@ -16505,6 +16578,7 @@ def calculate_business_profit(
         "uzum_expenses_available": uzum_expenses_available,
         "advertising_expense": advertising,
         "storage_expense": storage,
+        "legacy_storage_expense_ignored": legacy_storage,
         "other_expense": other,
         "external_expense_total": external_expense_total,
         "operating_expenses": (
@@ -16560,6 +16634,19 @@ def _format_profit_bridge_lines(
             if uz
             else f"4а. + Корректировка выплаты Uzum: <b>{_format_money(payout_adjustment)}</b>"
         )
+    uzum_breakdown_values = (
+        float(business.get("uzum_storage_expense") or 0),
+        float(business.get("uzum_advertising_expense") or 0),
+        float(business.get("uzum_penalty_expense") or 0),
+        float(business.get("uzum_other_expense") or 0),
+    )
+    uzum_breakdown = (
+        f"   ↳ saqlash: {_format_money(uzum_breakdown_values[0])} · reklama: {_format_money(uzum_breakdown_values[1])} · "
+        f"jarima: {_format_money(uzum_breakdown_values[2])} · boshqa: {_format_money(uzum_breakdown_values[3])}"
+        if uz
+        else f"   ↳ хранение: {_format_money(uzum_breakdown_values[0])} · реклама: {_format_money(uzum_breakdown_values[1])} · "
+        f"штрафы: {_format_money(uzum_breakdown_values[2])} · прочее: {_format_money(uzum_breakdown_values[3])}"
+    )
     lines.extend(
         [
             f"= To‘lovga: <b>{_format_money(float(business.get('calculation_payout') or 0))}</b>"
@@ -16571,12 +16658,13 @@ def _format_profit_bridge_lines(
             f"= Soliqdan oldingi foyda: <b>{_format_money(float(business.get('known_profit') or 0))}</b>"
             if uz
             else f"= Прибыль до налога: <b>{_format_money(float(business.get('known_profit') or 0))}</b>",
-            f"6. − Soliq: <b>{_format_money(float(business.get('tax_expense') or 0))}</b>"
+            f"6. − Soliq ({float(business.get('tax_percent') or 0):g}%): <b>{_format_money(float(business.get('tax_expense') or 0))}</b>"
             if uz
-            else f"6. − Налог: <b>{_format_money(float(business.get('tax_expense') or 0))}</b>",
+            else f"6. − Налог ({float(business.get('tax_percent') or 0):g}%): <b>{_format_money(float(business.get('tax_expense') or 0))}</b>",
             f"7. − Uzum qo‘shimcha xarajatlari: <b>{_format_money(float(business.get('uzum_expense_deductions') or 0))}</b>"
             if uz
             else f"7. − Доп. расходы Uzum: <b>{_format_money(float(business.get('uzum_expense_deductions') or 0))}</b>",
+            *([uzum_breakdown] if any(abs(value) > 0.001 for value in uzum_breakdown_values) else []),
             f"8. + Uzum qaytargan mablag‘: <b>{_format_money(float(business.get('uzum_expense_refunds') or 0))}</b>"
             if uz
             else f"8. + Возвраты от Uzum: <b>{_format_money(float(business.get('uzum_expense_refunds') or 0))}</b>",
@@ -17008,7 +17096,7 @@ async def subscription_reminder_loop() -> None:
                 last_digest_day = _subscription_automation_state_get("last_admin_digest_day")
                 if now_uzt.hour >= SUBSCRIPTION_ADMIN_DIGEST_HOUR_UZT and last_digest_day != today_key:
                     summary = refresh_subscription_reminder_queue()
-                    rows = list_pending_subscription_reminders(100)
+                    rows = list_pending_subscription_reminders(500)
                     digest = build_subscription_action_digest(rows, int(summary.get("created") or 0))
                     sent_to_admin = False
                     for admin_id in sorted(ADMIN_IDS):
@@ -17665,7 +17753,6 @@ PRODUCT_NUMERIC_LIMITS: dict[str, tuple[float, float]] = {
 FINANCE_NUMERIC_LIMITS: dict[str, tuple[float, float]] = {
     "tax_percent": (0, 100),
     "advertising_monthly": (0, 10_000_000_000),
-    "storage_monthly": (0, 10_000_000_000),
     "other_monthly": (0, 10_000_000_000),
 }
 
@@ -18068,29 +18155,90 @@ def supply_settings_markup(telegram_id: int) -> InlineKeyboardMarkup:
     ])
 
 
-def finance_settings_text(telegram_id: int, shop_id: int) -> str:
+async def load_finance_settings_uzum_expenses(
+    telegram_id: int,
+    shop_id: int,
+    *,
+    force: bool = False,
+) -> dict[str, Any] | None:
+    client = get_uzum_for_user(telegram_id)
+    if client is None:
+        return None
+    date_from, date_to = _days_range_ms(30)
+    # Align the end timestamp with the five-minute cache window.  Opening the
+    # tax menu and returning to settings must not trigger nearly identical
+    # Uzum requests with different millisecond cache keys.
+    date_to = (date_to // 300_000) * 300_000
+    try:
+        return await load_uzum_expense_summary(
+            client,
+            shop_id,
+            date_from,
+            date_to,
+            force=force,
+        )
+    except Exception:
+        logging.exception(
+            "Finance settings: Uzum expense summary unavailable user=%s shop=%s",
+            telegram_id,
+            shop_id,
+        )
+        return {"available": False}
+
+
+def finance_settings_text(
+    telegram_id: int,
+    shop_id: int,
+    *,
+    uzum_expenses: dict[str, Any] | None = None,
+) -> str:
     lang = get_user_language(telegram_id)
     row = ensure_finance_settings(telegram_id, shop_id)
     tax_percent = float(row.get("tax_percent") or 0)
     tax_name = _tax_setting_label(tax_percent, lang=lang)
+    legacy_storage = float(row.get("storage_monthly") or 0)
+    if uzum_expenses is None:
+        storage_ru = "автоматически из Uzum"
+        storage_uz = "Uzum'dan avtomatik"
+    elif not bool(uzum_expenses.get("available")):
+        storage_ru = "временно недоступно"
+        storage_uz = "vaqtincha mavjud emas"
+    else:
+        storage_value = _format_money(float(uzum_expenses.get("storage") or 0))
+        storage_ru = storage_value
+        storage_uz = storage_value
+    legacy_note_ru = (
+        f"\n⚠️ Ранее введённое ручное хранение {_format_money(legacy_storage)} больше не вычитается."
+        if legacy_storage > 0
+        else ""
+    )
+    legacy_note_uz = (
+        f"\n⚠️ Oldin qo‘lda kiritilgan saqlash {_format_money(legacy_storage)} endi ayrilmaydi."
+        if legacy_storage > 0
+        else ""
+    )
     if lang == "uz":
         return (
             "🧮 <b>Sof foyda sozlamalari</b>\n\n"
             f"🏪 Do‘kon: <code>{shop_id}</code>\n"
             f"🏛 Soliq: <b>{escape(tax_name)}</b>\n"
+            f"🏬 Uzum saqlash — oxirgi 30 kun: <b>{storage_uz}</b>\n"
             f"📣 Tashqi reklama / oy: <b>{_format_money(float(row.get('advertising_monthly') or 0))}</b>\n"
-            f"🏬 Tashqi saqlash / oy: <b>{_format_money(float(row.get('storage_monthly') or 0))}</b>\n"
             f"🧾 Boshqa tashqi / oy: <b>{_format_money(float(row.get('other_monthly') or 0))}</b>\n\n"
-            "Uzum xarajatlari API orqali avtomatik olinadi. Bu yerga faqat Uzumdan tashqaridagi xarajatlarni kiriting."
+            "Saqlash va Uzum ichidagi boshqa xarajatlar API orqali avtomatik olinadi. "
+            "Bu yerga faqat Uzumdan tashqaridagi xarajatlarni kiriting."
+            f"{legacy_note_uz}"
         )
     return (
         "🧮 <b>Настройки чистой прибыли</b>\n\n"
         f"🏪 Магазин: <code>{shop_id}</code>\n"
         f"🏛 Налог: <b>{escape(tax_name)}</b>\n"
+        f"🏬 Хранение Uzum за последние 30 дней: <b>{storage_ru}</b>\n"
         f"📣 Внешняя реклама в месяц: <b>{_format_money(float(row.get('advertising_monthly') or 0))}</b>\n"
-        f"🏬 Внешнее хранение в месяц: <b>{_format_money(float(row.get('storage_monthly') or 0))}</b>\n"
-        f"🧾 Другие внешние расходы: <b>{_format_money(float(row.get('other_monthly') or 0))}</b>\n\n"
-        "Расходы внутри Uzum загружаются автоматически. Здесь указывайте только расходы вне Uzum."
+        f"🧾 Другие расходы вне Uzum: <b>{_format_money(float(row.get('other_monthly') or 0))}</b>\n\n"
+        "Хранение и остальные расходы внутри Uzum загружаются автоматически. "
+        "Здесь указывайте только расходы вне Uzum."
+        f"{legacy_note_ru}"
     )
 
 
@@ -18100,8 +18248,8 @@ def finance_settings_markup(telegram_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=("🏛 Soliq turini tanlash" if uz else "🏛 Выбрать налог"), callback_data="taxmenu:open")],
         [InlineKeyboardButton(text=("📣 Tashqi reklama" if uz else "📣 Внешняя реклама"), callback_data="autoedit:advertising_monthly")],
-        [InlineKeyboardButton(text=("🏬 Tashqi saqlash" if uz else "🏬 Внешнее хранение"), callback_data="autoedit:storage_monthly")],
         [InlineKeyboardButton(text=("🧾 Boshqa tashqi" if uz else "🧾 Другие внешние"), callback_data="autoedit:other_monthly")],
+        [InlineKeyboardButton(text=("🔄 Uzum xarajatlarini yangilash" if uz else "🔄 Обновить расходы Uzum"), callback_data="finance_refresh:expenses")],
     ])
 
 
@@ -18117,6 +18265,25 @@ def _tax_setting_label(percent: float, *, lang: str) -> str:
     if value == 12:
         return "Qo‘shilgan qiymat solig‘i — 12%" if uz else "НДС — 12%"
     return f"Soliq — {value:g}%" if uz else f"Налог — {value:g}%"
+
+
+def tax_selection_text(telegram_id: int, shop_id: int) -> str:
+    lang = get_user_language(telegram_id)
+    current = float(ensure_finance_settings(telegram_id, shop_id).get("tax_percent") or 0)
+    current_label = _tax_setting_label(current, lang=lang)
+    if lang == "uz":
+        return (
+            "🏛 <b>Soliq stavkasi</b>\n\n"
+            f"🏪 Do‘kon: <code>{shop_id}</code>\n"
+            f"Hozir tanlangan: <b>{escape(current_label)}</b>\n\n"
+            "Stavkani quyidagi tugmalardan tanlang. Soliq har bir tovar tushumidan hisoblanadi."
+        )
+    return (
+        "🏛 <b>Налоговая ставка</b>\n\n"
+        f"🏪 Магазин: <code>{shop_id}</code>\n"
+        f"Сейчас выбрано: <b>{escape(current_label)}</b>\n\n"
+        "Выберите ставку кнопкой ниже. Налог рассчитывается с выручки каждого товара."
+    )
 
 
 def tax_selection_markup(telegram_id: int, current: float) -> InlineKeyboardMarkup:
@@ -18138,6 +18305,20 @@ def tax_selection_markup(telegram_id: int, current: float) -> InlineKeyboardMark
     ])
 
 
+@dp.message(Command("tax", "tax_rate"))
+@dp.message(F.text.in_({"🏛 Налоговая ставка", "🏛 Soliq stavkasi"}))
+async def tax_selection_screen(message: Message) -> None:
+    req = await require_connection(message)
+    if req is None:
+        return
+    telegram_id, _, shop_id = req
+    current = float(ensure_finance_settings(telegram_id, shop_id).get("tax_percent") or 0)
+    await message.answer(
+        tax_selection_text(telegram_id, shop_id),
+        reply_markup=tax_selection_markup(telegram_id, current),
+    )
+
+
 @dp.callback_query(F.data == "taxmenu:open")
 async def tax_selection_open(callback: CallbackQuery) -> None:
     if not callback.from_user:
@@ -18148,13 +18329,11 @@ async def tax_selection_open(callback: CallbackQuery) -> None:
         await callback.answer("Avval do‘konni ulang" if get_user_language(telegram_id) == "uz" else "Сначала подключите магазин", show_alert=True)
         return
     current = float(ensure_finance_settings(telegram_id, int(shop_id)).get("tax_percent") or 0)
-    text = (
-        "🏛 <b>Soliq turini tanlang</b>\n\nSoliq har bir tovar tushumidan hisoblanadi. Kerak bo‘lsa boshqa foizni qo‘lda kiriting."
-        if get_user_language(telegram_id) == "uz"
-        else "🏛 <b>Выберите налог</b>\n\nНалог рассчитывается с выручки каждого товара. При необходимости можно указать другой процент."
-    )
     if callback.message:
-        await callback.message.edit_text(text, reply_markup=tax_selection_markup(telegram_id, current))
+        await callback.message.edit_text(
+            tax_selection_text(telegram_id, int(shop_id)),
+            reply_markup=tax_selection_markup(telegram_id, current),
+        )
     await callback.answer()
 
 
@@ -18171,8 +18350,16 @@ async def tax_selection_set(callback: CallbackQuery, state: FSMContext) -> None:
         return
     if action == "back":
         if callback.message:
+            expense_summary = await load_finance_settings_uzum_expenses(
+                telegram_id,
+                int(shop_id),
+            )
             await callback.message.edit_text(
-                finance_settings_text(telegram_id, int(shop_id)),
+                finance_settings_text(
+                    telegram_id,
+                    int(shop_id),
+                    uzum_expenses=expense_summary,
+                ),
                 reply_markup=finance_settings_markup(telegram_id),
             )
         await callback.answer()
@@ -18199,8 +18386,16 @@ async def tax_selection_set(callback: CallbackQuery, state: FSMContext) -> None:
         return
     update_finance_setting(telegram_id, int(shop_id), "tax_percent", value)
     if callback.message:
+        expense_summary = await load_finance_settings_uzum_expenses(
+            telegram_id,
+            int(shop_id),
+        )
         await callback.message.edit_text(
-            finance_settings_text(telegram_id, int(shop_id)),
+            finance_settings_text(
+                telegram_id,
+                int(shop_id),
+                uzum_expenses=expense_summary,
+            ),
             reply_markup=finance_settings_markup(telegram_id),
         )
     await callback.answer("Saqlandi" if lang == "uz" else "Сохранено")
@@ -18460,16 +18655,55 @@ async def supply_settings_screen(message: Message) -> None:
 
 
 @dp.message(Command("finance_settings", "expenses_settings"))
-@dp.message(F.text.in_({"🧮 Расходы и налоги", "🧮 Xarajat va soliq"}))
+@dp.message(F.text.in_({
+    "🧮 Расходы и налоги",
+    "🧮 Xarajat va soliq",
+    "📣 Внешние расходы",
+    "📣 Tashqi xarajatlar",
+}))
 async def finance_settings_screen(message: Message) -> None:
     req = await require_connection(message)
     if req is None:
         return
     telegram_id, _, shop_id = req
+    expense_summary = await load_finance_settings_uzum_expenses(telegram_id, shop_id)
     await message.answer(
-        finance_settings_text(telegram_id, shop_id),
+        finance_settings_text(
+            telegram_id,
+            shop_id,
+            uzum_expenses=expense_summary,
+        ),
         reply_markup=finance_settings_markup(telegram_id),
     )
+
+
+@dp.callback_query(F.data == "finance_refresh:expenses")
+async def finance_expenses_refresh_callback(callback: CallbackQuery) -> None:
+    if not callback.from_user:
+        return
+    telegram_id = int(callback.from_user.id)
+    shop_id = db.get_default_shop_id(telegram_id)
+    if shop_id is None:
+        await callback.answer(
+            "Avval do‘konni ulang" if get_user_language(telegram_id) == "uz" else "Сначала подключите магазин",
+            show_alert=True,
+        )
+        return
+    summary = await load_finance_settings_uzum_expenses(
+        telegram_id,
+        int(shop_id),
+        force=True,
+    )
+    if callback.message:
+        await callback.message.edit_text(
+            finance_settings_text(
+                telegram_id,
+                int(shop_id),
+                uzum_expenses=summary,
+            ),
+            reply_markup=finance_settings_markup(telegram_id),
+        )
+    await callback.answer("Yangilandi" if get_user_language(telegram_id) == "uz" else "Обновлено")
 
 
 @dp.message(Command("uzum_expenses", "expenses_uzum"))
@@ -18544,8 +18778,8 @@ async def uzum_expenses_report(message: Message) -> None:
     items: list[str] = []
     for index, row in enumerate(list(summary.get("rows") or []), start=1):
         date_text = _fmt_dt(row.get("date"))
-        name = escape(_short_text(str(row.get("name") or "Uzum"), 85))
-        source = escape(_short_text(str(row.get("source") or "—"), 45))
+        name = escape(_short_text(expense_display_name(row, lang), 85))
+        source = escape(_short_text(expense_display_source(row, lang), 45))
         amount = float(row.get("signed_amount") or 0)
         included = bool(row.get("included_in_profit", True))
         accounting_note = (
@@ -18634,7 +18868,6 @@ async def automation_edit_callback(callback: CallbackQuery, state: FSMContext) -
         "target_cover_days": "На сколько дней продаж формировать рекомендуемую поставку?",
         "tax_percent": "Введите налог в процентах, например 4.",
         "advertising_monthly": "Введите средние расходы на рекламу за месяц в сумах.",
-        "storage_monthly": "Введите расходы на хранение за месяц в сумах.",
         "other_monthly": "Введите другие ежемесячные расходы в сумах.",
     }
     prompts_uz = {
@@ -18649,7 +18882,6 @@ async def automation_edit_callback(callback: CallbackQuery, state: FSMContext) -
         "target_cover_days": "Tavsiya etilgan yetkazish necha kunlik savdoga yetsin?",
         "tax_percent": "Soliq foizini kiriting, masalan 4.",
         "advertising_monthly": "Bir oylik reklama xarajatini so‘mda kiriting.",
-        "storage_monthly": "Bir oylik saqlash xarajatini so‘mda kiriting.",
         "other_monthly": "Boshqa oylik xarajatlarni so‘mda kiriting.",
     }
     await state.set_state(ProductSettingsStates.waiting_for_value)
@@ -18724,8 +18956,16 @@ async def product_setting_value_received(message: Message, state: FSMContext) ->
         return
     update_finance_setting(telegram_id, int(shop_id), field, value)
     await state.clear()
+    expense_summary = await load_finance_settings_uzum_expenses(
+        telegram_id,
+        int(shop_id),
+    )
     await message.answer(
-        finance_settings_text(telegram_id, int(shop_id)),
+        finance_settings_text(
+            telegram_id,
+            int(shop_id),
+            uzum_expenses=expense_summary,
+        ),
         reply_markup=finance_settings_markup(telegram_id),
     )
 
@@ -24291,7 +24531,7 @@ _cleanup_release_state()
 # Preserves per-user instant/hourly modes while using the durable outbox and
 # adaptive Finance pagination from RELEASE_HARDENING.
 # =============================================================================
-PREMIUM_RELEASE_VERSION = "2026.07.22-premium-r17-clear-profit-bridge"
+PREMIUM_RELEASE_VERSION = "2026.07.22-premium-r18-clear-finance-navigation"
 
 WATCHER_ACCESS_BACKOFF_SECONDS = max(
     300,
@@ -24589,6 +24829,7 @@ async def main() -> None:
     logging.info("UZUM_FINANCE_LOADED: purchasePrice-only cost + expense ledger + IKPU audit")
     logging.info("REPORT_RECONCILIATION_LOADED: historical purchasePrice + issued-date + cancelled quantity + tax/ROI")
     logging.info("PROFIT_BRIDGE_LOADED: revenue -> payout -> cost -> tax/expenses -> result")
+    logging.info("FINANCE_UI_R18_LOADED: compact renewals + direct tax + Uzum storage + localized expenses")
     logging.info("FBO_ACCEPTANCE_RECONCILIATION_LOADED: invoice/product totals + stale-zero guard")
     logging.info("MARKET_STYLE_REPORTS_LOADED: daily PDF/Excel + loss/damage claim documents")
     logging.info("LOGISTICS_REMINDERS_LOADED: FBO slots + return paid-storage deadlines")

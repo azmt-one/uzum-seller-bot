@@ -172,19 +172,70 @@ def expense_category(row: dict[str, Any]) -> str:
         enum_text(row.get(field)).lower()
         for field in ("name", "source", "code")
     )
+    # Uzum may return operation names in Russian, English or Uzbek regardless
+    # of the language selected in the bot.  Fold Uzbek apostrophe variants so
+    # strings such as ``pulli targ‘ibot`` are classified consistently.
+    folded = (
+        haystack.replace("‘", "'")
+        .replace("’", "'")
+        .replace("ʻ", "'")
+        .replace("ʼ", "'")
+    )
+    compact = folded.replace("'", "")
     # Order commission and delivery are already reflected in Finance payout.
     # Keep such ledger rows auditable but never deduct them for a second time.
-    if any(word in haystack for word in ("commission", "комисс", "komiss")):
+    if any(word in folded for word in ("commission", "комисс", "komiss")):
         return "order_charge"
-    if any(word in haystack for word in ("logistic", "delivery", "логист", "достав", "yetkaz")):
+    if any(word in folded for word in ("logistic", "delivery", "логист", "достав", "yetkaz")):
         return "order_charge"
-    if any(word in haystack for word in ("storage", "хран", "saql", "ombor")):
+    if any(word in folded for word in ("storage", "хран", "saql", "ombor")):
         return "storage"
-    if any(word in haystack for word in ("advert", "реклам", "reklama", "promotion", "продвиж")):
+    if any(
+        word in folded
+        for word in ("advert", "реклам", "reklama", "promotion", "продвиж", "marketing")
+    ) or "targibot" in compact:
         return "advertising"
-    if any(word in haystack for word in ("penalty", "fine", "штраф", "jarima")):
+    if any(word in folded for word in ("penalty", "fine", "штраф", "jarima")):
         return "penalty"
     return "other"
+
+
+def expense_display_name(item: dict[str, Any], lang: str = "ru") -> str:
+    """Return a user-language label instead of leaking Uzum's raw locale."""
+    category = text(item.get("category") or "other")
+    raw_name = text(item.get("name"))
+    uz = str(lang or "ru").lower() == "uz"
+    labels = {
+        "storage": ("Хранение Uzum", "Uzum saqlash xizmati"),
+        "advertising": ("Платное продвижение на Uzum", "Uzum'da pulli targ‘ibot"),
+        "penalty": ("Штраф Uzum", "Uzum jarimasi"),
+        "order_charge": ("Комиссия или логистика по заказу", "Buyurtma komissiyasi yoki logistikasi"),
+        "other": ("Прочая операция Uzum", "Uzum boshqa operatsiyasi"),
+    }
+    ru_label, uz_label = labels.get(category, labels["other"])
+    if category == "other":
+        # Preserve an already localized description when it is useful.  Raw
+        # Latin Uzbek/English text is replaced for Russian users.
+        if uz and raw_name:
+            return raw_name
+        if not uz and any("а" <= char.lower() <= "я" or char.lower() == "ё" for char in raw_name):
+            return raw_name
+    return uz_label if uz else ru_label
+
+
+def expense_display_source(item: dict[str, Any], lang: str = "ru") -> str:
+    """Localize the compact source label shown in Telegram expense rows."""
+    category = text(item.get("category") or "other")
+    uz = str(lang or "ru").lower() == "uz"
+    labels = {
+        "storage": ("Хранение", "Saqlash"),
+        "advertising": ("Продвижение", "Marketing"),
+        "penalty": ("Штрафы", "Jarimalar"),
+        "order_charge": ("Заказ", "Buyurtma"),
+        "other": ("Uzum", "Uzum"),
+    }
+    ru_label, uz_label = labels.get(category, labels["other"])
+    return uz_label if uz else ru_label
 
 
 def normalize_expense(row: dict[str, Any]) -> dict[str, Any] | None:
